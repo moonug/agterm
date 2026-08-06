@@ -4,6 +4,7 @@ paths:
   - "agterm/Ghostty/GhosttyApp.swift"
   - "agterm/Ghostty/GhosttyCallbacks.swift"
   - "agterm/Ghostty/GhosttyResources.swift"
+  - "agterm/Ghostty/GhosttyResourceLimits.swift"
   - "agterm/ContentView.swift"
   - "agterm/Views/WindowContentView*.swift"
   - "agterm/Views/SplitRatioAccessor.swift"
