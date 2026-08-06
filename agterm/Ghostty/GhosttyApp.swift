@@ -110,7 +110,12 @@ final class GhosttyApp {
 
     private init() {
         resolveResources()
-        guard ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv) == GHOSTTY_SUCCESS else {
+        // macOS login scans up to the inherited soft fd limit before exec. When needed, keep the limit Ghostty
+        // records for child restoration reasonable, then return the parent process to its original limit.
+        let originalFileDescriptorLimit = GhosttyResourceLimits.lowerSoftFileDescriptorLimit()
+        let initResult = ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv)
+        GhosttyResourceLimits.restoreSoftFileDescriptorLimit(originalFileDescriptorLimit)
+        guard initResult == GHOSTTY_SUCCESS else {
             logger.error("ghostty_init failed")
             return
         }

@@ -50,6 +50,10 @@ paths:
 
 ## Resources and lifecycle
 
+- When the inherited soft `RLIMIT_NOFILE` exceeds the cap, lower it before `ghostty_init` while libghostty
+  records its child limit, then restore agterm's parent limit immediately after init. Its child restoration
+  otherwise gives macOS `/usr/bin/login` a huge limit. `login` closes inherited descriptors above stderr to
+  start a clean session, but Apple's implementation linearly scans that many descriptors before the shell.
 - `GHOSTTY_RESOURCES_DIR` points to `Contents/Resources/ghostty`; terminfo must be its sibling at
   `Contents/Resources/terminfo`. Never set `TERMINFO`; libghostty derives and overwrites it at spawn.
 - Sessions own surfaces. The eager detail deck mounts every session once in a ZStack and toggles only
