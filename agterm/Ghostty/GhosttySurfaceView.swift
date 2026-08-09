@@ -184,6 +184,8 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     /// drag-destination resolution does NOT consult `hitTest`), so with every surface registered a file drop
     /// would land on whichever is topmost in z-order — an INVISIBLE background session — not the one under
     /// the cursor. `didSet` (un)registers the drag types and the mouse-tracking area for the same reason.
+    /// ALSO drives libghostty occlusion so a background session's renderer stops drawing until it next comes
+    /// on-screen; see `applyRendererVisibility`.
     var deckVisible = true {
         didSet {
             // `TerminalView` assigns this on every SwiftUI update pass, so skip the tracking-area teardown/
@@ -191,6 +193,7 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
             guard deckVisible != oldValue else { return }
             updateDropRegistration()
             updatePointerTracking()
+            applyRendererVisibility()
         }
     }
 
@@ -201,12 +204,40 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     /// `hitTest` returns nil and the surface refuses first responder; set on the cell, cleared on the slot.
     var viewOnly = false {
         didSet {
-            guard viewOnly, !oldValue else { return }
-            // acceptsFirstResponder=false blocks only NEW grabs: a surface carrying first responder in from
-            // the deck (the focused split pane at dashboard open) keeps it across the reparent and defeats
-            // the key-catcher. resign here; once view-only nothing can re-grab.
-            if let window, window.firstResponder === self { window.makeFirstResponder(nil) }
+            guard viewOnly != oldValue else { return }
+            if viewOnly, !oldValue,
+               let window, window.firstResponder === self {
+                // acceptsFirstResponder=false blocks only NEW grabs: a surface carrying first responder in from
+                // the deck (the focused split pane at dashboard open) keeps it across the reparent and defeats
+                // the key-catcher. resign here; once view-only nothing can re-grab.
+                window.makeFirstResponder(nil)
+            }
+            applyRendererVisibility()
         }
+    }
+
+    /// Whether libghostty should keep rendering this surface. The eager deck realizes every surface, but a
+    /// background session is never on-screen, and libghostty honors `ghostty_surface_set_occlusion(visible:)` to
+    /// pause rendering for hidden surfaces and resume on the next visibility change. `deckVisible` is false for
+    /// those backgrounds; `viewOnly` is true for dashboard cells whose `deckVisible` is false but whose pixels
+    /// still need to draw. A view with no `window` (the persistent quick-terminal, scratch, and split surfaces
+    /// survive view churn by staying off-host) must NOT report visible, so the renderer pauses until the host
+    /// reattaches. Caller pushes any change through `applyRendererVisibility`; the surface may not yet exist.
+    private var rendererVisible: Bool {
+        window != nil && (deckVisible || viewOnly)
+    }
+
+    /// Test seam: the renderer-visibility gate the surface pushes to libghostty. Exposed so the regression
+    /// suite can pin the hidden/detached/viewOnly rules without spinning up a real Metal surface (a
+    /// zero-frame view stays unrealized by design, so `ghostty_surface_set_occlusion` never runs there).
+    var rendererVisibleForTesting: Bool { rendererVisible }
+
+    /// Push the current `rendererVisible` value to libghostty. No-op until `ghostty_surface_new` runs; safe to
+    /// call from `didSet` and on `viewDidMoveToWindow` so background surfaces immediately stop rendering and
+    /// reattached ones resume.
+    private func applyRendererVisibility() {
+        guard let surface else { return }
+        ghostty_surface_set_occlusion(surface, rendererVisible)
     }
 
     /// Register the file/text drag types only while this surface is the on-screen deck pane, so an eagerly
@@ -271,6 +302,9 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     /// makes an any-motion + sgr-pixel mouse-reporting TUI emit a synthetic motion report per packet.
     var lastReportedMousePoint: NSPoint?
 
+    /// `true` while a ⌘+click press is unconsumed — set in `mouseDown` when cmd was held, read in `mouseUp`
+    /// to suppress the libghostty RELEASE (so ghostty doesn't try to fire its OSC-8 click handler against a
+    /// press we already intercepted). Reset to false at every release.
     var cmdClickArmed = false
 
     init(workingDirectory: String, fontSize: Float? = nil, command: String? = nil, initialInput: String? = nil,
@@ -512,6 +546,10 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
 
         // record the same scheme on the surface itself, so a later `update_config` re-resolves its side.
         ghostty_surface_set_color_scheme(surface, isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
+        // pause libghostty rendering if this surface is being realized off-screen — surfaces realized lazily
+        // by a deck reveal (an overlay/quick-terminal show) come up at full frame and will be flipped back on
+        // by the deck's `deckVisible` update.
+        applyRendererVisibility()
 
         if let screen = window?.screen ?? NSScreen.main,
            let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? UInt32 {
@@ -674,7 +712,13 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        guard let window else { return }
+        if window == nil {
+            // detached: pause libghostty rendering. The persistent quick/scratch/split surfaces survive a
+            // view churn by leaving the host, and libghostty would otherwise keep redrawing them in the dark.
+            applyRendererVisibility()
+            return
+        }
+        let window = window!
         if surface == nil {
             createSurface()
         } else {
@@ -687,6 +731,8 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
             updateGhosttyFocus()
         }
         updateMetalLayerSize()
+        // re-push occlusion: the surface may have been off-host (renderer paused) and is now back on-screen.
+        applyRendererVisibility()
         // focus is driven by TerminalView.updateNSView when this surface becomes the active session's detail
         // view; only an auto-focus (overlay) surface grabs here, since that grab misses a deferred surface.
         requestAutoFocus(in: window)

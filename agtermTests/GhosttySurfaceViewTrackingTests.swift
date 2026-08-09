@@ -151,4 +151,35 @@ final class GhosttySurfaceViewTrackingTests: XCTestCase {
                        "a torn-down hud surface must not leave its painter a file to keep reading")
         XCTAssertNil(view.hudBodyFile)
     }
+
+    /// Drives the libghostty occlusion seam — the eager deck pauses hidden renderers and resumes them on
+    /// visibility transitions; pinned by the regression suite so a future refactor can't accidentally keep
+    /// background sessions redrawing. The view stays at its zero init frame so `createSurface` never runs and
+    /// `surface` stays nil, which is the exact state the deck reaches on every background surface; the gate
+    /// MUST already report `false` before any surface is realized.
+    func testRendererPausesForHiddenAttachedDeckSurface() {
+        // surface is mounted (frame zero) by setUp() but no libghostty surface is realized; the gate answers
+        // for the deck view's perspective.
+        surface.deckVisible = false
+        XCTAssertFalse(surface.rendererVisibleForTesting,
+                       "a hidden attached deck surface must pause libghostty rendering")
+    }
+
+    /// A dashboard cell sets `viewOnly` while `deckVisible` is false; the dashboard is the only path that
+    /// overrides `deckVisible = false`, and its cells still need pixels. The gate lets those through.
+    func testRendererKeepsDashboardViewOnlySurfaceVisible() {
+        surface.deckVisible = false
+        surface.viewOnly = true
+        XCTAssertTrue(surface.rendererVisibleForTesting,
+                      "a dashboard cell's viewOnly surface must keep rendering")
+    }
+
+    /// A detached surface (persistent quick/scratch/split, off-host while a new view hosts the same shell)
+    /// must NOT keep drawing; libghostty pauses it until the new host attaches.
+    func testRendererPausesForDetachedSurfaceEvenWhenDeckVisible() {
+        let detached = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        detached.deckVisible = true
+        XCTAssertFalse(detached.rendererVisibleForTesting,
+                       "an off-host surface must pause libghostty rendering even if deckVisible=true")
+    }
 }
