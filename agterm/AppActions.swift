@@ -822,6 +822,17 @@ final class AppActions {
         target.startSearch()
     }
 
+    /// Open the link under the mouse cursor in the active session (Navigate ▸ Open Link at Cursor / a
+    /// keymap `open_link_at_cursor` binding). No-op with no realized active surface; notifies when nothing
+    /// matched, so a chord press always gives feedback.
+    func openLinkAtCursor() {
+        guard let surface = store?.activeSession?.activeSurface as? GhosttySurfaceView else { return }
+        if surface.openLinkAtMouseCursor() == nil {
+            NotificationManager.shared.notify(title: "Open Link at Cursor", body: "no link under cursor",
+                                              identifier: "open-link-at-cursor")
+        }
+    }
+
     /// Set the current query: mirror it into `searchNeedle` (keeping the bar's field in sync), then send
     /// `search:<needle>` to the pinned `searchSurface`, which replies with the match count — the pinned owner
     /// rather than a re-resolved focused surface keeps the bar on the pane that opened search after a split

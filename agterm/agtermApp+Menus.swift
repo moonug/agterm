@@ -301,6 +301,13 @@ extension agtermApp {
                     // not disabled when the dashboard itself is open: ⌘⇧D remains its close escape hatch.
                     // zoom and a topmost native picker still block the toggle.
                     .disabled(zoomed || pickActive)
+                // open the URL or task key under the mouse cursor per link-rules.conf (keyless by default;
+                // bind `open_link_at_cursor` in keymap.conf, e.g. cmd+opt+o).
+                Button { actions.openLinkAtCursor() } label: {
+                    Label("Open Link at Cursor", systemImage: "arrow.up.right.square")
+                }
+                .keyboardShortcut(shortcut(for: .openLinkAtCursor))
+                .disabled(library.activeStore?.activeSession == nil || modalActive)
                 Divider()
                 // step between sessions in the sidebar's flattened order. prev/next ride ⌥⌘↑/↓, NOT bare
                 // ⌘+arrows (which shadow text-field caret nav in rename/palette/settings fields), and

@@ -20,7 +20,7 @@ struct Session: ParsableCommand {
         subcommands: [New.self, Duplicate.self, Close.self, Select.self, Go.self, Rename.self, Reveal.self, Move.self, TypeText.self,
                       Split.self, Scratch.self, Focus.self, Resize.self, Copy.self, Paste.self, SelectAll.self,
                       Text.self, Status.self, Restore.self, FlagCommand.self,
-                      Seen.self, Search.self, Background.self, Overlay.self, Hud.self]
+                      Seen.self, Search.self, Background.self, Overlay.self, Hud.self, OpenLinkAtCursor.self]
     )
 
     struct New: RequestCommand {
@@ -313,6 +313,18 @@ struct Session: ParsableCommand {
 
         func makeRequest() throws -> ControlRequest {
             ControlRequest(cmd: .sessionSelectAll, target: target.target, args: options.withWindow())
+        }
+    }
+
+    struct OpenLinkAtCursor: RequestCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "open-link-at-cursor",
+            abstract: "Open the link (URL or task key) under the mouse cursor in a session, per link-rules.conf.")
+        @OptionGroup var target: TargetOptions
+        @OptionGroup var options: ClientOptions
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .sessionOpenLinkAtCursor, target: target.target, args: options.withWindow())
         }
     }
 

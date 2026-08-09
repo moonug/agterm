@@ -150,17 +150,30 @@ extension GhosttySurfaceView {
         lastReportedMousePoint = pt
     }
 
+    /// ⌘+click opens the link under the cursor via the `link-rules.conf` regex rules (wezterm-style
+    /// hyperlink click) and CONSUMES the event so libghostty doesn't ALSO fire its OSC-8 click handler —
+    /// cmd means "use my rules", unmodded click still means OSC-8. When the press isn't ⌘-held, behaviour
+    /// is unchanged: focus grab + forwarded to ghostty.
     override func mouseDown(with event: NSEvent) {
         guard let surface else { return }
         window?.makeFirstResponder(self)
         updateGhosttyFocus()
         reportMousePos(from: event)
+        if event.modifierFlags.contains(.command) {
+            cmdClickArmed = true
+            openLinkAtMouseCursor()
+            return
+        }
         _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods(event))
     }
 
     override func mouseUp(with event: NSEvent) {
         guard let surface else { return }
         reportMousePos(from: event)
+        // skip the ghostty release when a ⌘+click press was intercepted — without its paired press
+        // ghostty treats the release as a no-op anyway, but skipping keeps the gesture strictly ours.
+        defer { cmdClickArmed = false }
+        guard !cmdClickArmed else { return }
         _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, mods(event))
     }
 

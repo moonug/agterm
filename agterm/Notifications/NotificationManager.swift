@@ -149,6 +149,19 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         }
     }
 
+    /// Post an app-level banner (not tied to a session/surface), coalesced by `identifier`. App-level like
+    /// `notifyCommandFailure` — used for a keymap-driven action with no resolved surface to attribute to.
+    func notify(title: String, body: String, identifier: String) {
+        guard bannersEnabled else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error { logger.error("banner add failed: \(error.localizedDescription, privacy: .public)") }
+        }
+    }
+
     /// Post a banner when the keymap parsed with problems (parse errors or cross-section conflicts), visible
     /// without opening Settings. App-level like `notifyCommandFailure`; a fixed identifier coalesces reloads.
     func notifyKeymapDiagnostics(count: Int) {
