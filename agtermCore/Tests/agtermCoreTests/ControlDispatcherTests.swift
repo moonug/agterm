@@ -1255,6 +1255,18 @@ struct ControlDispatcherTests {
         #expect(actions.calls == [.sessionSelectAll(target: "session", window: "win")])
     }
 
+    @Test func sessionOpenLinkAtCursorRoutesTargetAndWindow() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        actions.nextSessionOpenLinkAtCursorResponse = ControlResponse(ok: true, result: ControlResult(text: "https://st.yandex-team.ru/NOCDEV-1234"))
+
+        let response = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionOpenLinkAtCursor, target: "session", args: ControlArgs(window: "win")))
+
+        #expect(response == ControlResponse(ok: true, result: ControlResult(text: "https://st.yandex-team.ru/NOCDEV-1234")))
+        #expect(actions.calls == [.sessionOpenLinkAtCursor(target: "session", window: "win")])
+    }
+
     @Test func sessionBackgroundRoutesParsedTextImageColorAndClearForms() async {
         let actions = MockControlActions()
         let dispatcher = ControlDispatcher(actions: actions)

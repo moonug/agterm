@@ -14,6 +14,7 @@ struct BuiltinActionTests {
         #expect(BuiltinAction.toggleSplit.rawValue == "toggle_split")
         #expect(BuiltinAction.toggleTerminalZoom.rawValue == "toggle_terminal_zoom")
         #expect(BuiltinAction.toggleSearch.rawValue == "toggle_search")
+        #expect(BuiltinAction.openLinkAtCursor.rawValue == "open_link_at_cursor")
         #expect(BuiltinAction.commandPalette.rawValue == "command_palette")
         #expect(BuiltinAction.customCommandPalette.rawValue == "custom_command_palette")
         #expect(BuiltinAction.nextAttentionSession.rawValue == "next_attention_session")
@@ -29,7 +30,7 @@ struct BuiltinActionTests {
         #expect(BuiltinAction.toggleFullscreen.rawValue == "toggle_fullscreen")
         #expect(BuiltinAction.dashboard.rawValue == "dashboard")
         #expect(BuiltinAction.duplicateSession.rawValue == "duplicate_session")
-        #expect(BuiltinAction.allCases.count == 42)
+        #expect(BuiltinAction.allCases.count == 43)
     }
 
     @Test func rejectsUnknownName() {
@@ -94,6 +95,7 @@ struct BuiltinActionTests {
             .toggleScratch: Chord(mods: [.command], key: "j"),
             .toggleTerminalZoom: Chord(mods: [.command, .shift], key: "return"),
             .toggleSearch: Chord(mods: [.command], key: "f"),
+            .openLinkAtCursor: nil,
             .toggleSidebar: Chord(mods: [.command, .control], key: "s"),
             .toggleFullscreen: Chord(mods: [.command, .control], key: "f"),
             .selectTheme: nil,
@@ -171,7 +173,7 @@ struct BuiltinActionTests {
         let keyless: Set<BuiltinAction> = [
             .renameWindow, .deleteWindow, .renameWorkspace, .deleteWorkspace, .renameSession, .duplicateSession,
             .clearStatus, .firstSession, .lastSession, .selectTheme, .toggleFlaggedView, .focusWorkspace,
-            .toggleWorkspaceFilter,
+            .toggleWorkspaceFilter, .openLinkAtCursor,
         ]
         for action in keyless {
             #expect(action.defaultChord == nil, "expected nil default for \(action.rawValue)")

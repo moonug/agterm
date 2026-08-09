@@ -21,6 +21,22 @@ extension ControlServer: ControlActions {
         copySelection(target, window: window)
     }
 
+    /// Resolve a link at the mouse cursor in the target session: the FIRST `link-rules.conf` (or default)
+    /// rule whose match covers the cursor cell, opened via the same `openLink` → `LinkPolicy` path as an
+    /// OSC-8 hyperlink click. Returns the matched raw text so the CLI can report it; errors when the
+    /// session has no realized surface, the cursor isn't inside it, nothing matches, or policy ignores it.
+    func openLinkAtCursor(_ target: String?, window: String?) -> ControlResponse {
+        return resolver.resolveSession(target, window: window) { store, id in
+            guard let surface = store.session(withID: id)?.addressableSurface as? GhosttySurfaceView else {
+                return ControlResponse(ok: false, error: "session not realized")
+            }
+            guard let raw = surface.openLinkAtMouseCursor() else {
+                return ControlResponse(ok: false, error: "no link under cursor")
+            }
+            return ControlResponse(ok: true, result: ControlResult(text: raw))
+        }
+    }
+
     /// `options.pane` picks the kind: nil opens the session-wide overlay, `left`/`right` a pane-scoped one
     /// covering that pane alone. The pane arm's two rejections need the LIVE session (its own slot occupied,
     /// or the pane not laid out at all, which would leave the slot active with no surface ever created), so

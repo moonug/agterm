@@ -61,6 +61,7 @@ public protocol ControlActions {
     func copySessionSelection(_ target: String?, window: String?) -> ControlResponse
     func pasteSession(_ target: String?, window: String?) -> ControlResponse
     func selectAllSession(_ target: String?, window: String?) -> ControlResponse
+    func openLinkAtCursor(_ target: String?, window: String?) -> ControlResponse
     func searchSession(_ target: String?, window: String?,
                        text: String?, to: String?) async -> ControlResponse
     func openSessionOverlay(_ target: String?, window: String?,
@@ -174,9 +175,9 @@ public struct ControlDispatcher {
                 .sessionReveal, .sessionMove, .sessionFlag, .sessionSeen, .sessionStatus, .sessionRestore:
             return dispatchSessionCommand(request)
         case .sessionSplit, .sessionScratch, .sessionFocus, .sessionResize, .surfaceZoom, .sessionType,
-                .sessionCopy, .sessionPaste, .sessionSelectAll, .sessionSearch, .sessionOverlayOpen,
-                .sessionOverlayClose, .sessionOverlayResize, .sessionOverlayResult, .sessionBackground,
-                .sessionText:
+                .sessionCopy, .sessionPaste, .sessionSelectAll, .sessionOpenLinkAtCursor, .sessionSearch,
+                .sessionOverlayOpen, .sessionOverlayClose, .sessionOverlayResize, .sessionOverlayResult,
+                .sessionBackground, .sessionText:
             return await dispatchSessionSurfaceCommand(request)
         case .workspaceNew, .workspaceSelect, .workspaceRename, .workspaceDelete,
                 .workspaceMove, .workspaceFocus, .workspaceFilter, .workspaceCollapse, .workspaceExpand:
@@ -543,6 +544,8 @@ public struct ControlDispatcher {
             return actions.pasteSession(request.target, window: request.args?.window)
         case .sessionSelectAll:
             return actions.selectAllSession(request.target, window: request.args?.window)
+        case .sessionOpenLinkAtCursor:
+            return actions.openLinkAtCursor(request.target, window: request.args?.window)
         case .sessionSearch:
             return await actions.searchSession(request.target, window: request.args?.window,
                                                text: request.args?.text, to: request.args?.to)

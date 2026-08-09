@@ -57,6 +57,7 @@ final class MockControlActions: ControlActions {
         case sessionCopy(target: String?, window: String?)
         case sessionPaste(target: String?, window: String?)
         case sessionSelectAll(target: String?, window: String?)
+        case sessionOpenLinkAtCursor(target: String?, window: String?)
         case sessionSearch(target: String?, window: String?, text: String?, to: String?)
         case overlayOpen(target: String?, window: String?, ControlSessionOverlayOpenOptions)
         case overlayClose(target: String?, window: String?, pane: OverlayPane?)
@@ -118,6 +119,7 @@ final class MockControlActions: ControlActions {
     var nextSessionCopyResponse = ControlResponse(ok: true)
     var nextSessionPasteResponse = ControlResponse(ok: true)
     var nextSessionSelectAllResponse = ControlResponse(ok: true)
+    var nextSessionOpenLinkAtCursorResponse = ControlResponse(ok: true)
     var nextSessionSearchResponse = ControlResponse(ok: true)
     var nextOverlayOpenResponse = ControlResponse(ok: true)
     var nextOverlayCloseResponse = ControlResponse(ok: true)
@@ -400,6 +402,11 @@ final class MockControlActions: ControlActions {
     func selectAllSession(_ target: String?, window: String?) -> ControlResponse {
         calls.append(.sessionSelectAll(target: target, window: window))
         return nextSessionSelectAllResponse
+    }
+
+    func openLinkAtCursor(_ target: String?, window: String?) -> ControlResponse {
+        calls.append(.sessionOpenLinkAtCursor(target: target, window: window))
+        return nextSessionOpenLinkAtCursorResponse
     }
 
     func searchSession(_ target: String?, window: String?,
