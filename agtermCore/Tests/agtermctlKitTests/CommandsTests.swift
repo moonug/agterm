@@ -54,6 +54,18 @@ struct CommandsTests {
         #expect(try request(["workspace", "select", "--target", "ab"]) == ControlRequest(cmd: .workspaceSelect, target: "ab"))
     }
 
+    @Test func workspaceGo() throws {
+        #expect(try request(["workspace", "go", "--to", "next"]) == ControlRequest(cmd: .workspaceGo, args: ControlArgs(to: "next")))
+        let windowed = ControlRequest(cmd: .workspaceGo, args: ControlArgs(window: "w1", to: "prev"))
+        #expect(try request(["workspace", "go", "--to", "prev", "--window", "w1"]) == windowed)
+    }
+
+    // relative to what is current, so unlike its `workspace.*` siblings it carries no target at all
+    @Test func workspaceGoTakesNoTarget() {
+        #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["workspace", "go", "--to", "next", "--target", "ab"]) }
+        #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["workspace", "go"]) }
+    }
+
     @Test func workspaceMove() throws {
         let expected = ControlRequest(cmd: .workspaceMove, target: "active", args: ControlArgs(to: "top"))
         #expect(try request(["workspace", "move", "--to", "top"]) == expected)
@@ -353,6 +365,28 @@ struct CommandsTests {
         #expect(try request(["session", "split", "on"]) == expected)
     }
 
+    @Test func sessionSplitWithTargetAndWindow() throws {
+        let expected = ControlRequest(cmd: .sessionSplit, target: "s1", args: ControlArgs(mode: "off", window: "w1"))
+        #expect(try request(["session", "split", "off", "--target", "s1", "--window", "w1"]) == expected)
+    }
+
+    @Test func sessionSplitAcceptsAnOptionalAxis() throws {
+        let expected = ControlRequest(cmd: .sessionSplit, target: "active",
+                                      args: ControlArgs(mode: "toggle", axis: "horizontal"))
+        #expect(try request(["session", "split", "--axis", "horizontal"]) == expected)
+        #expect(validationMessage(["session", "split", "--axis", "diagonal"])
+            == "--axis must be vertical or horizontal")
+    }
+
+    @Test func sessionSplitClose() throws {
+        #expect(try request(["session", "split", "close"]) == ControlRequest(cmd: .sessionSplitClose, target: "active"))
+    }
+
+    @Test func sessionSplitCloseWithTargetAndWindow() throws {
+        let expected = ControlRequest(cmd: .sessionSplitClose, target: "s1", args: ControlArgs(window: "w1"))
+        #expect(try request(["session", "split", "close", "--target", "s1", "--window", "w1"]) == expected)
+    }
+
     @Test func sessionScratchDefaultsToggle() throws {
         let expected = ControlRequest(cmd: .sessionScratch, target: "active", args: ControlArgs(mode: "toggle"))
         #expect(try request(["session", "scratch"]) == expected)
@@ -373,6 +407,12 @@ struct CommandsTests {
         #expect(try request(["session", "focus", "right"]) == expected)
     }
 
+    @Test func sessionFocusAcceptsRoleAndAxisAliasesVerbatim() throws {
+        for pane in ["primary", "left", "top", "split", "right", "bottom"] {
+            #expect(try request(["session", "focus", pane]).args?.pane == pane)
+        }
+    }
+
     @Test func sessionResizeAbsolute() throws {
         let expected = ControlRequest(cmd: .sessionResize, target: "active", args: ControlArgs(ratio: 0.7))
         #expect(try request(["session", "resize", "--split-ratio", "0.7"]) == expected)
@@ -386,6 +426,15 @@ struct CommandsTests {
     @Test func sessionResizeGrowRightIsNegativeDelta() throws {
         let expected = ControlRequest(cmd: .sessionResize, target: "active", args: ControlArgs(ratioDelta: -0.05))
         #expect(try request(["session", "resize", "--grow-right", "0.05"]) == expected)
+    }
+
+    @Test func sessionResizeRoleAndAxisAliasesKeepThePrimaryFractionConvention() throws {
+        for option in ["--grow-primary", "--grow-top"] {
+            #expect(try request(["session", "resize", option, "0.05"]).args?.ratioDelta == 0.05)
+        }
+        for option in ["--grow-split", "--grow-bottom"] {
+            #expect(try request(["session", "resize", option, "0.05"]).args?.ratioDelta == -0.05)
+        }
     }
 
     @Test func sessionResizeRequiresExactlyOneForm() {
@@ -834,6 +883,10 @@ struct CommandsTests {
         let right = ControlRequest(cmd: .sessionOverlayOpen, target: "9f3c",
                                    args: ControlArgs(command: "htop", pane: "right"))
         #expect(try request(["session", "overlay", "open", "htop", "--pane", "right", "--target", "9f3c"]) == right)
+        #expect(try request(["session", "overlay", "open", "revdiff", "--pane", "top"]).args?.pane == "top")
+        #expect(try request(["session", "overlay", "open", "revdiff", "--pane", "bottom"]).args?.pane == "bottom")
+        #expect(try request(["session", "overlay", "open", "revdiff", "--pane", "primary"]).args?.pane == "primary")
+        #expect(try request(["session", "overlay", "open", "revdiff", "--pane", "split"]).args?.pane == "split")
     }
 
     @Test func sessionOverlayOpenPaneWithTheOtherFlags() throws {
@@ -853,7 +906,32 @@ struct CommandsTests {
             == "--pane must be left or right")
         #expect(validationMessage(["session", "overlay", "close", "--pane", "scratch"]) == "--pane must be left or right")
         #expect(validationMessage(["session", "overlay", "result", "--pane", "scratch"]) == "--pane must be left or right")
+        #expect(validationMessage(["session", "overlay", "copy", "--pane", "scratch"]) == "--pane must be left or right")
+        #expect(validationMessage(["session", "overlay", "text", "--pane", "scratch"]) == "--pane must be left or right")
         #expect(validationMessage(["session", "overlay", "open", "cmd", "--pane", "middle"]) == "--pane must be left or right")
+    }
+
+    @Test func sessionOverlayCopyWithAndWithoutPane() throws {
+        let expected = ControlRequest(cmd: .sessionOverlayCopy, target: "9f3c", args: ControlArgs(pane: "right"))
+        #expect(try request(["session", "overlay", "copy", "--pane", "right", "--target", "9f3c"]) == expected)
+        #expect(try request(["session", "overlay", "copy"]) == ControlRequest(cmd: .sessionOverlayCopy, target: "active"))
+        #expect(try request(["session", "overlay", "copy", "--pane", "primary"]).args?.pane == "primary")
+    }
+
+    @Test func sessionOverlayTextCarriesExtentAndPane() throws {
+        let expected = ControlRequest(cmd: .sessionOverlayText, target: "9f3c",
+                                      args: ControlArgs(pane: "left", all: true))
+        #expect(try request(["session", "overlay", "text", "--all", "--pane", "left", "--target", "9f3c"]) == expected)
+        #expect(try request(["session", "overlay", "text", "--lines", "20"]).args?.lines == 20)
+        #expect(try request(["session", "overlay", "text"]).args == ControlArgs())
+    }
+
+    @Test func sessionOverlayTextRejectsConflictingAndZeroExtent() {
+        // as with `session text`, ArgumentParser takes a negative `-2` for a flag before validate() runs, so
+        // 0 is the only CLI-reachable non-positive case; the dispatcher covers the rest for a socket client.
+        #expect(validationMessage(["session", "overlay", "text", "--all", "--lines", "5"])
+            == "use either --all or --lines, not both")
+        #expect(validationMessage(["session", "overlay", "text", "--lines", "0"]) == "--lines must be greater than 0")
     }
 
     @Test func sessionOverlayOpenRejectsPaneWithSizePercent() {
@@ -981,13 +1059,42 @@ struct CommandsTests {
         #expect(built.args?.position == nil)
         #expect(built.args?.sizePercent == nil)
         #expect(built.args?.color == nil)
+        #expect(built.args?.textColor == nil)
+    }
+
+    /// The CLI must take everything the socket does, so a caller can echo back what `tree` handed him and a
+    /// script written against the original vocabulary keeps parsing.
+    @Test(arguments: ["top", "bottom"])
+    func sessionHudAcceptsTheBarePositionAliases(alias: String) throws {
+        let open = try request(["session", "hud", "wait", "--position", alias])
+        let update = try request(["session", "hud", "update", "wait", "--position", alias])
+        #expect(open.args?.position == alias)
+        #expect(update.args?.position == alias)
     }
 
     @Test func sessionHudRejectsBadPosition() {
-        #expect(validationMessage(["session", "hud", "wait", "--position", "middle"])
-            == "position must be one of: top, center, bottom")
-        #expect(validationMessage(["session", "hud", "update", "wait", "--position", "middle"])
-            == "position must be one of: top, center, bottom")
+        let expected = "position must be one of: \(HudPosition.acceptedNamesPhrase)"
+        #expect(validationMessage(["session", "hud", "wait", "--position", "middle"]) == expected)
+        #expect(validationMessage(["session", "hud", "update", "wait", "--position", "middle"]) == expected)
+    }
+
+    @Test func sessionHudCarriesTextColorOnOpenAndUpdate() throws {
+        let open = try request(["session", "hud", "wait", "--text-color", "#7ec07e"])
+        let update = try request(["session", "hud", "update", "done", "--text-color", "#e0e0e0"])
+        #expect(open.args?.textColor == "#7ec07e")
+        #expect(update.args?.textColor == "#e0e0e0")
+    }
+
+    /// The panel's backing is read once at creation, so only the text half is updatable.
+    @Test func sessionHudUpdateTakesNoBackgroundColor() {
+        #expect(validationMessage(["session", "hud", "update", "done", "--background-color", "#112233"]) != nil)
+    }
+
+    @Test func sessionHudRejectsBadTextColor() {
+        #expect(validationMessage(["session", "hud", "wait", "--text-color", "7ec07"])
+            == "text-color must be a #rrggbb hex value")
+        #expect(validationMessage(["session", "hud", "update", "done", "--text-color", "#gggggg"])
+            == "text-color must be a #rrggbb hex value")
     }
 
     @Test func sessionHudRejectsBadSizePercent() {
@@ -1101,6 +1208,18 @@ struct CommandsTests {
     @Test func surfaceZoomTargetsWindow() throws {
         #expect(try request(["surface", "zoom", "hide", "--window", "win"]) ==
             ControlRequest(cmd: .surfaceZoom, target: "active", args: ControlArgs(mode: "hide", window: "win")))
+    }
+
+    @Test func surfaceCursorDefaultsToActive() throws {
+        #expect(try request(["surface", "cursor"]) ==
+            ControlRequest(cmd: .surfaceCursor, target: "active", args: ControlArgs()))
+    }
+
+    @Test func surfaceCursorTargetsSurfaceIDAndWindow() throws {
+        let id = "surface:5E5B1C5B-75C5-49E6-8806-2C61D8D6BBA9:right"
+
+        #expect(try request(["surface", "cursor", "--target", id, "--window", "win"]) ==
+            ControlRequest(cmd: .surfaceCursor, target: id, args: ControlArgs(window: "win")))
     }
 
     // MARK: - pick

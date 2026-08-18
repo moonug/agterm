@@ -58,13 +58,13 @@ extension AppActions {
         return DashboardControllerRegistry.shared.controller(for: windowID)?.isOpen == true
     }
 
-    /// Whether the quick terminal is showing in the window OWNING this session — the session-scoped twin of
-    /// `frontmostQuickTerminal`, window-scoped like `terminalZoomActive(for:)` since each window owns its own
-    /// controller: gating on the frontmost would both drop the focus step for a background target (leaving
-    /// its `splitFocused` and real first responder disagreeing) and miss a cover actually showing there.
-    private func quickTerminalActive(for session: Session) -> Bool {
-        guard let windowID = library.windowID(forSession: session.id) else { return false }
-        return QuickTerminalRegistry.shared.controller(for: windowID)?.isVisible == true
+    /// Whether `session` is selected in its OWN window. The deck mounts every session and only hides the
+    /// unselected ones, so their surfaces still accept first responder and focusing one types into a
+    /// terminal the user cannot see. Control reaches here on background targets; GUI callers select first.
+    /// Unresolvable ownership does not block, like the window-scoped gates below.
+    func sessionIsSelected(_ session: Session) -> Bool {
+        guard let owner = library.store(forSession: session.id) else { return true }
+        return owner.selectedSessionID == session.id
     }
 
     // MARK: - Reveal & focus
@@ -127,7 +127,7 @@ extension AppActions {
         // palette, then opens the .themes picker a tick later) keeps its field focus.
         if palette?.mode != nil { return }
         if pickActive(for: library.activeWindowID) { return }
-        if frontmostQuickTerminal?.isVisible == true { return }
+        if quickTerminal.holdsKey { return }
         if let view = store?.activeSession?.topmostSurface as? GhosttySurfaceView, let window = view.window {
             window.makeFirstResponder(view)
         }
@@ -163,6 +163,7 @@ extension AppActions {
         if terminalZoomActive(for: session) { return }
         if dashboardActive(for: session) { return }
         if pickActive(for: library.windowID(forSession: session.id)) { return }
+        if !sessionIsSelected(session) { return }
         // the inline rename field and an open palette own the keyboard. this loop needs the gate because the
         // `.left`/nil reveal routes here (a plain `session status blocked` with no `--pane`), so a sidebar
         // row click followed inside the ~360ms retry window by ⌘R or a palette open would pull first
@@ -177,8 +178,9 @@ extension AppActions {
             if renamePending { return }
             if palette?.mode != nil { return }
         }
-        // the quick terminal is a window-level cover that owns focus; its own hide restores the session.
-        if quickTerminalActive(for: session) { return }
+        // the quick-terminal panel owns focus above EVERY window, not just this session's; its own hide
+        // restores the session.
+        if quickTerminal.holdsKey { return }
         if let view = session.focusTarget(wantSplit: wantSplit) as? GhosttySurfaceView, let window = view.window {
             window.makeFirstResponder(view)
         }

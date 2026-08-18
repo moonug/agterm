@@ -15,10 +15,9 @@ final class AppActions {
     /// closed (quitting), where callers no-op.
     var store: AppStore? { library.activeStore }
 
-    /// The frontmost window's quick-terminal controller (one per window). Nil when no window is open.
-    var frontmostQuickTerminal: QuickTerminalController? {
-        QuickTerminalRegistry.shared.controller(for: library.activeWindowID)
-    }
+    /// The app's one quick terminal, which lives in a detached panel rather than in a window — so unlike the
+    /// zoom/dashboard/pick controllers beside it there is nothing to resolve and nothing to be nil.
+    var quickTerminal: QuickTerminalController { .shared }
 
     /// The frontmost window's zoom controller; `WindowContentView` renders its target above the chrome.
     private var frontmostTerminalZoom: TerminalZoomController? {
@@ -220,12 +219,17 @@ final class AppActions {
         // a pick is an external caller waiting on an answer: the first ⌘W layer even behind a zoomed terminal,
         // and resolved rather than hidden so the caller can finish.
         if cancelPendingPick(for: library.activeWindowID) { return true }
-        // zoom is the topmost cover: ⌘W dismisses it stepwise (a zoomed quick terminal un-zooms first, the
-        // next ⌘W hides it), never mutating hidden session/window state behind it. the dashboard grid is the
+        // the quick-terminal panel floats above every window, so it outranks anything inside one — the window
+        // rungs below read state the panel is covering, and clearing a zoom the user cannot see is a silent
+        // mutation of state they never touched. Stepwise like zoom: a zoomed panel un-zooms first, the next
+        // ⌘W hides it. Its zoom is app-level (`isZoomed`), NOT a window's `TerminalZoomTarget`.
+        if quickTerminal.holdsKey, quickTerminal.isZoomed { quickTerminal.setZoom(.off); return true }
+        if quickTerminal.holdsKey { quickTerminal.hide(); return true }
+        // zoom is the topmost cover inside the window: ⌘W dismisses it, never mutating hidden session/window
+        // state behind it. the dashboard grid is the
         // other modal cover (mutually exclusive with zoom) — close and refocus, don't close the session.
         if terminalZoomActive { frontmostTerminalZoom?.clear(); return true }
         if let dashboard = frontmostDashboard, dashboard.isOpen { dashboard.close(); focusActiveSession(); return true }
-        if let quick = frontmostQuickTerminal, quick.isVisible { quick.hide(); return true }
         guard let store, let session = store.activeSession else { return false }
         if session.overlayActive { store.closeOverlay(session.id); return true }
         if session.scratchActive { store.toggleScratch(session.id); return true }
@@ -238,6 +242,14 @@ final class AppActions {
         closeSessionAfterConfirmation(session.id, in: store)
         focusActiveSession()
         return true
+    }
+
+    /// The whole close-session keystroke as File ▸ Close Session performs it: dismiss the frontmost cover or
+    /// close the active session, and when there was neither — a zero-session window — close `window` instead.
+    /// Shared with the key monitor so a `close_session` alternative cannot be the one binding that dies in a
+    /// window with nothing left to close.
+    func closeActiveSessionOrWindow(_ window: NSWindow?) {
+        if !closeActiveSession() { window?.performClose(nil) }
     }
 
     /// Resolve the pending picker owned by `windowID` as cancelled. Used by ⌘W and app termination;
@@ -415,6 +427,21 @@ final class AppActions {
     func selectFirstSession() { navigatePlain(.first) }
     func selectLastSession() { navigatePlain(.last) }
 
+    /// Step the CURRENT workspace prev/next through the sidebar's visible order and select its first session,
+    /// through shared `navigateWorkspace` so the menu, the palette and `workspace.go` can't drift. Notes the
+    /// step as user activity like session nav, then routes pane reveal off the step's captured indicator —
+    /// the same treatment plain session nav gives, so where focus lands does not depend on which keystroke
+    /// got you there. A step with nowhere to go (flagged mode, one visible workspace) leaves focus alone.
+    private func navigateWorkspace(_ direction: WorkspaceNavigation) {
+        guard uiActionsEnabled else { return }
+        store?.noteUserActivity()
+        guard let step = store?.navigateWorkspace(direction) else { return }
+        revealActiveBlockedPane(captured: step.indicator)
+    }
+
+    func selectNextWorkspace() { navigateWorkspace(.next) }
+    func selectPreviousWorkspace() { navigateWorkspace(.previous) }
+
     /// Step to the next/previous session needing attention (`blocked`/`completed`), wrapping and skipping
     /// idle/active, through `navigateSession` shared with the palette and `session.go next-attention|prev-attention`.
     /// Notes user activity like plain nav, then `revealActiveBlockedPane` focuses the split/scratch pane that
@@ -520,8 +547,22 @@ final class AppActions {
         NotificationCenter.default.post(name: .agtermCollapseWorkspaces, object: store)
     }
 
-    /// Collapse/expand a SINGLE workspace in `store`'s window sidebar — the `workspace.collapse`/`.expand`
-    /// control path and its only caller (a GUI row click drives the outline directly). Persists
+    /// Fold or unfold the CURRENT workspace alone, for the keyless `toggle_workspace_collapse`, its View-menu
+    /// item and its palette row. The per-workspace counterpart of Expand / Collapse Workspaces, which act on
+    /// every row and deliberately keep this one open — so before this there was no built-in way to fold the
+    /// workspace you are in. Tree mode only, matching those two and the rows it acts on. Targets what the row
+    /// SHOWS (`isCurrentWorkspaceCollapsed`), not what is persisted: a reveal routinely leaves this workspace
+    /// open on screen while its stored flag still says collapsed, and toggling the stored flag there costs the
+    /// user a keystroke that changes nothing he can see.
+    func toggleActiveWorkspaceCollapse() {
+        guard uiActionsEnabled else { return }
+        guard let store, store.sidebarMode == .tree, let id = store.currentWorkspaceID else { return }
+        setWorkspaceExpanded(id, expanded: store.isCurrentWorkspaceCollapsed, in: store)
+    }
+
+    /// Collapse/expand a SINGLE workspace in `store`'s window sidebar — the shared path for
+    /// `workspace.collapse`/`.expand` and for `toggleActiveWorkspaceCollapse` above (a GUI row click drives
+    /// the outline directly instead). Persists
     /// `Workspace.isExpanded` DIRECTLY on the store (source of truth for the `collapsed` read-back,
     /// delta-guarded so it's idempotent), THEN posts a store-scoped notification so that window's Coordinator
     /// syncs the live outline row and its tracked expansion set. The persist must NOT ride the notification:
@@ -662,7 +703,7 @@ final class AppActions {
 
     // MARK: - Split
 
-    /// Toggle the active session's split. A NEW split shows both panes and focuses the new (right) one;
+    /// Toggle the active session's vertical split. A NEW split shows both panes and focuses the new one;
     /// closing only HIDES it (both shells stay alive) and maximizes the focused pane, so reopening restores
     /// both in their original positions with the SAME pane focused — focus follows `splitFocused`, which
     /// `AppStore.toggleSplit` moves only for a genuinely new split.
@@ -673,13 +714,42 @@ final class AppActions {
     /// scratch shell survives. A full overlay runs a caller's program that must not be closed under it, so
     /// the press is inert. Control's `session.split` keeps acting on the deck behind either cover.
     func toggleSplit() {
+        toggleSplit(axis: .leftRight)
+    }
+
+    /// Toggle the active session's horizontal split, or transpose a shown vertical split in place.
+    func toggleHorizontalSplit() {
+        toggleSplit(axis: .topBottom)
+    }
+
+    /// Preserve the current axis. Used by the titlebar's stateful split button rather than either
+    /// orientation-specific menu/keymap action.
+    func toggleCurrentSplit() {
+        toggleSplit(axis: nil)
+    }
+
+    private func toggleSplit(axis: SplitAxis?) {
         guard uiActionsEnabled else { return }
         guard let store, let session = store.activeSession else { return }
         guard !session.fullOverlayActive else { return }
         // the deck's `scratchActive` onChange reclaims first responder for the pane, as it does for ⌘J.
         if session.scratchActive { store.toggleScratch(session.id); return }
-        store.toggleSplit(session.id)
+        store.toggleSplit(session.id, axis: axis)
         focusSplitPane(session, wantSplit: session.splitFocused)
+    }
+
+    /// The palette's Close Split, GUI twin of `session.split.close`. Gated on `hasSplit`, so the hidden
+    /// split ⌘D leaves behind is reachable. Immediate and unconfirmed like the other pane teardowns; the
+    /// confirm and undo window stay with `closeActiveSession`. Carries `toggleSplit`'s cover rungs, which
+    /// matter more here: behind a cover this destroys a live shell instead of rearranging panes, so the
+    /// dismissed scratch makes the teardown a second, deliberate press with the panes in view.
+    func closeSplit() {
+        guard uiActionsEnabled else { return }
+        guard let store, let session = store.activeSession else { return }
+        guard session.hasSplit, !session.fullOverlayActive else { return }
+        if session.scratchActive { store.toggleScratch(session.id); return }
+        store.closeSplit(session.id)
+        focusSplitPane(session, wantSplit: false)
     }
 
     /// Show/hide the active session's scratch terminal, a third full-overlay login shell. Focus rides the
@@ -724,17 +794,27 @@ final class AppActions {
     /// item's own key equivalent), the palette's `runPaletteCommand`, and the Dock item's invocation check.
     func toggleQuickTerminal() {
         guard uiActionsEnabled else { return }
-        frontmostQuickTerminal?.toggle()
+        quickTerminal.toggle()
     }
 
-    /// Toggle the frontmost window's full-window terminal zoom. Core resolves which surface is active
-    /// (quick, overlay, scratch, split, or primary); the owning window renders it above all chrome.
+    /// Toggle terminal zoom for whatever the user is actually looking at: the quick-terminal panel when it
+    /// owns the keyboard, else the frontmost window's active surface (core resolves overlay, scratch, split
+    /// or primary; the owning window renders it above all chrome).
+    ///
+    /// The panel rung is not optional. The chord still reaches agterm while the panel is key, but the panel
+    /// is no longer a `TerminalZoomTarget` a window can hold — so without it the keystroke would arm zoom on
+    /// a window BEHIND the panel, changing nothing on screen and leaving a window the user may not even have
+    /// visible zoomed with its sidebar gone. Same rule as `closeActiveSession`: never mutate covered state.
     func toggleTerminalZoom() {
         guard !pickActive(for: library.activeWindowID) else { return }
+        if quickTerminal.holdsKey {
+            quickTerminal.setZoom(.toggle)
+            return
+        }
         frontmostTerminalZoom?.toggle()
     }
 
-    /// Toggle the frontmost window's dashboard — the ⌘⇧D / Navigate ▸ Dashboard MRU grid, equivalent to
+    /// Toggle the frontmost window's dashboard, the ⌘⇧G / Navigate ▸ Dashboard MRU grid, equivalent to
     /// `agtermctl dashboard --mru --auto-size`. Inert while terminal zoom or a pending picker is up, but NOT
     /// while the dashboard itself is open, so the grid stays its own escape hatch. Open → close and refocus;
     /// closed → open over the window's most-recently-used sessions, auto-sized; no-op with none.
@@ -757,7 +837,9 @@ final class AppActions {
     }
 
     /// Toggle native macOS full screen for the key window: the green traffic-light behavior, moving the window
-    /// to its own Space; a second invocation exits. Shared by ⌃⌘F, the palette, `toggle_fullscreen`, `window.fullscreen`.
+    /// to its own Space; a second invocation exits. The palette's entry alone — `toggle_fullscreen`'s chord
+    /// calls `NSWindow.toggleFullScreen` from the key monitor and `window.fullscreen` through
+    /// `WindowRegistry`, so neither routes here.
     func toggleFullscreen() { NSApp.keyWindow?.toggleFullScreen(nil) }
 
     // MARK: - Font (on the focused terminal)
@@ -799,7 +881,7 @@ final class AppActions {
     /// overlay is NOT a term here — `searchTarget` owns that rung, in the one order that gets the
     /// scratch-above-a-pane-overlay case right; duplicating it here would block ⌘F on the searchable scratch.
     private var coverHidesActiveSession: Bool {
-        if frontmostQuickTerminal?.isVisible == true { return true }
+        if quickTerminal.holdsKey { return true }
         guard let session = store?.activeSession else { return false }
         // a FLOATING overlay leaves the session visible, so only a FULL overlay hides it (and is not searchable).
         return session.fullOverlayActive

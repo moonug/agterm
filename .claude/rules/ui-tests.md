@@ -18,6 +18,13 @@ These run inside the app, so a mistake can kill the host instead of failing an a
   item-header/payload pairs, write the minidump attachment as `.dmp`, then run
   `lldb -b -o "bt all" -c <dmp>`. CI discards both sources, so temporarily upload the crash directory
   and `build/DerivedData/Logs/Test/*.xcresult` under `if: failure()`, then remove the step.
+- **A menu fixture needs `NSMenuItem.usesUserKeyEquivalents = false` in `setUp`, restored in `tearDown`.**
+  AppKit substitutes an App Shortcut from System Settings by menu-item title as soon as the item joins a
+  menu, a detached one included, replacing the key equivalent and mask the test just set. Titles like
+  "Paste and Match Style", "Zoom" and "Close" are real system commands, so a developer who rebound one
+  fails on his machine alone while CI stays green. `defaults read -g NSUserKeyEquivalents` names the
+  bindings. Suppress the substitution rather than renaming fixtures: `CloseSessionChordTests` needs the
+  real "Close" to test chord ownership, and the substitution matches invented titles just as readily.
 - Never stub `GhosttyApp`; its handler is the only crash record.
 - `AGTERM_HOSTED_TESTS=1`, set by the `agtermTests` scheme, renders `Color.clear` and skips the scene task
   that assigns `appDelegate.library`; it stays nil. SwiftUI's `@NSApplicationDelegateAdaptor` also makes
@@ -66,8 +73,11 @@ These run inside the app, so a mistake can kill the host instead of failing an a
   keyboard/mouse events even in the background. Run them before handoff or after the user finishes.
   Host-free tests are safe.
 - Always run `cd agtermCore && swift test`, normally about 0.2 seconds. Ask before XCUITest.
-  The suite is about 75 seconds per
-  class and 460 seconds for all 77; target exact affected methods with one
+  The tree is 44 classes and 429 methods, and a class costs about its own test bodies: 31 seconds for
+  EditMenu's four, 7.5 minutes for ControlAPI's 82. Per-method preamble is about 0.1 seconds; if it
+  returns to 18-25 seconds the scheme's `preferredScreenCaptureFormat` has regressed to
+  `screenRecording`, whose per-method video startup made a full run take 2.5 hours.
+  Target exact affected methods with one
   `-only-testing:agtermUITests/<Class>/<method>` each. A behavior-preserving extraction with unchanged AX
   identifiers needs `make build` and lint, not UI tests. Recommend a class/broader run only for changed
   cross-cutting behavior such as launch, signing/bundle, eager-deck, or scene/window wiring.
@@ -98,8 +108,10 @@ These run inside the app, so a mistake can kill the host instead of failing an a
   quit-confirm modal. `MultiWindowUITests` survives hard termination only because structural saves
   already persist the open set. Use a temp file, not unreliable `NSLog`, to instrument the callback.
 - Dismiss Settings by the close button of `app.windows.containing(.any, identifier: <a control on the
-  tab>)`, never ⌘W: that reaches the app's Close Session command and takes the seeded session with it,
-  which a session-row-count oracle reads as a collapse rather than as a closed session.
+  tab>)`. ⌘W also closes it and leaves the deck alone (issue #401, pinned by
+  `SettingsUITests.testCommandWClosesTheSettingsWindowNotTheSession`), but only while Settings is KEY —
+  the reopen path above can leave it open and non-key, where ⌘W reaches the terminal window behind it
+  and takes a session with it.
 - `ghostty_surface_foreground_pid` is `tcgetpgrp`, so it returns the foreground process GROUP id. Under a
   job-control shell that leader IS the program; a `--command` pane has no such shell and its leader is
   unreadable setuid-root `login`, which is why the tree read descends to the leader's children and the

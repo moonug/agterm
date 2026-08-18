@@ -174,28 +174,33 @@ extension WindowContentView {
         let isSplit = store.activeSession?.isSplit ?? false
         let hasSplit = store.activeSession?.hasSplit ?? false
         let splitFocused = store.activeSession?.splitFocused ?? false
+        let axis = store.activeSession?.splitAxis ?? .leftRight
+        let shortcutAction: BuiltinAction = axis == .topBottom ? .toggleHorizontalSplit : .toggleSplit
         // filled = pane visible, outline = hidden: no split is an empty two-pane outline, a shown split fills
-        // both, a collapsed one (hasSplit, not shown) fills only the visible half — left for the primary, right
-        // for the split (`splitFocused` is the shown pane when hidden) — naming the pane up and the one parked.
-        // `a11y` mirrors the four states for XCUITest, which can't read the symbol name.
+        // both, and a collapsed one fills the visible leading or trailing half on the current axis.
+        // `splitFocused` identifies that visible pane. `a11y` mirrors all seven states for XCUITest, which
+        // cannot read the symbol name: none, both, both-horizontal, left, right, top, and bottom.
         let symbol: String
         let a11y: String
         if !hasSplit {
             symbol = "rectangle.split.2x1"; a11y = "none"
         } else if isSplit {
-            symbol = "rectangle.split.2x1.fill"; a11y = "both"
+            symbol = axis == .topBottom ? "rectangle.split.1x2.fill" : "rectangle.split.2x1.fill"
+            a11y = axis == .topBottom ? "both-horizontal" : "both"
         } else if splitFocused {
-            symbol = "rectangle.righthalf.filled"; a11y = "right"
+            symbol = axis == .topBottom ? "rectangle.bottomhalf.filled" : "rectangle.righthalf.filled"
+            a11y = axis == .topBottom ? "bottom" : "right"
         } else {
-            symbol = "rectangle.lefthalf.filled"; a11y = "left"
+            symbol = axis == .topBottom ? "rectangle.tophalf.filled" : "rectangle.lefthalf.filled"
+            a11y = axis == .topBottom ? "top" : "left"
         }
         return Button {
-            actions.toggleSplit()
+            actions.toggleCurrentSplit()
         } label: {
             // a Label (icon + title) so the toolbar's "Icon and Text" mode has text; hidden in icon-only mode.
             Label("Split", systemImage: symbol)
         }
-        .help(helpHint(isSplit ? "Hide split" : (hasSplit ? "Show split" : "Split right"), .toggleSplit))
+        .help(helpHint(isSplit ? "Hide split" : (hasSplit ? "Show split" : "Split right"), shortcutAction))
         .disabled(store.activeSession == nil)
         .accessibilityValue(a11y)
         .accessibilityIdentifier("split-toggle")

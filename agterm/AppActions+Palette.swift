@@ -1,3 +1,4 @@
+import AppKit
 import agtermCore
 import Foundation
 
@@ -16,7 +17,9 @@ extension AppActions {
         return keymap.glyphHint(for: action)
     }
 
-    private var paletteContext: PaletteContext {
+    /// The live facts behind `PaletteCommand.isEnabled(in:)`. Read by the palette rows, by `perform(_:in:)`
+    /// and by the menu items in `agtermApp+Menus`, so the three read one predicate over one set of facts.
+    var paletteContext: PaletteContext {
         let activeStore = store
         return PaletteContext(
             canRemoveWorkspace: activeStore?.canRemoveWorkspace == true,
@@ -26,21 +29,41 @@ extension AppActions {
             activeSessionFlagged: activeStore?.activeSession?.flagged == true,
             hasMarkedWorkspaces: activeStore?.focusedWorkspaceIDs.isEmpty == false,
             activeWorkspaceMarked: activeStore?.isCurrentWorkspaceFocusMember == true,
+            activeWorkspaceCollapsed: activeStore?.isCurrentWorkspaceCollapsed == true,
+            canStepWorkspaces: activeStore?.canStepWorkspaces == true,
             activeSessionHasSplit: activeStore?.activeSession?.hasSplit == true,
+            activeSplitAxis: activeStore?.activeSession?.splitAxis,
             hasPendingClose: activeStore?.pendingCloseSummary != nil,
-            hasRecentClosed: !library.recentClosedItems.isEmpty
+            hasRecentClosed: !library.recentClosedItems.isEmpty,
+            hasActiveSession: activeStore?.activeSession != nil,
+            hasCurrentWorkspace: activeStore?.currentWorkspaceID != nil,
+            terminalZoomActive: terminalZoomActive,
+            dashboardOpen: frontmostDashboard?.isOpen == true,
+            pickerActive: pickActive(for: library.activeWindowID)
         )
     }
 
+    /// `context` supplies only the title, which the palette's own rebuild refreshes. Enablement takes a closure
+    /// over LIVE state instead: the row renders and runs against the state of the moment, not of the last build.
     private func paletteItem(for command: PaletteCommand, context: PaletteContext) -> PaletteItem {
         PaletteItem(title: command.title(in: context),
-                    shortcut: command.builtinAction.flatMap { shortcutGlyph(for: $0) }) { [weak self] in
-            self?.runPaletteCommand(command)
-        }
+                    shortcut: command.builtinAction.flatMap { shortcutGlyph(for: $0) },
+                    isEnabled: { [weak self] in
+                        guard let self else { return false }
+                        return command.isEnabled(in: paletteContext)
+                    },
+                    run: { [weak self] in self?.runPaletteCommand(command) })
     }
 
+    /// The row's body keeps the predicate too, so a caller reaching `run` without asking `isEnabled` still
+    /// cannot run a disabled action.
     private func runPaletteCommand(_ command: PaletteCommand) {
-        guard uiActionsEnabled || command == .toggleTerminalZoom else { return }
+        guard command.isEnabled(in: paletteContext) else { return }
+        dispatch(command)
+    }
+
+    /// The action behind a palette row, ungated: both callers apply `PaletteCommand.isEnabled(in:)` first.
+    private func dispatch(_ command: PaletteCommand) {
         switch command {
         case .newSession: newSession()
         case .newWorkspace: newWorkspace()
@@ -56,10 +79,14 @@ extension AppActions {
         case .nextSession: selectNextSession()
         case .previousAttentionSession: selectPreviousAttentionSession()
         case .nextAttentionSession: selectNextAttentionSession()
+        case .previousWorkspace: selectPreviousWorkspace()
+        case .nextWorkspace: selectNextWorkspace()
         case .firstSession: selectFirstSession()
         case .lastSession: selectLastSession()
         case .showAttention: openAttentionPalette()
         case .toggleSplit: toggleSplit()
+        case .toggleHorizontalSplit: toggleHorizontalSplit()
+        case .closeSplit: closeSplit()
         case .toggleScratch: toggleScratch()
         case .toggleTerminalZoom: toggleTerminalZoom()
         case .toggleSidebar: toggleSidebar()
@@ -85,8 +112,48 @@ extension AppActions {
         case .toggleWorkspaceFilter: toggleFocusFilter()
         case .expandWorkspaces: expandAllWorkspaces()
         case .collapseWorkspaces: collapseOtherWorkspaces()
+        case .toggleWorkspaceCollapse: toggleActiveWorkspaceCollapse()
         case .focusLeftPane: focusPane(.main)
         case .focusRightPane: focusPane(.split)
+        }
+    }
+
+    /// Run a built-in action fired by `CustomCommandRunner`'s key monitor in `window` — a `map` line's
+    /// alternative beyond the menu key equivalent. The MENU chord is the reference behavior: an alternative of
+    /// a line does what its menu-bound sibling does, so it runs the palette row's body behind
+    /// `isEnabled(in:)`, the predicate the menu item spells as its `.disabled(…)`. The rest go through
+    /// `paletteLessHandler(for:)`, whose entry points carry their gate themselves.
+    func perform(_ action: BuiltinAction, in window: NSWindow?) {
+        if let command = PaletteCommand.allCases.first(where: { $0.builtinAction == action }) {
+            guard command.isEnabled(in: paletteContext) else { return }
+            // the MENU's close rung, not the palette's: with no cover and no session left to close, ⌘W closes
+            // the window — the zero-session window a keybind still fires in. The menu's other rung, an
+            // auxiliary key window keeping its own ⌘W, is unreachable here: the monitor fires only inside an
+            // agterm terminal window.
+            if command == .closeSession {
+                closeActiveSessionOrWindow(window)
+                return
+            }
+            dispatch(command)
+            return
+        }
+        paletteLessHandler(for: action)?()
+    }
+
+    /// The entry point for a built-in that no `PaletteCommand` row owns — window management and the three
+    /// palette launchers, each already gated where it needs to be — and nil for every action the palette
+    /// covers. The SINGLE listing of those actions: `perform(_:)` dispatches through it and
+    /// `AppActionsPaletteTests` partitions `BuiltinAction.allCases` across it and `PaletteCommand`, so a new
+    /// action reaching neither fails a test instead of binding a key that swallows itself and does nothing.
+    func paletteLessHandler(for action: BuiltinAction) -> (() -> Void)? {
+        switch action {
+        case .newWindow: return { self.newWindow() }
+        case .renameWindow: return renameActiveWindow
+        case .deleteWindow: return deleteActiveWindow
+        case .sessionPalette: return toggleSessionPalette
+        case .commandPalette: return toggleActionPalette
+        case .customCommandPalette: return toggleCustomCommandPalette
+        default: return nil
         }
     }
 
@@ -191,20 +258,22 @@ extension AppActions {
         palette?.toggle(.attention)
     }
 
-    /// Menu/keymap palette launchers route through actions, not `palette.toggle`, so terminal zoom's modal UI
-    /// guard applies consistently to the keyboard-shortcut and menu paths.
+    /// Menu/keymap palette launchers route through actions, not `palette.toggle`, so the modal UI guard applies
+    /// consistently to the keyboard-shortcut and menu paths. The full `uiActionsEnabled` and not zoom/picker
+    /// alone: their menu items carry the `modalActive` mirror, so a launcher must not open a palette over the
+    /// dashboard grid the menu item refuses to open it over.
     func toggleSessionPalette() {
-        guard !terminalZoomActive, !pickActive(for: library.activeWindowID) else { return }
+        guard uiActionsEnabled else { return }
         palette?.toggle(.sessions)
     }
 
     func toggleActionPalette() {
-        guard !terminalZoomActive, !pickActive(for: library.activeWindowID) else { return }
+        guard uiActionsEnabled else { return }
         palette?.toggle(.actions)
     }
 
     func toggleCustomCommandPalette() {
-        guard !terminalZoomActive, !pickActive(for: library.activeWindowID) else { return }
+        guard uiActionsEnabled else { return }
         palette?.toggle(.customCommands)
     }
 

@@ -43,7 +43,10 @@ paths:
   toggle. This click routing is keep-in-sync exempt. `GhosttyApp.workspaceRowClickExpands` (default on)
   gates the whole-row target only; the disclosure triangle toggles natively and stays unconditional.
   The deferred item re-reads that mirror when it fires, so turning the setting off inside the deferral
-  window cancels the pending toggle. Control expansion instead persists through
+  window cancels the pending toggle. Route the row-click toggle through `outline.animator()` so it animates
+  like the triangle; a bare `expandItem`/`collapseItem` silently drops the animation. Do not gate that on
+  Reduce Motion — both hit targets reach the same AppKit animation, so a gate would re-split them. Every
+  other expand/collapse site stays unanimated: bulk or programmatic. Control expansion instead persists through
   `AppActions.setWorkspaceExpanded`, then posts `.agtermSetWorkspaceExpanded` to synchronize a live outline.
 - A session-row click selects, then asynchronously calls `revealActiveBlockedPane` with the captured
   pre-reset indicator. Blocked/completed pane tags reveal split, scratch, or primary; idle and active use
@@ -60,7 +63,10 @@ paths:
 - Right-click inside a selection preserves it; outside narrows to the clicked row.
   `sidebarSelectionTargets` filters through the visible projection. Batch move, soft close, flag, and
   clear-status operate on all targets.
-- Rename, Duplicate Session, and Reveal in Finder appear only for one target. Duplicate inserts a fresh
+- Copy Name writes `Session.displayName`, or the workspace name, to `NSPasteboard.general`. A blank
+  workspace name and a vanished row both count as absent, and nothing to copy leaves the pasteboard
+  untouched rather than clearing it. No control form — see `control-api.md`.
+- Rename, Copy Name, Duplicate Session, and Reveal in Finder appear only for one target. Duplicate inserts a fresh
   login-shell session immediately after the source in the same workspace, using only
   `Session.focusedCwd`. It does not copy name, command, panes, status, flag, font size, or watermark.
   `session.duplicate` provides the control form; its `tree.cwd` can differ from focused cwd when a split's
@@ -158,7 +164,9 @@ paths:
   leave the data source, so expand/collapse delegate callbacks and `expandAll` update the set and
   `rebuildAndReload` reapplies it after flagged-mode round trips.
 - Expand Workspaces opens all. Collapse Workspaces closes all except the active workspace and scrolls it
-  visible. Scope notifications by the target `AppStore` object so only that window's Coordinator acts.
+  visible. Collapse/Expand Workspace (singular, `toggle_workspace_collapse`) folds the active one alone,
+  which is the row those two never fold; it routes through `AppActions.setWorkspaceExpanded(_:expanded:in:)`,
+  the same persist-then-notify path as `workspace.collapse`/`.expand`. Scope notifications by the target `AppStore` object so only that window's Coordinator acts.
   Both no-op in flagged mode. Menus/palette target frontmost; `sidebar.expand`/`sidebar.collapse` resolve
   `--window` and can target background windows.
 

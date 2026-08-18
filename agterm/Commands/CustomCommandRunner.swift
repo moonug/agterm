@@ -7,7 +7,8 @@ private let logger = Logger(subsystem: "com.umputun.agterm", category: "CustomCo
 /// Drives user-defined custom commands: an app-wide `NSEvent` local key monitor turns key presses into
 /// chords, a `CustomCommandEngine` resolves them (simple chords and leader sequences like `ctrl+a > g`), and
 /// a fired command runs detached as `/bin/sh -c` with the session's context in `{AGT_X}` tokens and `$AGT_X`
-/// environment.
+/// environment. The same matcher also carries the built-in binds an `NSMenuItem` key equivalent cannot hold —
+/// a `map` line's alternatives beyond its first single chord — dispatched through `AppActions.perform(_:in:)`.
 ///
 /// Constructed once as `@State` in `agtermApp`. `start()`/`stop()` install/remove the monitor; `start()` is
 /// idempotent because the scene `.task` fires once per window, and the matcher rebuilds there and on
@@ -17,6 +18,7 @@ private let logger = Logger(subsystem: "com.umputun.agterm", category: "CustomCo
 final class CustomCommandRunner {
     private let library: WindowLibrary
     private let settings: SettingsModel
+    private let actions: AppActions
     private let socketProvider: () -> String
 
     private var commandEngine = CustomCommandEngine(commands: [])
@@ -28,9 +30,11 @@ final class CustomCommandRunner {
     /// How long a half-typed leader sequence waits for its next chord before abandoning (kitty-style).
     private static let leaderTimeout: TimeInterval = 1.5
 
-    init(library: WindowLibrary, settings: SettingsModel, socketProvider: @escaping () -> String) {
+    init(library: WindowLibrary, settings: SettingsModel, actions: AppActions,
+         socketProvider: @escaping () -> String) {
         self.library = library
         self.settings = settings
+        self.actions = actions
         self.socketProvider = socketProvider
     }
 
@@ -59,17 +63,13 @@ final class CustomCommandRunner {
         cancelLeaderTimer()
     }
 
-    /// Rebuild the matcher and the id→command map from the current keymap, skipping empty shortcuts
-    /// (palette-only commands have none). `parseKeymap`'s cross-section validation already empties the
-    /// shortcut of a command colliding with a built-in or another custom one, so it drops out of the matcher.
+    /// Rebuild the matcher from the current keymap — custom commands plus the built-in monitor binds — skipping
+    /// empty shortcuts (palette-only commands have none). `parseKeymap`'s cross-section validation already
+    /// empties the shortcut of a command colliding with a built-in or another custom one, so it drops out of
+    /// the matcher.
     private func rebuild() {
-        let commands = settings.keymap.commands
-        for command in commands where !command.shortcut.isEmpty {
-            if parseKeybind(command.shortcut) == nil {
-                logger.notice("custom command \"\(command.name, privacy: .public)\" has invalid shortcut \"\(command.shortcut, privacy: .public)\"; skipping keybind")
-            }
-        }
-        commandEngine = CustomCommandEngine(commands: commands)
+        let keymap = settings.keymap
+        commandEngine = CustomCommandEngine(commands: keymap.commands, builtinSequences: keymap.builtinSequences)
         cancelLeaderTimer()
     }
 
@@ -78,7 +78,9 @@ final class CustomCommandRunner {
     private static let escapeKeyCode: UInt16 = 53
 
     /// Feed one key event to the matcher; returns whether it was consumed (so the caller drops it). Esc while
-    /// armed resets, `.fired` runs, `.armed` arms the leader timer — all consumed; `.unmatched` passes through.
+    /// armed resets, `.fired` runs a command, `.firedBuiltin` runs a built-in action, `.armed` arms the leader
+    /// timer, and `toggle_fullscreen`'s chord toggles full screen without reaching the matcher at all — all
+    /// consumed; `.unmatched` passes through.
     ///
     /// Acts when the key window's first responder is a terminal surface (context from that surface), or when
     /// the key window is an agterm terminal window whose focus is NOT on a text field — including one emptied
@@ -86,8 +88,16 @@ final class CustomCommandRunner {
     /// search) so a bound chord never eats those keystrokes, and for an auxiliary window focused off a text
     /// field. A key repeat is ignored, so a held-down shortcut spawns one process, not one per OS repeat.
     private func handleKeyDown(_ event: NSEvent) -> Bool {
-        guard !event.isARepeat else { return false }
         guard let keyWindow = NSApp.keyWindow else { return false }
+        return handleKeyDown(event, in: keyWindow)
+    }
+
+    /// Everything after the key-window lookup, split out so a test can supply the window: a hosted test's
+    /// own window never becomes `NSApp.keyWindow` (the app is not active), so `handleKeyDown(_:)` returns at
+    /// that guard and none of this runs. Internal for that reason alone, like
+    /// `ControlServer.collectKeyEquivalents`.
+    func handleKeyDown(_ event: NSEvent, in keyWindow: NSWindow) -> Bool {
+        guard !event.isARepeat else { return false }
         let responder = keyWindow.firstResponder
         // a focused text field is the window's NSText field editor and must keep its keystrokes: drop the
         // half-typed leader, pass through.
@@ -119,6 +129,16 @@ final class CustomCommandRunner {
             // a key with no usable base (e.g. a bare modifier) can't advance; while armed, keep waiting.
             return false
         }
+        // `toggle_fullscreen` is the one built-in with no menu item to carry its equivalent: AppKit appends
+        // the only full screen item there is, at menu-display time, and an item of agterm's own beside it is
+        // the duplicate this avoids. So the rebindable chord is matched here instead. A half-typed leader
+        // sequence still wins, exactly as it does over a custom command sharing its first chord.
+        // Its MENU chord alone comes through here, ungated; an alternative of the same `map` line goes the
+        // ordinary `.firedBuiltin` route and so takes that route's modal rule.
+        if !commandEngine.isArmed, chord == settings.keymap.equivalent(for: .toggleFullscreen) {
+            keyWindow.toggleFullScreen(nil)
+            return true
+        }
         switch commandEngine.advance(chord) {
         case .fired(let command):
             cancelLeaderTimer()
@@ -129,6 +149,14 @@ final class CustomCommandRunner {
                 // no fired-from surface: the active session if one exists, else the launcher path.
                 runNoSurface(command)
             }
+            return true
+        case .firedBuiltin(let action):
+            cancelLeaderTimer()
+            // no focusedSurface/runNoSurface split: a built-in acts on the active session and key window,
+            // like the palette row behind it. Consumed even when `perform` finds the action gated out: the
+            // gate lives inside each action, so this cannot see the outcome, and passing a leader's LAST chord
+            // through after swallowing its prefix would type a stray character into the terminal.
+            actions.perform(action, in: keyWindow)
             return true
         case .armed:
             startLeaderTimer()
@@ -217,17 +245,35 @@ final class CustomCommandRunner {
     }
 
     /// The keybind fallback for a sessionless focused surface (quick terminal, overlay, scratch). The scratch
-    /// belongs to the ACTIVE session, so a chord from it runs against that session with `pane = .scratch` and
-    /// reads the scratch's own selection — the read leg of `$AGT_PANE` → `session type --pane scratch`. The
-    /// others are not panes and take the plain palette path.
+    /// and the overlays belong to the ACTIVE session, so a chord from one runs against that session and reads
+    /// THAT surface's own selection — the read leg of `$AGT_PANE` → `session type --pane scratch`. The quick
+    /// terminal is nobody's pane and takes the plain palette path.
     private func runFromSessionlessSurface(_ command: CustomCommand, focusedSurface: GhosttySurfaceView) {
-        if let store = library.activeStore, let session = store.activeSession,
-           (session.scratchSurface as? GhosttySurfaceView) === focusedSurface {
-            let context = self.context(for: session, in: store, selectionSurface: focusedSurface, pane: .scratch)
-            spawn(command, context: context)
+        guard let store = library.activeStore, let session = store.activeSession,
+              let pane = sessionlessPane(of: focusedSurface, in: session) else {
+            runNoSurface(command)
             return
         }
-        runNoSurface(command)
+        let context = self.context(for: session, in: store, selectionSurface: focusedSurface, pane: pane)
+        spawn(command, context: context)
+    }
+
+    /// Which pane `session`'s sessionless surface reports as `$AGT_PANE`, nil when the surface is not one of
+    /// them (the quick terminal). The scratch names itself; an overlay names the surface UNDERNEATH it, so a
+    /// note taken in it still pastes back through `session type --pane` — the overlay's own buffer is
+    /// `session overlay copy`/`text`, which `CommandContext.Pane` deliberately cannot spell.
+    private func sessionlessPane(of surface: GhosttySurfaceView, in session: Session) -> CommandContext.Pane? {
+        if (session.scratchSurface as? GhosttySurfaceView) === surface { return .scratch }
+        let overlayPane = session.paneOverlayRole(of: surface)
+        guard overlayPane != nil || (session.overlaySurface as? GhosttySurfaceView) === surface else {
+            return nil
+        }
+        // what is underneath is what `topmostSurface` resolves once this overlay closes, and that is the
+        // SCRATCH whenever one is up: a session-wide overlay sits above it, and it in turn covers a pane
+        // overlay. Naming a pane there routes the reply into a surface the user cannot see.
+        if session.scratchActive { return .scratch }
+        guard let overlayPane else { return session.focusedPane == .right ? .right : .left }
+        return overlayPane == .right ? .right : .left
     }
 
     /// Keybind fire with NO usable fired-from session — an emptied window, or focus off any surface. Uses the
@@ -284,14 +330,19 @@ final class CustomCommandRunner {
     }
 
     /// Spawn the expanded command as a detached `/bin/sh -c`, exporting `$AGT_*` over the app environment and
-    /// running in the session's cwd. A spawn error or non-zero exit posts a failure banner; no output
-    /// capture, no success banner.
+    /// running in the session's cwd. `PATH` is widened first (`CommandPath`): the app's own is launchd's, and
+    /// `sh -c` runs no profile, so a bare `agtermctl` would exit 127. A spawn error or non-zero exit posts a
+    /// failure banner; no output capture, no success banner.
     private func spawn(_ command: CustomCommand, context: CommandContext) {
         let line = context.expand(command.command)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", line]
-        process.environment = ProcessInfo.processInfo.environment.merging(context.environment()) { _, new in new }
+        var environment = ProcessInfo.processInfo.environment.merging(context.environment()) { _, new in new }
+        environment["PATH"] = CommandPath.widened(environment["PATH"],
+                                                  bundledCLIDirectory: CLIInstaller.bundledTool?
+                                                      .deletingLastPathComponent().path)
+        process.environment = environment
         // fire-and-forget: pin stdio to /dev/null rather than inherit the app's fds, which vary by launch.
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice

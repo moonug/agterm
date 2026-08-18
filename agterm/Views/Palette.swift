@@ -24,11 +24,19 @@ struct PaletteItem: Identifiable {
     /// Fired when this item BECOMES the selection (keyboard navigation), distinct from `run` (Enter/click).
     /// Only `.themes` sets it, driving the live theme preview.
     let onSelect: (() -> Void)?
+    /// Whether the row can run right now, asked of LIVE state on every render and again at the keystroke —
+    /// never cached — because a session can exit or a cover open while the palette sits there. False for a row
+    /// the palette LISTS but cannot run, an action whose menu item is disabled (`PaletteCommand.isEnabled(in:)`):
+    /// it renders like a disabled menu item and stays searchable rather than vanishing, since the palette is
+    /// where a user looks the action up.
+    let isEnabled: () -> Bool
     let run: () -> Void
 
     init(id: String? = nil, title: String, subtitle: String? = nil, shortcut: String? = nil,
          badge: String? = nil, status: AgentStatus? = nil, statusColor: String? = nil,
-         statusShape: StatusShape? = nil, onSelect: (() -> Void)? = nil, run: @escaping () -> Void) {
+         statusShape: StatusShape? = nil, isEnabled: @escaping () -> Bool = { true },
+         onSelect: (() -> Void)? = nil,
+         run: @escaping () -> Void) {
         self.id = id ?? title
         self.title = title
         self.subtitle = subtitle
@@ -37,8 +45,18 @@ struct PaletteItem: Identifiable {
         self.status = status
         self.statusColor = statusColor
         self.statusShape = statusShape
+        self.isEnabled = isEnabled
         self.onSelect = onSelect
         self.run = run
+    }
+
+    /// Run the row if live state still allows it, reporting whether it ran. The palette dismisses on that
+    /// answer alone, so an inert row neither acts nor closes the palette — like clicking a disabled menu item.
+    @discardableResult
+    func runIfEnabled() -> Bool {
+        guard isEnabled() else { return false }
+        run()
+        return true
     }
 }
 
@@ -240,6 +258,10 @@ struct CommandPalette: View {
             results
         }
         .background { PalettePanelBackground() }
+        // the rounded background is drawn, not enforced: a selected or hovered bottom row fills its full
+        // square bounds and paints over the corner arc without this. the clip stays above `.shadow`, which
+        // would otherwise be clipped away with everything else outside the shape.
+        .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.white.opacity(0.1)))
         .shadow(radius: 24)
         .accessibilityIdentifier(explicitItems == nil ? "command-palette" : "pick-palette")
@@ -303,8 +325,11 @@ struct CommandPalette: View {
         runItem(filtered[selection])
     }
 
+    /// An inert row neither runs nor dismisses: the palette stays open on the query the user is still working
+    /// with. The enablement is re-asked HERE, so a row that went inert while the palette sat open cannot slip
+    /// through on what it looked like when the list was built.
     private func runItem(_ item: PaletteItem) {
-        item.run()
+        guard item.runIfEnabled() else { return }
         dismiss()
     }
 
@@ -335,6 +360,22 @@ private struct PaletteRow: View {
     let item: PaletteItem
     let isSelected: Bool
     let metrics: InterfaceMetrics
+    @State private var hovering = false
+
+    /// A neutral wash rather than a weaker accent: hover and the accent-tinted selection can sit on different
+    /// rows at once, so the same hue at two strengths would read as a second selection. It also has to hold up
+    /// over both panel backings, `.regularMaterial` and the opaque Reduce Transparency one.
+    private static let hoverTint = Color.primary.opacity(0.04)
+
+    private var rowTint: Color {
+        if isSelected { return Color.accentColor.opacity(0.25) }
+        // no hover tint on an inert row: the tint reads as "click this".
+        return hovering && enabled ? Self.hoverTint : .clear
+    }
+
+    /// Asked during body evaluation, not read off a snapshot, so the observable state it consults re-renders
+    /// the row the moment the action becomes runnable or stops being.
+    private var enabled: Bool { item.isEnabled() }
 
     var body: some View {
         HStack {
@@ -343,6 +384,7 @@ private struct PaletteRow: View {
             }
             VStack(alignment: .leading, spacing: 1) {
                 Text(item.title).font(.system(size: metrics.base))
+                    .foregroundStyle(enabled ? Color.primary : Color(nsColor: .disabledControlTextColor))
                 if let subtitle = item.subtitle {
                     Text(subtitle).font(.system(size: metrics.secondary)).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)
@@ -370,8 +412,9 @@ private struct PaletteRow: View {
         .padding(.horizontal, metrics.scaled(12))
         .padding(.vertical, metrics.scaled(6))
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isSelected ? Color.accentColor.opacity(0.25) : Color.clear)
+        .background(rowTint)
         .contentShape(Rectangle())
+        .onHover { hovering = $0 }
         .accessibilityIdentifier("palette-item-\(item.id)")
     }
 }

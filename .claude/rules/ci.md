@@ -16,10 +16,34 @@ paths:
   `coverage`, the only Swift-gated Linux job, downloads it for best-effort Coveralls.
   `lint` installs SwiftLint and runs `swiftlint lint --strict`; every warning fails.
 - `build` restores the libghostty/resource `actions/cache` keyed by `hashFiles('scripts/setup.sh')`,
-  installs xcodegen, runs Release `scripts/build.sh`, then Debug `scripts/test-app.sh`. Editing
+  installs xcodegen, runs Release `scripts/build.sh`, asserts the built `agtermctl` carries no
+  entitlements, then Debug `scripts/test-app.sh`. Editing
   `setup.sh` rebuilds libghostty. Keep both app builds: Release exercises the whole-module optimizer and
   its SIL-deserializer failure; Debug provides `ENABLE_TESTABILITY` for
   `DockMenuTests`'s `@testable import agterm`. Do not enable testability in the notarized Release app.
+- Three entitlement assertions run, all because a wrong entitlement set stays green. The first two read
+  the built Release app. The first guards issue #396: `--deep` with `--entitlements` stamps the app's TCC
+  entitlements onto the bundled CLI on the user's PATH. `scripts/release.sh` repeats it after its
+  Developer ID re-sign, which runs after CI's copy and is not covered by it.
+  Use `codesign -d --entitlements -`; the `:-` spelling is deprecated and warns.
+- The second pins the app's own Release set to the seven TCC keys, so neither a Debug-only hardened-runtime
+  exception nor a dropped TCC key can ship. It ignores `com.apple.security.get-task-allow`, which the
+  ad-hoc "Sign to Run Locally" identity adds and the Developer ID re-sign drops. It compares `key=value`
+  through `jq ... tojson`, not key names: a key set to `<false/>` is not granted and macOS treats it as
+  absent, and codesign accepts `<string>true</string>`, which is not a Boolean and renders identically to
+  one without `tojson`. Changing the set means editing that list in the same commit.
+- The third reads the two entitlements files rather than a build, and derives Debug's expected content
+  from the shipping file: Debug must be the shipping set plus exactly the three exceptions. Without it a
+  TCC key added to the shipping file and missed in the Debug one leaves every job green, and Debug
+  silently unable to prompt for that permission.
+- Debug and Release sign from different entitlements files. `agterm/agterm-debug.entitlements` adds
+  `disable-library-validation`, `allow-jit` and `allow-unsigned-executable-memory`: Debug is ad-hoc signed
+  and split into a stub plus `agterm.debug.dylib`, and `agtermTests` loads an ad-hoc `.xctest` into that
+  app, so library validation would reject both on a Team-ID mismatch. The Release bundle holds no dylib
+  and JIT-links nothing, so `agterm/agterm.entitlements` carries none of the three. The re-sign in
+  `project.yml` reads `$CODE_SIGN_ENTITLEMENTS` rather than a literal path, so it follows the
+  configuration. Restoring a literal path there would re-sign Debug from the shipping file, stripping the
+  three exceptions and breaking the ad-hoc `.xctest` load in `make test-app`.
 - A separate `cookbook: ["cookbook/**"]` filter gates the Linux `cookbook` job. Recipe-only changes run
   no macOS jobs. Keep `.github/workflows/ci.yml` in both filters: the inline cookbook checks must run when
   changed; its Swift membership also runs macOS jobs.

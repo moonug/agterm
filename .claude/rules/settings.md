@@ -19,6 +19,8 @@ paths:
 - Theme slots and following are owned by the theme-picker rule. `ToolbarMode` is
   `normal|compact|hidden`, stored raw; nil defaults compact. Normal adds cwd, hidden removes titlebar and
   traffic lights but leaves an invisible roughly 3-point drag strip above the first row at padding 6.
+  Hidden also drops the title/terminal hairline both columns draw: `titlebarHeight` is 0 there, so the line
+  would sit on the window's top edge separating nothing and read as a rendering artifact.
   `effectiveToolbarMode` falls back through legacy `compactToolbar` (`false` = normal, nil/true = compact);
   writing a mode clears the legacy field.
 - Default-on nil fields are `notificationsEnabled`, `notificationBadgeEnabled`, `rightClickPaste`, and
@@ -97,12 +99,6 @@ paths:
   `CGSSetWindowBackgroundBlurRadius`; absence is a no-op. `ghosttyConfigLines()` pins renderer opacity and
   blur to 0. At opacity 1, restore opaque rendering. Reduce Transparency temporarily forces opaque,
   unblurred windows/panels without changing saved settings or config.
-- In native fullscreen AppKit relocates the chrome into an `NSToolbarFullScreenWindow` child window, so the
-  window's own view tree holds no `NSTitlebarContainerView` and the whole blend is skipped.
-  Hidden toolbar mode falls back to that child, or `NSTitlebarBackgroundView` paints a hairline across the
-  top edge of the full-bleed terminal. Other modes keep AppKit's own fullscreen rendering.
-  Key the `_NSTitlebarDecorationView` suppression off the mode, never the traffic-light flag, whose
-  fullscreen carve-out would un-hide what AppKit hides there itself.
 - On macOS 26, find the wrapping `NSContainerConcentricGlassEffectView` by walking from
   `agterm-sidebar-scroll`; for translucent windows use clear style plus terminal tint. Its Liquid Glass
   blur is not pixel-identical to CGS blur. Reapply on key/main/fullscreen and appearance changes.
@@ -123,12 +119,38 @@ paths:
   libghostty diagnostics across all sources, clear all session zoom, post appearance change, and notify
   non-zero diagnostics. A config-directory change reloads both co-located files. Launch also reports
   cached diagnostics.
-- **Restore running commands is opt-in and clean-quit only.** Before `saveAllOpen()`,
-  `applicationWillTerminate` captures each visible main/split foreground argv through
-  `ghostty_surface_foreground_pid`, `sysctl(KERN_PROCARGS2)`, and host-free parsing. Capture no hidden
-  split. A known shell with only flags is idle and omitted; scripts/payload args remain, including
-  `/bin/sh <script>`. Strip login `-` before shell recognition. Force quit preserves snapshots/cwd but
-  skips command capture.
+- **Restore running commands is opt-in, and both capture and replay are exit-scoped.**
+  `AppDelegate.captureForegroundCommands` runs at two points: `applicationWillTerminate` before
+  `saveAllOpen()`, and the LAST window's `willClose` before its surface teardown, which precedes
+  `applicationWillTerminate` and is therefore the only point where a close-the-last-window exit's
+  commands are still readable.
+  Guarded by `openIDs() == [windowID]`, skipped under `isTerminating`.
+  A NON-last close captures nothing: a launch restore can't tell that window's file from one open at
+  exit, so its argv could replay via the never-windowless reopen fallback.
+  Argv comes from `ghostty_surface_foreground_pid`, `sysctl(KERN_PROCARGS2)`, and host-free parsing.
+  Capture no hidden split.
+  Strip login `-` before shell recognition; a known shell with only flags is idle and omitted, while
+  scripts/payload args remain, including `/bin/sh <script>`.
+  System shutdown, restart, and logout skip quit confirmation so `applicationWillTerminate` can capture
+  commands and flush stores. Force quit preserves earlier snapshots/cwd but skips this exit path.
+  Replay arms ONLY on a launch restore: `session(from:launchRestore:)` copies
+  `foregroundCommand`/`splitForegroundCommand` (like the pending override) under `launchRestore` alone,
+  so a mid-run window reopen or Reopen Closed Item comes back a plain shell.
+  Consumption is one-shot AND durable, and that rests on WHERE the launch arms it.
+  `session(from:launchRestore:)` seeds the TRANSIENT `pendingForegroundCommand`/
+  `pendingSplitForegroundCommand`, which `snapshot()` does not serialize, and leaves the persisted fields
+  nil; `loadStore` strips the file in the same step.
+  So no save landing between arming and the surface spawning can write the argv back — several do land
+  there (`applyInactiveWindowSidebarHiding`, the debounced save `reselectIfSelectionHidden` schedules),
+  and arming the persisted fields instead would let any of them resurrect it.
+  A crash can then cost a restore but never repeat one; a failed strip disarms the pending slots rather
+  than leaving a replay nothing recorded.
+  Anything else that must cancel an armed replay clears those slots too, never the persisted fields:
+  `recoverOrphanedWindows`, `Session.clearPendingRestoreOverrides` on the soft-close round trip, and
+  `restore.clear`, which the socket can receive before the later windows' decks have mounted.
+  Against STALE files from older builds, `loadStore` also rewrites a snapshot that carried captures on a
+  mid-run reopen, and `recoverOrphanedWindows` drops captures while the sticky override still arms
+  (a corrupt index must not re-execute a closed window's last command).
 - Restore only when the toggle is on and basename is absent from user
   `restore-denylist.conf`, seeded with `tmux`, `screen`, and `zellij`. Feed captured argv once through
   shell-quoted `config.initial_input` so exit returns to the shell, then nil it. Only one foreground

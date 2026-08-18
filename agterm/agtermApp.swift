@@ -15,11 +15,13 @@ struct agtermApp: App {
     @State private var sessionSwitcher: SessionSwitcher
     @State private var paneShortcuts: PaneShortcuts
     @State private var undoCloseShortcut: UndoCloseShortcut
+    @State private var globalHotkey: GlobalHotkey
     @State var settingsModel: SettingsModel
     @State private var controlServer: ControlServer
     @State private var customCommandRunner: CustomCommandRunner
     @State private var appearanceObserver: SystemAppearanceObserver
     @State private var accessibilityObserver: SystemAccessibilityObserver
+    @State private var wakeObserver: SystemWakeObserver
 
     /// Whether this launch owes the user the first-run welcome. Decided in `init()`, because the first
     /// launch writes its own window snapshot moments after the scene appears and that write would read back
@@ -61,15 +63,20 @@ struct agtermApp: App {
         _sessionSwitcher = State(initialValue: SessionSwitcher(library: library, canSwitch: { actions.uiActionsEnabled }))
         _paneShortcuts = State(initialValue: PaneShortcuts(library: library, actions: actions))
         _undoCloseShortcut = State(initialValue: UndoCloseShortcut(actions: actions))
-        // built last: needs the keymap (settings) and the control server's bound socket path for `{AGT_SOCKET}`.
+        _globalHotkey = State(initialValue: GlobalHotkey(settings: settingsModel))
+        // built last: needs the keymap (settings), the action hub for built-in monitor binds, and the control
+        // server's bound socket path for `{AGT_SOCKET}`.
         _customCommandRunner = State(initialValue: CustomCommandRunner(
-            library: library, settings: settingsModel,
+            library: library, settings: settingsModel, actions: actions,
             socketProvider: { controlServer.resolvedSocketPath }))
         // follows macOS light/dark via KVO on NSApp.effectiveAppearance; dependency-free, started in `.task`.
         _appearanceObserver = State(initialValue: SystemAppearanceObserver())
         // follows Reduce Motion / Reduce Transparency via NSWorkspace's accessibility-display notification,
         // fanning live changes to AppKit consumers; SwiftUI ones use Environment.
         _accessibilityObserver = State(initialValue: SystemAccessibilityObserver())
+        // re-attempts surface creation on display wake: libghostty refuses to create one while the display
+        // sleeps, which leaves a scheduled job's session realized-never and its --command unrun (#416).
+        _wakeObserver = State(initialValue: SystemWakeObserver())
     }
 
     var body: some Scene {
@@ -94,17 +101,15 @@ struct agtermApp: App {
                         Self.makeOverlaySurface(for: $0, store: $1, pane: $2, env: surfaceEnv(for: $0))
                     },
                     makeScratchSurface: { session, store in
-                        // suppress the scratch's creation autoFocus when a caller's program overlay or this
-                        // window's quick terminal is up — each renders above it and owns focus. A HUD renders
+                        // suppress the scratch's creation autoFocus when a caller's program overlay or the
+                        // quick terminal is up — each renders above it and owns focus. A HUD renders
                         // above it too but owns nothing, so it must not hold focus off a scratch just shown.
-                        let qtVisible = library.windowID(forSession: session.id)
-                            .flatMap { QuickTerminalRegistry.shared.controller(for: $0) }?.isVisible ?? false
+                        let qtVisible = QuickTerminalController.shared.holdsKey
                         return Self.makeScratchSurface(for: session, store: store,
                                                        env: surfaceEnv(for: session, pane: .scratch),
                                                        suppressAutoFocus: session.programOverlayActive || qtVisible,
                                                        library: library)
                     },
-                    quickTerminalEnv: { quickTerminalEnv(for: $0) },
                     actions: actions,
                     palette: palette,
                     sessionSwitcher: sessionSwitcher
@@ -124,12 +129,18 @@ struct agtermApp: App {
                         // socket on terminate.
                         appDelegate.controlServer = controlServer
                         controlServer.start()
+                        // bind the app-level quick terminal (idempotent); its env needs the bound socket, so
+                        // this follows `start()` like the surface environment does.
+                        wireQuickTerminal(library: library)
                         // Ctrl-Tab session-switcher key monitors (idempotent).
                         sessionSwitcher.start()
                         // Ctrl-1/Ctrl-2 direct pane-focus key monitor (idempotent).
                         paneShortcuts.start()
                         // undo-close shortcut (idempotent); passes through text fields so native undo wins there.
                         undoCloseShortcut.start()
+                        // the OS-registered quick-terminal chord (idempotent), re-registered on keymap reload.
+                        // Must follow `wireQuickTerminal`, the hotkey being able to summon the panel at once.
+                        globalHotkey.start()
                         // custom-command key monitor (idempotent): rebuilds its matcher from the keymap on
                         // `.agtermKeymapChanged`, removed on terminate via the delegate reference.
                         appDelegate.customCommandRunner = customCommandRunner
@@ -175,6 +186,7 @@ struct agtermApp: App {
                         appearanceObserver.start()
                         // consumers read current accessibility values at first render; this handles live flips.
                         accessibilityObserver.start()
+                        wakeObserver.start()
                         // last: a modal here blocks the rest of the task, and the window behind it should be
                         // fully wired before it opens. `presentOnce` latches, so the per-window .task is safe.
                         if welcomeDue { WelcomeAlert.presentOnce(settingsModel: settingsModel) }
@@ -222,9 +234,9 @@ struct agtermApp: App {
         // captured foreground preempts `initialCommand` even when denylist-suppressed. A `session.restore` override
         // beats both, from the TRANSIENT pending slot (only an app-bootstrap restore seeds it) not the sticky
         // persisted field; taking it clears it, so this pane's next surface is a plain shell.
-        let hadForeground = session.foregroundCommand != nil
-        let restoreInput = Self.restoreInitialInput(session.foregroundCommand)
-        session.foregroundCommand = nil
+        let pendingForeground = session.takePendingForegroundCommand(pane: .left)
+        let hadForeground = pendingForeground != nil
+        let restoreInput = Self.restoreInitialInput(pendingForeground)
         let inputs = CommandRestore.RestoreInputs(wasRestored: session.wasRestored,
                                                   restoreEnabled: GhosttyApp.shared.restoreRunningCommand,
                                                   hadForeground: hadForeground, foregroundInput: restoreInput,
@@ -331,13 +343,11 @@ struct agtermApp: App {
             // refocus ONLY while this is still the selected session and no cover is up: `session.search --close
             // --target <background>` would otherwise make a hidden, opacity-0 surface first responder and steal
             // input from the visible session (hidden views CAN), and a cover owns focus. `topmostSurface` catches
-            // the in-deck overlay/scratch (overlay > scratch > active pane) but not the window-level quick
-            // terminal, so bail while that is up — it refocuses on hide; the retry outlasts the SwiftUI teardown.
+            // the in-deck overlay/scratch (overlay > scratch > active pane) but not the quick-terminal panel,
+            // so bail while that is up — it refocuses on hide; the retry outlasts the SwiftUI teardown.
             guard store.selectedSessionID == sessionID else { return }
             let windowID = library.windowID(forSession: sessionID)
-            let quickTerminalVisible = windowID
-                .flatMap { QuickTerminalRegistry.shared.controller(for: $0) }?.isVisible ?? false
-            guard !quickTerminalVisible else { return }
+            guard !QuickTerminalController.shared.holdsKey else { return }
             // terminal zoom owns focus above the deck and zoom-enter ends an open search; this END lands a tick
             // later, so refocusing would steal first responder back from the zoomed terminal.
             guard windowID.flatMap({ TerminalZoomRegistry.shared.controller(for: $0) })?.target == nil else { return }
@@ -380,8 +390,7 @@ struct agtermApp: App {
         // `restorePlan` — `restoreInput` alone decides. A `session.restore` override wins over the capture, from
         // the TRANSIENT pending slot (seeded only by an app-bootstrap restore whose split was shown) not the
         // sticky persisted field; taking it clears it, so a fresh ⌘D split after a split shell exits is a shell.
-        let capturedInput = Self.restoreInitialInput(session.splitForegroundCommand)
-        session.splitForegroundCommand = nil
+        let capturedInput = Self.restoreInitialInput(session.takePendingForegroundCommand(pane: .right))
         let restoreInput = CommandRestore.restoreInput(restoreEnabled: GhosttyApp.shared.restoreRunningCommand,
                                                        restoreOverride: session.takePendingRestoreOverride(pane: .right),
                                                        capturedInput: capturedInput)
@@ -533,7 +542,8 @@ struct agtermApp: App {
     /// session facts plus agterm's identity (`TERM_PROGRAM`/`TERM_PROGRAM_VERSION`). The window id comes from the
     /// open store owning the session (split/overlay/scratch inherit it), the workspace from the session's owner.
     /// `AGTERM_SOCKET` is the path `ControlServer` will bind, resolved at init so a launch-window shell
-    /// materializing before `start()` still sees it, honoring a test's `AGTERM_CONTROL_SOCKET` override. `pane`
+    /// materializing before `start()` still sees it, honoring a test's `AGTERM_CONTROL_SOCKET` override, and
+    /// replaced by an unbindable path when this instance refused it to another live one. `pane`
     /// injects `AGTERM_PANE` (`left`=main, `right`=split, `scratch`) so the hook wrapper forwards `--pane` and a
     /// background-pane status records which surface blocked; the overlay passes nil.
     @MainActor
@@ -554,11 +564,38 @@ struct agtermApp: App {
                                           pane: pane, paneToken: pane == nil ? nil : UUID().uuidString)
     }
 
-    /// The environment a window's quick terminal exposes — scratch, not in the tree, so its `AGTERM_*`
-    /// values carry only enabled, window, and socket facts (no workspace/session ids), plus app identity.
+    /// The environment the quick terminal exposes — scratch, not in the tree and owned by no window, so its
+    /// `AGTERM_*` values carry only enabled and socket facts, plus app identity.
     @MainActor
-    func quickTerminalEnv(for windowID: WindowInfo.ID) -> [String: String] {
-        SurfaceEnvironment.quickTerminal(windowID: windowID, socketPath: controlServer.resolvedSocketPath,
+    func quickTerminalEnv() -> [String: String] {
+        SurfaceEnvironment.quickTerminal(socketPath: controlServer.resolvedSocketPath,
                                          programVersion: Self.terminalProgramVersion)
+    }
+
+    /// Bind the app's one quick terminal to the library. Every provider resolves through `activeStore` at
+    /// call time rather than capturing a window, the panel outliving any particular one; `canShow` is what
+    /// keeps it from being summoned into an app with no window left to return to.
+    @MainActor
+    func wireQuickTerminal(library: WindowLibrary) {
+        let controller = QuickTerminalController.shared
+        controller.cwdProvider = { [weak library] in
+            library?.activeStore?.activeSession?.effectiveCwd
+                ?? FileManager.default.homeDirectoryForCurrentUser.path
+        }
+        controller.envProvider = { [self] in quickTerminalEnv() }
+        // typing counts as activity, so an idle auto-follow fire can't reshuffle the active window's
+        // selection behind the panel while the user types (mirrors the overlay/scratch).
+        controller.onUserInput = { [weak library] in library?.activeStore?.noteUserActivity() }
+        controller.focusAllowed = { [weak library] in
+            PickRegistry.shared.controller(for: library?.activeWindowID)?.pending == nil
+        }
+        // the global hotkey reaches the controller directly, with none of the `uiActionsEnabled` gating every
+        // in-app path has, so the pick term belongs here. Only that term: refusing a system-wide summon
+        // because some BACKGROUND window has a dashboard open would defeat the point of the chord.
+        controller.canShow = { [weak library] in
+            guard let library, !library.openIDs().isEmpty else { return false }
+            return PickRegistry.shared.controller(for: library.activeWindowID)?.pending == nil
+        }
+        controller.terminalColorProvider = { WindowContentView.resolvedTerminalColor() }
     }
 }

@@ -5,15 +5,18 @@ import agtermCore
 /// watermark, buffer read, in-terminal search, text injection. Split out for the swiftlint size limit.
 extension ControlServer {
     /// Runs a libghostty binding action on the target's addressable surface — a SPECIFIC one, unlike the menu
-    /// path's focused pane. Shared by `session.paste`/`session.selectall`. `addressableSurface` falls back to
-    /// a promoted split survivor whose primary shell exited (which nils `surface`), else a session the user
-    /// is typing in reports "session not realized"; a never-shown session has no surface at all → error.
+    /// path's focused pane. Shared by `session.paste`/`session.selectall`; `Session.addressableSurface` owns
+    /// which pane that resolves to. An empty slot and a parked view whose surface never came up are one state
+    /// to a caller: "session not realized".
     private func surfaceBindingAction(_ target: String?, window: String?, action: String) -> ControlResponse {
         return resolver.resolveSession(target, window: window) { store, id in
             guard let surface = store.session(withID: id)?.addressableSurface as? GhosttySurfaceView else {
                 return ControlResponse(ok: false, error: "session not realized")
             }
-            surface.performBindingAction(action)
+            // the cast alone only proves the SLOT is filled; a false return is the view without a surface.
+            guard surface.performBindingAction(action) else {
+                return ControlResponse(ok: false, error: "session not realized")
+            }
             return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
         }
     }
@@ -82,10 +85,88 @@ extension ControlServer {
             guard let surface = store.session(withID: id)?.addressableSurface as? GhosttySurfaceView else {
                 return ControlResponse(ok: false, error: "session not realized")
             }
+            // an unrealized pane has no selection to report EITHER way, and `readSelection` cannot tell the
+            // two apart — so answer it as `session.selectall` does rather than blaming an empty selection.
+            guard surface.isRealized else {
+                return ControlResponse(ok: false, error: "session not realized")
+            }
             guard let text = surface.readSelection() else {
                 return ControlResponse(ok: false, error: "no selection")
             }
             return ControlResponse(ok: true, result: ControlResult(text: text))
+        }
+    }
+
+    /// The outcome of resolving an overlay read's surface: the view, or the rejection the arm returns as-is.
+    private enum OverlayReadSurface {
+        case surface(GhosttySurfaceView)
+        case rejected(ControlResponse)
+    }
+
+    /// The surface `session.overlay.copy`/`.text` address: the pane's own overlay with `pane`, else the
+    /// session-wide slot. Shared by both, so `no overlay` and `overlay not realized` cannot come to mean
+    /// different things on one command than the other. A filled slot with an unrealized surface is the ms
+    /// after `overlay.open`, and it names the OVERLAY rather than borrowing `session not realized`: the
+    /// session is fine, it is the cover that is not up. A HUD is refused ahead of everything, `overlayActive`
+    /// alone being unable to tell the app's own painter from a caller's program.
+    private func overlayReadSurface(_ session: Session, pane: OverlayPane?) -> OverlayReadSurface {
+        let occupied: Bool
+        let surface: (any TerminalSurface)?
+        if let pane {
+            occupied = session.paneOverlay(pane) != nil
+            surface = session.paneOverlaySurface(pane)
+        } else {
+            if session.hudActive {
+                return .rejected(ControlResponse(ok: false, error: OverlayHudError.noRead))
+            }
+            occupied = session.overlayActive
+            surface = session.overlaySurface
+        }
+        guard occupied else { return .rejected(ControlResponse(ok: false, error: "no overlay")) }
+        guard let view = surface as? GhosttySurfaceView, view.isRealized else {
+            return .rejected(ControlResponse(ok: false, error: "overlay not realized"))
+        }
+        return .surface(view)
+    }
+
+    /// Returns the OVERLAY's current selection (`session.overlay.copy`), which `session.copy` cannot reach:
+    /// that one addresses `addressableSurface`, the pane the overlay covers, so a selection the user made in
+    /// the overlay reads as `no selection` there. Returns the text rather than writing the clipboard, like
+    /// its session-level twin. The realization gate above runs first, so nil here is genuinely no selection.
+    func copySessionOverlaySelection(_ target: String?, window: String?, pane: OverlayPane?) -> ControlResponse {
+        return resolver.resolveSession(target, window: window) { store, id in
+            guard let session = store.session(withID: id) else {
+                return ControlResponse(ok: false, error: "no such session")
+            }
+            switch self.overlayReadSurface(session, pane: pane) {
+            case .rejected(let response): return response
+            case .surface(let surface):
+                guard let text = surface.readSelection() else {
+                    return ControlResponse(ok: false, error: "no selection")
+                }
+                return ControlResponse(ok: true, result: ControlResult(text: text))
+            }
+        }
+    }
+
+    /// Returns the OVERLAY's terminal buffer (`session.overlay.text`), `session.text`'s counterpart for the
+    /// covering surface — `--pane right` reads the shell underneath, never the program drawn over it. `all`
+    /// and `lines` mean what they do on `session.text`, the dispatcher having validated them the same way.
+    /// What comes back is a TUI's DRAWN screen, wrapped as rendered, not the output it would have printed.
+    func readSessionOverlayText(_ target: String?, window: String?,
+                                options: ControlSessionOverlayTextOptions) -> ControlResponse {
+        return resolver.resolveSession(target, window: window) { store, id in
+            guard let session = store.session(withID: id) else {
+                return ControlResponse(ok: false, error: "no such session")
+            }
+            switch self.overlayReadSurface(session, pane: options.pane) {
+            case .rejected(let response): return response
+            case .surface(let surface):
+                guard let text = surface.readScreenText(all: options.all, lines: options.lines) else {
+                    return ControlResponse(ok: false, error: "failed to read surface buffer")
+                }
+                return ControlResponse(ok: true, result: ControlResult(text: text))
+            }
         }
     }
 
@@ -172,11 +253,87 @@ extension ControlServer {
             guard let surface = chosen as? GhosttySurfaceView else {
                 return ControlResponse(ok: false, error: "session not realized")
             }
+            // a view parked in the slot whose libghostty surface never came up is UNREALIZED, not a failed
+            // read — the deck installs the view before `createSurface`, and creation is refused outright
+            // while the display sleeps (#416). Without this the same state answered `failed to read surface
+            // buffer` here and `session not realized` from every other command, naming a cause that did not
+            // happen: nothing failed to read, there was nothing to read from.
+            guard surface.isRealized else {
+                return ControlResponse(ok: false, error: "session not realized")
+            }
             guard let text = surface.readScreenText(all: all, lines: lines) else {
                 return ControlResponse(ok: false, error: "failed to read surface buffer")
             }
             return ControlResponse(ok: true, result: ControlResult(text: text))
         }
+    }
+
+    /// Returns the addressed surface's zero-based cursor column. Takes `surface.zoom`'s target vocabulary —
+    /// `surface:<session-id>:<kind>` ids from `tree`, `quick`, or `active` for the frontmost (or `--window`)
+    /// window's active surface — so both `surface.*` commands address the same set. Unlike zoom it changes
+    /// nothing, so it neither selects nor realizes the target: an unrealized surface is reported, not waited
+    /// for. `GhosttySurfaceView.readCursorColumn` owns how the column is derived and when it declines.
+    func readSurfaceCursor(_ target: String?, window: String?) -> ControlResponse {
+        let rawTarget = trimmed(target) ?? "active"
+        if rawTarget == "quick" {
+            // `hide()` deliberately keeps the panel's surface alive, so visibility is the gate, not the
+            // surface existing — otherwise a panel shown once stays readable forever. Same test `setZoom` makes.
+            guard QuickTerminalController.shared.isVisible,
+                  let surface = QuickTerminalController.shared.currentSurface() else {
+                return ControlResponse(ok: false, error: "surface not available: quick")
+            }
+            return cursorResponse(surface, controlID: "quick")
+        }
+        let resolved: (store: AppStore, target: TerminalZoomTarget)
+        if rawTarget == "active" {
+            switch resolveOpenWindow(window) {
+            case .failure(let response):
+                return response
+            case .success(let (windowID, store)):
+                // a live zoom IS the active surface, and `surface.zoom active` resolves it the same way: the
+                // controller's target wins over the store's focused pane, which zooming a NONFOCUSED pane
+                // never moves.
+                guard let zoomTarget = TerminalZoomRegistry.shared.controller(for: windowID)?.target
+                        ?? TerminalZoomController.resolveTarget(store: store) else {
+                    return ControlResponse(ok: false, error: "no active surface")
+                }
+                resolved = (store, zoomTarget)
+            }
+        } else {
+            guard let surfaceID = TerminalSurfaceID(rawValue: rawTarget) else {
+                return ControlResponse(ok: false, error: "invalid surface: \(rawTarget)")
+            }
+            switch resolveSurfaceOwner(surfaceID, window: window) {
+            case .failure(let response):
+                return response
+            case .success(let (_, store)):
+                resolved = (store, .session(surfaceID.sessionID, surfaceID.surface))
+            }
+        }
+        // the same validity gate `surface.zoom` applies, so an explicit id cannot reach an occupant the tree
+        // refuses to address: a HUD fills `overlaySurface` while `.overlay` reads unavailable, and without
+        // this a guessed `surface:<id>:overlay` would report the app's own message painter's cursor.
+        guard case let .session(sessionID, kind) = resolved.target,
+              let session = resolved.store.session(withID: sessionID),
+              TerminalZoomController.isTargetValid(resolved.target, in: resolved.store) else {
+            return ControlResponse(ok: false, error: "surface not available: \(resolved.target.controlID)")
+        }
+        return cursorResponse(kind.surface(in: session) as? GhosttySurfaceView, controlID: resolved.target.controlID)
+    }
+
+    private func cursorResponse(_ surface: GhosttySurfaceView?, controlID: String) -> ControlResponse {
+        guard let surface else {
+            return ControlResponse(ok: false, error: "surface not available: \(controlID)")
+        }
+        // an occupied slot proves nothing about a running terminal — the deck parks the view before
+        // `createSurface`, which the display being asleep refuses outright (#416).
+        guard surface.isRealized else {
+            return ControlResponse(ok: false, error: "surface not realized")
+        }
+        guard let column = surface.readCursorColumn() else {
+            return ControlResponse(ok: false, error: "failed to read cursor position")
+        }
+        return ControlResponse(ok: true, result: ControlResult(id: controlID, cursor: ControlCursor(column: column)))
     }
 
     /// Drives in-terminal search on session `id`, mirroring the GUI bar. `close` exits without selecting;

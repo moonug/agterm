@@ -12,6 +12,7 @@ struct BuiltinActionTests {
     @Test func rawNamesAreTheKittyStyleNames() {
         #expect(BuiltinAction.newWindow.rawValue == "new_window")
         #expect(BuiltinAction.toggleSplit.rawValue == "toggle_split")
+        #expect(BuiltinAction.toggleHorizontalSplit.rawValue == "toggle_horizontal_split")
         #expect(BuiltinAction.toggleTerminalZoom.rawValue == "toggle_terminal_zoom")
         #expect(BuiltinAction.toggleSearch.rawValue == "toggle_search")
         #expect(BuiltinAction.openLinkAtCursor.rawValue == "open_link_at_cursor")
@@ -30,7 +31,10 @@ struct BuiltinActionTests {
         #expect(BuiltinAction.toggleFullscreen.rawValue == "toggle_fullscreen")
         #expect(BuiltinAction.dashboard.rawValue == "dashboard")
         #expect(BuiltinAction.duplicateSession.rawValue == "duplicate_session")
-        #expect(BuiltinAction.allCases.count == 43)
+        #expect(BuiltinAction.previousWorkspace.rawValue == "previous_workspace")
+        #expect(BuiltinAction.nextWorkspace.rawValue == "next_workspace")
+        #expect(BuiltinAction.toggleWorkspaceCollapse.rawValue == "toggle_workspace_collapse")
+        #expect(BuiltinAction.allCases.count == 47)
     }
 
     @Test func rejectsUnknownName() {
@@ -92,6 +96,7 @@ struct BuiltinActionTests {
             .decreaseFontSize: Chord(mods: [.command], key: "-"),
             .resetFontSize: Chord(mods: [.command], key: "0"),
             .toggleSplit: Chord(mods: [.command], key: "d"),
+            .toggleHorizontalSplit: Chord(mods: [.command, .shift], key: "d"),
             .toggleScratch: Chord(mods: [.command], key: "j"),
             .toggleTerminalZoom: Chord(mods: [.command, .shift], key: "return"),
             .toggleSearch: Chord(mods: [.command], key: "f"),
@@ -103,6 +108,9 @@ struct BuiltinActionTests {
             .toggleWorkspaceFilter: nil,
             .toggleFlag: Chord(mods: [.command, .shift], key: "f"),
             .focusWorkspace: nil,
+            .previousWorkspace: nil,
+            .nextWorkspace: nil,
+            .toggleWorkspaceCollapse: nil,
             .focusLeftPane: Chord(mods: [.command, .option], key: "left"),
             .focusRightPane: Chord(mods: [.command, .option], key: "right"),
             .previousSession: Chord(mods: [.command, .option], key: "up"),
@@ -116,7 +124,7 @@ struct BuiltinActionTests {
             .commandPalette: Chord(mods: [.control, .shift], key: "p"),
             .customCommandPalette: Chord(mods: [.control, .shift], key: "o"),
             .showAttention: Chord(mods: [.control, .shift], key: "i"),
-            .dashboard: Chord(mods: [.command, .shift], key: "d"),
+            .dashboard: Chord(mods: [.command, .shift], key: "g"),
         ]
         #expect(expected.count == BuiltinAction.allCases.count)
         for action in BuiltinAction.allCases {
@@ -173,7 +181,7 @@ struct BuiltinActionTests {
         let keyless: Set<BuiltinAction> = [
             .renameWindow, .deleteWindow, .renameWorkspace, .deleteWorkspace, .renameSession, .duplicateSession,
             .clearStatus, .firstSession, .lastSession, .selectTheme, .toggleFlaggedView, .focusWorkspace,
-            .toggleWorkspaceFilter, .openLinkAtCursor,
+            .toggleWorkspaceFilter, .previousWorkspace, .nextWorkspace, .toggleWorkspaceCollapse, .openLinkAtCursor,
         ]
         for action in keyless {
             #expect(action.defaultChord == nil, "expected nil default for \(action.rawValue)")

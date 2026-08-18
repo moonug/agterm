@@ -6,6 +6,7 @@ paths:
   - "agterm/Views/Palette.swift"
   - "agterm/Views/PaneShortcuts.swift"
   - "agterm/Views/SessionSwitcher.swift"
+  - "agtermCore/Sources/agtermCore/PaletteCatalog.swift"
   - "agtermCore/Sources/agtermCore/RecencyStack.swift"
   - "agtermCore/Sources/agtermCore/Fuzzy.swift"
   - "agtermUITests/MenuUITests.swift"
@@ -20,10 +21,29 @@ paths:
 
 - `@MainActor AppActions` shares nontrivial behavior among titlebar/footer, menu, palette, and control:
   placement, directory picking, split/focus, and font. Trivial toggles may call their owner directly.
-- `toggleQuickTerminal` gates on all `uiActionsEnabled`, including terminal zoom and dashboard. Menu
-  `.disabled(modalActive)` also gates rebound key equivalents; palette dispatch and Dock invocation recheck.
-  Control drives `QuickTerminalRegistry` directly. The titlebar button is replaced by dashboard chrome,
-  which hides an open quick terminal before showing the grid.
+- **`PaletteCommand.isEnabled(in:)` is the single owner of menu enablement.** Every menu item backed by a
+  palette row spells its `.disabled(…)` as that predicate, the palette row renders inert on it, and a
+  `keymap.conf` alternative dispatches through it in `AppActions.perform(_:in:)` (see [[keymap]]), so the
+  three cannot drift. It layers `isVisible(in:)`, then the modal cover, then the presence terms
+  (no active session, no current workspace). Add a term to `PaletteContext` and the predicate; never to one
+  item's `.disabled(…)`. An action's own `AppActions` method keeps its guard as well — belt and braces, not
+  the contract.
+- The modal cover — terminal zoom, the open dashboard grid, a pending native picker — reads off the same
+  predicate. Close Session, both reloads, the three font sizes and Toggle Terminal Zoom carry no modal term
+  (⌘W is how a cover is dismissed); Dashboard carries every cover but its own grid, its item being that
+  grid's escape hatch. Items with no palette row (window management, the three palette launchers) keep the
+  bare `context.modalActive`.
+- `isVisible(in:)` stays WIDER than `isEnabled(in:)`: the palette lists Rename Session with no session and
+  renders it disabled, and `runItem` neither runs nor dismisses it. Do not narrow `isVisible` to match the
+  menu — that deletes rows users search for.
+- **`PaletteItem.isEnabled` is a closure over live state, never a flag captured when the list was built.**
+  `filtered` refreshes only on appear, query and mode, so a snapshot goes stale under an open palette: a
+  session exits, a pending close expires, control mutates the tree. The row asks it during body evaluation
+  and `runIfEnabled()` asks it again at the keystroke, returning whether it ran — which is the only thing
+  that dismisses the palette, so an inert row cannot close it on a keystroke that did nothing.
+- `toggleQuickTerminal` gates on all `uiActionsEnabled`, including terminal zoom and dashboard.
+  Control drives `QuickTerminalController.shared` directly, there being one panel per app. The titlebar
+  button is replaced by dashboard chrome, which hides an open quick terminal before showing the grid.
 - Every new action must satisfy the control contract in [[control-api]]: protocol, dispatch, CLI, and
   protocol/end-to-end tests. Do not restate per-action audits here.
 
@@ -54,10 +74,10 @@ paths:
   stepping, pane focus, and Dashboard. File UI tests against the menu that owns the item.
 - Workspace focus controls are mode-agnostic because membership applies when tree mode returns.
   Expand/Collapse Workspaces alone are disabled outside tree mode, in both menu and palette.
-- Dashboard uses Command-Shift-D, `BuiltinAction.dashboard`, and `toggleDashboard`; it toggles an MRU,
+- Dashboard uses Command-Shift-G, `BuiltinAction.dashboard`, and `toggleDashboard`; it toggles an MRU,
   auto-sized grid unless terminal zoom is active. Share `dashboardMembers` with control.
-- Remove AppKit's reinjected fullscreen item as described in [[windows]]. agterm's own
-  `toggle_fullscreen` remains rebindable and control-drivable.
+- The View menu carries no fullscreen item of agterm's own, and `toggle_fullscreen` rides the key monitor
+  rather than a menu shortcut; see [[windows]]. It remains rebindable and control-drivable.
 - Font shortcuts call libghostty binding actions on the key window's first-responder surface, falling back
   to the active session. Persistence still flows from cell-size callbacks.
 - `shortcutGlyph` delegates to host-free `Keymap.glyphHint`. Use it for palette hints and the ten built-in
@@ -84,8 +104,9 @@ paths:
 
 ## Split panes
 
-- `isSplit` means shown side-by-side, `hasSplit` means the second shell exists, and `splitFocused` chooses
-  focus. Split title/cwd feed focus-aware display name and focused cwd based on `splitFocused`, even hidden.
+- `isSplit` means both panes are shown, `hasSplit` means the second shell exists, `splitAxis` chooses
+  left/right or top/bottom, and `splitFocused` chooses focus. Split title/cwd feed focus-aware display name
+  and focused cwd based on `splitFocused`, even hidden.
   `effectiveCwd` remains primary for new panes and `AGTERM_SESSION_PWD`; `activeSurface` follows focus.
 - Creating a split focuses right. Hiding retains both shells and shows the focused pane maximized;
   reshown splits preserve focus. `closePrimaryPane` promotes right into primary with cwd/title/foreground
@@ -94,8 +115,8 @@ paths:
 - Pane focus actions, menu/palette, and `session.focus` gate on `hasSplit`, not `isSplit`, so they also swap
   the maximized hidden pane. Ctrl-1/Ctrl-2 use an app-wide event monitor and always consume these reserved
   keys, even when no split exists.
-- Persist each pane cwd and the 0...1 left-pane `splitRatio`. `SplitRatioAccessor` is an unconditional
-  background representable on primary, introspects `NSSplitView`, retries until width exists, observes
+- Persist each pane cwd and the 0...1 primary-pane `splitRatio`. `SplitRatioAccessor` is an unconditional
+  background representable on primary, introspects `NSSplitView`, retries until its axis extent exists, observes
   `didResizeSubviews`, and debounces save by about 0.4 seconds. Regular saves and quit flush also persist it.
 - Double-clicking the divider restores `splitRatioDefault` through the same `applyRatio` path as
   `session.resize`, persisting immediately rather than through the drag debounce. AppKit offers no hook:
@@ -112,18 +133,34 @@ paths:
   padding lies inside the safe-area band and AppKit expands `NSSplitView` full height; normal 48px mode is
   already bounded. Compute the live overrun and apply a CALayer mask, removing it at zero.
   Do not use SwiftUI mask/clipping because it reflows and loses the terminal's top row; do not use an
-  opaque cover because it breaks translucency. Key `HSplitView` identity by session.
-- Sidebar icon follows `hasSplit`. The titlebar's four-state icon is outline with none,
-  `rectangle.split.2x1.fill` while shown, left-half filled for hidden primary, and right-half filled for
-  hidden split.
+  opaque cover because it breaks translucency. Key each `HSplitView`/`VSplitView` identity by session and
+  keep the terminal surface identities stable when changing axis.
+- Sidebar icon follows `hasSplit` and `splitAxis`. The titlebar has seven accessibility states: `none`,
+  `both`, `left`, and `right` for the left/right symbols, plus `both-horizontal`, `top`, and `bottom` for
+  the top/bottom symbols. A shown split fills both halves; a hidden split fills the visible primary or
+  split half on its current axis.
 
 ## Close and reselection
 
-- Command-W first dismisses the frontmost cover: quick terminal, then overlay, then scratch, then the
+- Command-W first dismisses the frontmost cover: the quick-terminal panel (un-zoom, then hide), then
+  overlay, then scratch, then the
   FOCUSED pane's own overlay (`focusedOverlayPane`; one on the sibling pane is not in front of the user and
   does not intercept). Only then close the active session. If no cover or session exists, the menu performs
   window close. Keep the cover check inside `closeActiveSession`, since a sessionless window can still show
   quick terminal.
+- The panel's two rungs read `holdsKey`, not `isVisible`. A PINNED panel (a control `quick show`) stays on
+  screen without owning the keyboard, and Command-W in a terminal window must then close that session
+  rather than reach past it to the panel.
+- The menu item diverts to a plain `performClose` when the key window is not an agterm terminal window —
+  Settings, the About panel, an open/save panel — because `applyCloseSessionChord` takes ⌘W off the stock
+  File ▸ Close item and nothing else would close them (issue #401). `WindowRegistry.contains` is the
+  predicate, as in `CustomCommandRunner`, EXCEPT for `QuickTerminalPanel`: it is unregistered too but it is
+  a cover, not an auxiliary window, and being borderless it has no close button, so `performClose` would
+  only beep and the ladder's own panel rungs would never run. A `nil` key window still runs the deck sequence: with every
+  window minimized the equivalent still dispatches, and `performClose` on nothing would make ⌘W silently
+  no-op. The divert is gated on `close_session` still holding ⌘W, the same condition
+  `applyCloseSessionChord` splits on: rebound off it, the stock item takes the chord back and the
+  auxiliary window closes itself, so the new chord keeps its labelled meaning.
 - All active-session close paths use host-free `closeReselectionTarget` (Discussion #147). Prefer the most
   recent survivor in three widening scopes: same workspace intersected with `navigableSessions`, all
   navigable sessions, then the whole tree. Build scopes from the post-removal tree; soft close retains
@@ -148,6 +185,12 @@ paths:
   Option-Command-Left/Right remains pane focus.
 - `navigateSession` uses `navigableSessions`, wraps previous/next, selects ends for first/last, chooses
   first on nil/invalid selection, and no-ops when empty. Menu, palette, and `session.go` share it.
+- Previous/Next Workspace are the level above: `navigateWorkspace` steps `currentWorkspaceID` through
+  `visibleWorkspaces` and lands on the target's FIRST session, so the keybind, the palette row and
+  `workspace.go` mean one thing. Keyless, tree mode only, and it reveals a landed pane off the step's
+  captured indicator exactly as plain session nav does. **Collapse is not a navigation filter** —
+  `navigableSessions` and `navigateWorkspace` both ignore `isExpanded`, and adding a term to either would
+  silently rewrite where every existing keystroke, `session.go` call and Ctrl-Tab candidate lands.
 - When selection moves, GUI callers reveal a captured blocked/completed pane; unchanged plain navigation
   only refocuses, preventing a one-item wrap from resetting split focus. Modal focus guards still apply.
 - Attention navigation defaults to Control-Option-Up/Down, includes blocked/completed only, wraps, and

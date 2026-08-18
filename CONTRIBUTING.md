@@ -4,7 +4,7 @@
 
 If this is your first pull request to agterm, open a [Discussion](https://github.com/umputun/agterm/discussions) describing what you plan to build and why, then wait for a reply before writing code. Some ideas do not fit the project's direction, and finding that out early costs less than finding it out after a finished PR.
 
-Check that what you want does not already exist: agterm carries 74 control commands, custom commands you bind yourself in `keymap.conf`, and six Settings tabs, so a lot is reachable without new code. Look at `agtermctl --help`, the [README](README.md), [agterm.com/docs](https://agterm.com/docs), and the bundled agent skill under `plugins/agterm/skills/agterm/` before proposing anything.
+Check that what you want does not already exist: agterm carries a broad control API, custom commands you bind yourself in `keymap.conf`, and six Settings tabs, so a lot is reachable without new code. Look at `agtermctl --help`, the [README](README.md), [agterm.com/docs](https://agterm.com/docs), and the bundled agent skill under `plugins/agterm/skills/agterm/` before proposing anything.
 
 Discussions are for ideas, questions, and anything open-ended. Issues are for concrete bugs and for features already agreed in a Discussion.
 
@@ -37,6 +37,8 @@ After that:
 | `make lint` | `swiftlint lint --strict` over the tree |
 
 All four must be green before you send a PR. `make lint` runs with `--strict`, so a warning fails it and the tree is kept at zero findings.
+
+The OpenCode status-plugin tests inside `make test` spawn Node.js, so they need 22.7+ (or 20.19+ on the 20.x line) on `PATH`; those versions unflag module-syntax detection for the plugin's bare `.js`. Without a qualifying Node they skip, and the app itself never needs Node at runtime.
 
 None of those four runs the XCUITests in `agtermUITests/`. Those need the `agterm` scheme, which drives the running app through the accessibility API:
 

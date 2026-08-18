@@ -144,7 +144,18 @@ struct WindowAccessor: NSViewRepresentable {
                     // flush cwd drift before dropping the store — AppStore doesn't save on a live `cd`, so a
                     // reopened window would load a stale snapshot. skipped once the window is no longer open:
                     // a delete already dropped the store and removed the per-window file, so this resurrects it.
-                    if library.isOpen(windowID) { store.save() }
+                    if library.isOpen(windowID) {
+                        // restore-running-command: capture while the surfaces below are still alive. Skipped
+                        // under termination — the quit-time capture already ran, and a re-read assigns
+                        // unconditionally, so a foreground that exited since would overwrite it with nil.
+                        // `openIDs()` is read before `closeWindow` runs, so it scopes this to the app-exit
+                        // close. Contract in `.claude/rules/settings.md`.
+                        if !library.isTerminating, library.openIDs() == [windowID],
+                           GhosttyApp.shared.restoreRunningCommand {
+                            AppDelegate.captureForegroundCommands(sessions: store.workspaces.flatMap(\.sessions))
+                        }
+                        store.save()
+                    }
                     for session in store.workspaces.flatMap(\.sessions) {
                         session.surface?.teardown()
                         session.splitSurface?.teardown()
@@ -154,6 +165,11 @@ struct WindowAccessor: NSViewRepresentable {
                         session.discardHudBody() // an unrealized HUD has no teardown to delete its body file
                     }
                     library.closeWindow(windowID)
+                    // the quick-terminal panel belongs to no window, so nothing above tore it down. Usually
+                    // moot — an empty open set terminates the app — but a cancelled quit prompt leaves agterm
+                    // running with no window, where `canShow` refuses a NEW show while a panel already up
+                    // would linger as the only thing on screen.
+                    if library.openIDs().isEmpty { QuickTerminalController.shared.hide() }
                     // closing a window drops its (unobserved) store, so the Dock badge's observation won't
                     // fire — refresh explicitly. guarded on isTerminating: at quit willClose fires after
                     // applicationWillTerminate's clear() and closeWindow no-ops (stores stay loaded), so the

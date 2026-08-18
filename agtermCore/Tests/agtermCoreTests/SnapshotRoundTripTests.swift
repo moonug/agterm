@@ -29,17 +29,25 @@ struct SnapshotRoundTripTests {
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
         let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        // split, because the capture path only ever records a split argv for a SHOWN split and the launch
+        // restore arms the split slot on the same condition
+        session.isSplit = true
         session.foregroundCommand = ["ssh", "gate", "-p", "22"]
         session.splitForegroundCommand = ["tail", "-f", "/var/log/x"]
         let snap = store.snapshot()
         let snapped = snap.workspaces[0].sessions[0]
         #expect(snapped.foregroundCommand == ["ssh", "gate", "-p", "22"])
         #expect(snapped.splitForegroundCommand == ["tail", "-f", "/var/log/x"])
+        // the executable half of the round trip is quit → next-launch bootstrap; a non-launch rebuild
+        // deliberately drops the captured commands (see AppStoreRestoreSeedTests).
         let restored = makeStore()
-        restored.restore(from: snap)
+        restored.restore(from: snap, launchRestore: true)
         let r = restored.workspaces[0].sessions[0]
-        #expect(r.foregroundCommand == ["ssh", "gate", "-p", "22"])
-        #expect(r.splitForegroundCommand == ["tail", "-f", "/var/log/x"])
+        #expect(r.pendingForegroundCommand == ["ssh", "gate", "-p", "22"])
+        #expect(r.pendingSplitForegroundCommand == ["tail", "-f", "/var/log/x"])
+        // re-snapshotting the restored store must not write the argv back — that is what makes the
+        // launch-time strip durable against any save before the surfaces consume it.
+        #expect(restored.snapshot().workspaces[0].sessions[0].foregroundCommand == nil)
     }
 
     @Test func legacySnapshotWithoutForegroundCommandDecodesNil() throws {
@@ -153,6 +161,44 @@ struct SnapshotRoundTripTests {
         let restored = makeStore()
         restored.restore(from: store.snapshot())
         #expect(restored.workspaces[0].sessions[0].splitRatio == 0.63)
+    }
+
+    @Test func splitAxisRoundTripsAndLegacyOrUnknownValuesDefaultLeftRight() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        session.isSplit = true
+        session.hasSplit = true
+        session.splitAxis = .topBottom
+
+        let snapshot = store.snapshot()
+        #expect(snapshot.workspaces[0].sessions[0].splitAxis == .topBottom)
+        let restored = makeStore()
+        restored.restore(from: snapshot)
+        #expect(restored.workspaces[0].sessions[0].splitAxis == .topBottom)
+
+        let legacy = #"{"id":"00000000-0000-0000-0000-000000000001","cwd":"/tmp","isSplit":true}"#
+        let legacySession = try JSONDecoder().decode(SessionSnapshot.self, from: Data(legacy.utf8))
+        #expect(legacySession.splitAxis == nil)
+        let legacyStore = makeStore()
+        legacyStore.restore(from: Snapshot(workspaces: [
+            WorkspaceSnapshot(id: UUID(), name: "legacy", sessions: [legacySession]),
+        ]))
+        #expect(legacyStore.workspaces[0].sessions[0].splitAxis == .leftRight)
+
+        let unknown = #"{"id":"00000000-0000-0000-0000-000000000002","cwd":"/tmp","isSplit":true,"splitAxis":"diagonal"}"#
+        let unknownSession = try JSONDecoder().decode(SessionSnapshot.self, from: Data(unknown.utf8))
+        #expect(unknownSession.splitAxis == nil)
+    }
+
+    @Test func hiddenSplitDoesNotPersistAnUnrestorableAxis() {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        session.hasSplit = true
+        session.isSplit = false
+        session.splitAxis = .topBottom
+        #expect(store.snapshot().workspaces[0].sessions[0].splitAxis == nil)
     }
 
     @Test func restoreCommandRoundTripsThroughSnapshot() {

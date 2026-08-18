@@ -21,6 +21,7 @@ final class MockControlActions: ControlActions {
         case sessionReveal(target: String?, window: String?)
         case workspaceNew(window: String?, String?, collapsed: Bool)
         case workspaceSelect(target: String?, window: String?)
+        case workspaceGo(window: String?, WorkspaceNavigation)
         case workspaceRename(target: String?, window: String?, String)
         case workspaceDelete(target: String?, window: String?)
         case sessionMove(target: String?, window: String?, ControlSessionMove)
@@ -33,11 +34,13 @@ final class MockControlActions: ControlActions {
         case markSessionSeen(target: String?, window: String?)
         case sessionStatus(target: String?, window: String?, ControlSessionStatusUpdate)
         case sessionRestore(target: String?, window: String?, ControlSessionRestoreUpdate)
-        case sessionSplit(target: String?, window: String?, String?)
+        case sessionSplit(target: String?, window: String?, String?, SplitAxis?)
+        case sessionSplitClose(target: String?, window: String?)
         case sessionScratch(target: String?, window: String?, String?, command: String?)
         case sessionFocus(target: String?, window: String?, String?)
         case sessionResize(target: String?, window: String?, ControlSplitResize)
         case surfaceZoom(target: String?, window: String?, ControlToggleMode)
+        case surfaceCursor(target: String?, window: String?)
         case dashboard(targets: [String], window: String?, close: Bool, fontMode: DashboardFontMode, mru: Bool)
         case font(target: String?, window: String?, pane: String?, String)
         case keymapReload
@@ -63,6 +66,8 @@ final class MockControlActions: ControlActions {
         case overlayClose(target: String?, window: String?, pane: OverlayPane?)
         case overlayResize(target: String?, window: String?, sizePercent: Int?)
         case overlayResult(target: String?, window: String?, pane: OverlayPane?)
+        case overlayCopy(target: String?, window: String?, pane: OverlayPane?)
+        case overlayText(target: String?, window: String?, ControlSessionOverlayTextOptions)
         case hudOpen(target: String?, window: String?, HudSpec)
         case hudUpdate(target: String?, window: String?, HudSpec)
         case hudClose(target: String?, window: String?)
@@ -125,12 +130,15 @@ final class MockControlActions: ControlActions {
     var nextOverlayCloseResponse = ControlResponse(ok: true)
     var nextOverlayResizeResponse = ControlResponse(ok: true)
     var nextOverlayResultResponse = ControlResponse(ok: true)
+    var nextOverlayCopyResponse = ControlResponse(ok: true)
+    var nextOverlayTextResponse = ControlResponse(ok: true)
     var nextHudOpenResponse = ControlResponse(ok: true)
     var nextHudUpdateResponse = ControlResponse(ok: true)
     var nextHudCloseResponse = ControlResponse(ok: true)
     var nextSessionBackgroundResponse = ControlResponse(ok: true)
     var nextSessionTextResponse = ControlResponse(ok: true)
     var nextSurfaceZoomResponse = ControlResponse(ok: true)
+    var nextSurfaceCursorResponse = ControlResponse(ok: true, result: ControlResult(cursor: ControlCursor(column: 0)))
     var nextDashboardResponse = ControlResponse(ok: true)
     var nextWindowNewResponse = ControlResponse(ok: true)
     var nextWindowListResponse = ControlResponse(ok: true)
@@ -209,6 +217,11 @@ final class MockControlActions: ControlActions {
         return ControlResponse(ok: true)
     }
 
+    func goWorkspace(window: String?, direction: WorkspaceNavigation) -> ControlResponse {
+        calls.append(.workspaceGo(window: window, direction))
+        return ControlResponse(ok: true)
+    }
+
     func renameWorkspace(_ target: String?, window: String?, name: String) -> ControlResponse {
         calls.append(.workspaceRename(target: target, window: window, name))
         return ControlResponse(ok: true)
@@ -281,7 +294,16 @@ final class MockControlActions: ControlActions {
     }
 
     func splitSession(_ target: String?, window: String?, mode: String?) -> ControlResponse {
-        calls.append(.sessionSplit(target: target, window: window, mode))
+        splitSession(target, window: window, mode: mode, axis: nil)
+    }
+
+    func splitSession(_ target: String?, window: String?, mode: String?, axis: SplitAxis?) -> ControlResponse {
+        calls.append(.sessionSplit(target: target, window: window, mode, axis))
+        return ControlResponse(ok: true)
+    }
+
+    func closeSessionSplit(_ target: String?, window: String?) -> ControlResponse {
+        calls.append(.sessionSplitClose(target: target, window: window))
         return ControlResponse(ok: true)
     }
 
@@ -304,6 +326,11 @@ final class MockControlActions: ControlActions {
     func setSurfaceZoom(_ target: String?, window: String?, mode: ControlToggleMode) -> ControlResponse {
         calls.append(.surfaceZoom(target: target, window: window, mode))
         return nextSurfaceZoomResponse
+    }
+
+    func readSurfaceCursor(_ target: String?, window: String?) -> ControlResponse {
+        calls.append(.surfaceCursor(target: target, window: window))
+        return nextSurfaceCursorResponse
     }
 
     func setDashboard(targets: [String], window: String?, close: Bool,
@@ -434,6 +461,17 @@ final class MockControlActions: ControlActions {
     func sessionOverlayResult(_ target: String?, window: String?, pane: OverlayPane?) -> ControlResponse {
         calls.append(.overlayResult(target: target, window: window, pane: pane))
         return nextOverlayResultResponse
+    }
+
+    func copySessionOverlaySelection(_ target: String?, window: String?, pane: OverlayPane?) -> ControlResponse {
+        calls.append(.overlayCopy(target: target, window: window, pane: pane))
+        return nextOverlayCopyResponse
+    }
+
+    func readSessionOverlayText(_ target: String?, window: String?,
+                                options: ControlSessionOverlayTextOptions) -> ControlResponse {
+        calls.append(.overlayText(target: target, window: window, options))
+        return nextOverlayTextResponse
     }
 
     func openHud(_ target: String?, window: String?, spec: HudSpec) -> ControlResponse {

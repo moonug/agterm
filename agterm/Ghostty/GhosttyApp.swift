@@ -148,13 +148,34 @@ final class GhosttyApp {
         config = cfg
         // boot: no surface yet, so the NSApp read is the only side source and nothing rendered can disagree.
         resolveThemeColors(from: cfg, inputs: configInputs, isDark: Self.currentIsDark())
-        // demand-driven, no poll timer (like Ghostty.app/conterm): ticks come from libghostty wakeups
-        // (coalesced in GhosttyCallbacks.wakeup), surfaces draw on GHOSTTY_ACTION_RENDER — idle costs nothing.
+        // no poll timer (like Ghostty.app/conterm): ticks come from libghostty wakeups, coalesced in
+        // GhosttyCallbacks.wakeup, and the renderer thread paints on its own — idle costs nothing.
     }
 
     func tick() {
         guard let app else { return }
         ghostty_app_tick(app)
+    }
+
+    /// Re-side the APP config to the launch appearance, BEFORE the first surface is created.
+    ///
+    /// `Surface.init` rebuilds a surface's config whenever the app's conditional state differs from the
+    /// config's, and that rebuild replays the config FILES only: it carries `working-directory` over and
+    /// drops the per-surface `env_vars`, `initial_input` and `command` the host set on the struct. A
+    /// host-built config always resolves LIGHT, so on a dark launch with a dual `theme = light:,dark:`
+    /// every surface created before the first re-feed spawns with no `AGTERM_*`, no restore replay and no
+    /// `session.new --command` (#260). Only the `update_config` round trip re-sides the stored app config
+    /// — after it the states match and surfaces keep what they were built with. The KVO appearance reload
+    /// does the same thing but is debounced, so it lands well after the launch restore.
+    ///
+    /// Must run where `NSApp` exists (`GhosttyApp` is built before that, so its own read is always light)
+    /// and before any scene mounts, which is why `applicationDidFinishLaunching` calls it.
+    func syncLaunchColorScheme() {
+        guard let app, Self.currentIsDark(), let config else { return }
+        ghostty_app_set_color_scheme(app, GHOSTTY_COLOR_SCHEME_DARK)
+        ghostty_app_update_config(app, config)
+        // the reply carries the config libghostty APPLIED; take and free it so the box holds no stale clone.
+        if let derived = callbacks.takeDerivedAppConfig() { ghostty_config_free(derived) }
     }
 
     /// Set the window translucency the chrome applies. `SettingsModel` calls this and every setter below at
@@ -612,6 +633,13 @@ extension Notification.Name {
     /// accessibility environment values.
     static let agtermAccessibilityDisplayOptionsChanged =
         Notification.Name("agterm.accessibilityDisplayOptionsChanged")
+
+    /// Posted by `SystemWakeObserver` when the displays wake. `ghostty_surface_new` returns NULL while the
+    /// display is asleep, so a session created in that window realizes no surface — the `--command` never runs
+    /// and every later call reports `session not realized` (#416). Nothing re-attempts on a schedule, because
+    /// the deck's retries all ride SwiftUI layout, which does not run for an off-display window. UNREALIZED
+    /// surfaces re-attempt creation here; a realized one is left alone.
+    static let agtermScreensDidWake = Notification.Name("agterm.screensDidWake")
 
     /// Posted when a window becomes frontmost (async, via the window's didBecomeKey), so the control server can
     /// refresh its cached `window.list` — its `active` flag would otherwise stay stale until the next command.

@@ -3,6 +3,12 @@ import Testing
 @testable import agtermCore
 
 struct KeybindTests {
+    private let cmdA = Chord(mods: .command, key: "a")
+    private let cmdB = Chord(mods: .command, key: "b")
+    private let ctrlA = Chord(mods: .control, key: "a")
+    private let keyB = Chord(mods: [], key: "b")
+    private let keyC = Chord(mods: [], key: "c")
+
     // the character counterpart of namedKey(forKeyCode:) must cover the SAME vocabulary, or a menu key
     // equivalent renders with its key missing and stops comparing against the chord the keymap resolved.
     @Test func namedKeyForKeyEquivalentCoversEveryBindableNamedKey() {
@@ -21,6 +27,31 @@ struct KeybindTests {
         #expect(namedKey(forKeyEquivalent: "w") == nil)
         #expect(namedKey(forKeyEquivalent: "") == nil)
         #expect(namedKey(forKeyEquivalent: "ab") == nil, "only a single scalar can be a named key")
+    }
+
+    /// The reverse lookup must round-trip both tables it scans, or a chord that parses cannot be registered
+    /// as a system-wide hotkey.
+    @Test func keyCodeForChordKeyInvertsBothKeyTables() {
+        for code in UInt16(0)...127 {
+            if let named = namedKey(forKeyCode: code) {
+                #expect(keyCode(forChordKey: named) == code)
+            }
+            if let latin = latinKey(forKeyCode: code) {
+                #expect(keyCode(forChordKey: latin) == code)
+            }
+        }
+    }
+
+    @Test func keyCodeForChordKeyCoversEveryBindableNamedKey() {
+        for key in bindableNamedKeys {
+            #expect(keyCode(forChordKey: key) != nil)
+        }
+    }
+
+    @Test func keyCodeForChordKeyRejectsUnproducibleKeys() {
+        #expect(keyCode(forChordKey: "f1") == nil)
+        #expect(keyCode(forChordKey: "esc") == nil)
+        #expect(keyCode(forChordKey: "") == nil)
     }
 
     @Test func parseSimpleChord() {
@@ -262,55 +293,78 @@ struct KeybindTests {
     }
 
     @Test func noConflictsForDistinctShortcuts() {
-        let cmds = [CustomCommand(name: "a", command: "", shortcut: "cmd+a"),
-                    CustomCommand(name: "b", command: "", shortcut: "cmd+b")]
-        #expect(keybindConflicts(cmds).isEmpty)
+        let a = KeybindTarget.command(UUID())
+        let b = KeybindTarget.command(UUID())
+        #expect(keybindConflicts([(keybind: [cmdA], target: a), (keybind: [cmdB], target: b)]).isEmpty)
     }
 
     @Test func detectsDuplicateShortcut() {
-        let a = CustomCommand(name: "a", command: "", shortcut: "cmd+a")
-        let b = CustomCommand(name: "b", command: "", shortcut: "CMD+A")
-        let conflicts = keybindConflicts([a, b])
-        #expect(conflicts == [KeybindConflict(first: a.id, second: b.id)])
+        let a = KeybindTarget.command(UUID())
+        let b = KeybindTarget.command(UUID())
+        let conflicts = keybindConflicts([(keybind: [cmdA], target: a), (keybind: [cmdA], target: b)])
+        #expect(conflicts == [KeybindConflict(first: .init(target: a, keybind: [cmdA]),
+                                             second: .init(target: b, keybind: [cmdA]))])
     }
 
     @Test func detectsPrefixOverlap() {
-        let leader = CustomCommand(name: "leader", command: "", shortcut: "ctrl+a")
-        let seq = CustomCommand(name: "seq", command: "", shortcut: "ctrl+a>b")
-        let conflicts = keybindConflicts([leader, seq])
-        #expect(conflicts == [KeybindConflict(first: leader.id, second: seq.id)])
+        let leader = KeybindTarget.command(UUID())
+        let seq = KeybindTarget.command(UUID())
+        let conflicts = keybindConflicts([(keybind: [ctrlA], target: leader),
+                                          (keybind: [ctrlA, keyB], target: seq)])
+        #expect(conflicts == [KeybindConflict(first: .init(target: leader, keybind: [ctrlA]),
+                                             second: .init(target: seq, keybind: [ctrlA, keyB]))])
     }
 
     @Test func detectsPrefixOverlapRegardlessOfOrder() {
-        let seq = CustomCommand(name: "seq", command: "", shortcut: "ctrl+a>b")
-        let leader = CustomCommand(name: "leader", command: "", shortcut: "ctrl+a")
-        let conflicts = keybindConflicts([seq, leader])
-        #expect(conflicts == [KeybindConflict(first: seq.id, second: leader.id)])
+        let seq = KeybindTarget.command(UUID())
+        let leader = KeybindTarget.command(UUID())
+        let conflicts = keybindConflicts([(keybind: [ctrlA, keyB], target: seq),
+                                          (keybind: [ctrlA], target: leader)])
+        #expect(conflicts == [KeybindConflict(first: .init(target: seq, keybind: [ctrlA, keyB]),
+                                             second: .init(target: leader, keybind: [ctrlA]))])
     }
 
     @Test func detectsThreeWayOverlap() {
         // every shorter bind is a prefix of every longer one, so all three pairs conflict.
-        let leader = CustomCommand(name: "leader", command: "", shortcut: "ctrl+a")
-        let two = CustomCommand(name: "two", command: "", shortcut: "ctrl+a>b")
-        let three = CustomCommand(name: "three", command: "", shortcut: "ctrl+a>b>c")
-        let conflicts = keybindConflicts([leader, two, three])
+        let leader = KeybindTarget.command(UUID())
+        let two = KeybindTarget.command(UUID())
+        let three = KeybindTarget.command(UUID())
+        let conflicts = keybindConflicts([(keybind: [ctrlA], target: leader),
+                                          (keybind: [ctrlA, keyB], target: two),
+                                          (keybind: [ctrlA, keyB, keyC], target: three)])
         #expect(conflicts.count == 3)
-        #expect(conflicts.contains(KeybindConflict(first: leader.id, second: two.id)))
-        #expect(conflicts.contains(KeybindConflict(first: leader.id, second: three.id)))
-        #expect(conflicts.contains(KeybindConflict(first: two.id, second: three.id)))
+        #expect(conflicts.contains(KeybindConflict(first: .init(target: leader, keybind: [ctrlA]),
+                                                   second: .init(target: two, keybind: [ctrlA, keyB]))))
+        #expect(conflicts.contains(KeybindConflict(first: .init(target: leader, keybind: [ctrlA]),
+                                                   second: .init(target: three, keybind: [ctrlA, keyB, keyC]))))
+        #expect(conflicts.contains(KeybindConflict(first: .init(target: two, keybind: [ctrlA, keyB]),
+                                                   second: .init(target: three, keybind: [ctrlA, keyB, keyC]))))
     }
 
     @Test func siblingSequencesSharingLeaderDoNotConflict() {
-        let b = CustomCommand(name: "b", command: "", shortcut: "ctrl+a>b")
-        let c = CustomCommand(name: "c", command: "", shortcut: "ctrl+a>c")
-        #expect(keybindConflicts([b, c]).isEmpty)
+        let b = KeybindTarget.command(UUID())
+        let c = KeybindTarget.command(UUID())
+        #expect(keybindConflicts([(keybind: [ctrlA, keyB], target: b),
+                                  (keybind: [ctrlA, keyC], target: c)]).isEmpty)
     }
 
-    @Test func skipsEmptyAndUnparseableShortcuts() {
-        let paletteOnly = CustomCommand(name: "p", command: "", shortcut: "")
-        let invalid = CustomCommand(name: "i", command: "", shortcut: "ctrl+")
-        let valid = CustomCommand(name: "v", command: "", shortcut: "cmd+a")
-        #expect(keybindConflicts([paletteOnly, invalid, valid]).isEmpty)
+    @Test func detectsConflictBetweenCommandAndBuiltinAlternatives() {
+        let command = KeybindTarget.command(UUID())
+        let builtin = KeybindTarget.builtin(.toggleSplit)
+        let conflicts = keybindConflicts([(keybind: [ctrlA, keyB], target: command),
+                                          (keybind: [ctrlA], target: builtin)])
+        #expect(conflicts == [KeybindConflict(first: .init(target: command, keybind: [ctrlA, keyB]),
+                                             second: .init(target: builtin, keybind: [ctrlA]))])
+    }
+
+    @Test func alternativesOfOneTargetConflictWithEachOther() {
+        // one shortcut offering both `ctrl+a` and `ctrl+a>b` is the wait-or-fire ambiguity against itself.
+        let target = KeybindTarget.command(UUID())
+        let conflicts = keybindConflicts([(keybind: [ctrlA], target: target),
+                                          (keybind: [ctrlA, keyB], target: target)])
+        #expect(conflicts.count == 1)
+        #expect(conflicts[0].first.target == target)
+        #expect(conflicts[0].second.target == target)
     }
 
     @Test func isReservedMonitorChordMatchesTheMonitorPredicates() {
@@ -367,5 +421,104 @@ struct KeybindTests {
             #expect(chord.displayString == "cmd+shift+\(key)")
             #expect(parseKeybind(chord.displayString) == [chord])
         }
+    }
+
+    // MARK: parseKeybinds — `|`-separated alternatives
+
+    @Test func parseKeybindsWithoutPipeWrapsTheSingleResult() {
+        #expect(parseKeybinds("cmd+shift+e") == [[Chord(mods: [.command, .shift], key: "e")]])
+        #expect(parseKeybinds("ctrl+a>g") == [[Chord(mods: .control, key: "a"), Chord(mods: [], key: "g")]])
+    }
+
+    @Test func parseKeybindsSplitsTwoAlternatives() {
+        #expect(parseKeybinds("cmd+t|ctrl+space") == [
+            [Chord(mods: .command, key: "t")],
+            [Chord(mods: .control, key: "space")],
+        ])
+    }
+
+    @Test func parseKeybindsSplitsThreeAlternatives() {
+        #expect(parseKeybinds("cmd+t|ctrl+t|opt+t") == [
+            [Chord(mods: .command, key: "t")],
+            [Chord(mods: .control, key: "t")],
+            [Chord(mods: .option, key: "t")],
+        ])
+    }
+
+    @Test func parseKeybindsAcceptsSequenceAlternatives() {
+        #expect(parseKeybinds("cmd+t|ctrl+space>s") == [
+            [Chord(mods: .command, key: "t")],
+            [Chord(mods: .control, key: "space"), Chord(mods: [], key: "s")],
+        ])
+        #expect(parseKeybinds("ctrl+a>m|cmd+a>m") == [
+            [Chord(mods: .control, key: "a"), Chord(mods: [], key: "m")],
+            [Chord(mods: .command, key: "a"), Chord(mods: [], key: "m")],
+        ])
+    }
+
+    @Test func parseKeybindsRejectsEmptyAlternatives() {
+        #expect(parseKeybinds("") == nil)
+        #expect(parseKeybinds("a||b") == nil)
+        #expect(parseKeybinds("|cmd+t") == nil)
+        #expect(parseKeybinds("cmd+t|") == nil)
+        #expect(parseKeybinds("|") == nil)
+    }
+
+    // a typo is not a collision: binding the half that parsed would hide it behind a working-looking line.
+    @Test func parseKeybindsRejectsTheWholeListWhenOneAlternativeIsMalformed() {
+        #expect(parseKeybinds("cmd+t|f1") == nil)
+        #expect(parseKeybinds("f1|cmd+t") == nil)
+        #expect(parseKeybinds("cmd+t|ctrl+") == nil)
+        #expect(parseKeybinds("cmd+t|cmd+a+b") == nil)
+    }
+
+    @Test func parseKeybindsRejectsAPipeAsABaseKey() {
+        #expect(parseKeybinds("cmd+|") == nil, "no unshifted key produces `|`; the spelling that fires is shift+\\")
+    }
+
+    // MARK: keybind rendering
+
+    @Test func keybindDisplayStringJoinsChordsWithAngle() {
+        let keybind: Keybind = [Chord(mods: .control, key: "a"), Chord(mods: [], key: "g")]
+        #expect(keybind.displayString == "ctrl+a>g")
+        #expect(parseKeybind(keybind.displayString) == keybind)
+        #expect([Chord(mods: .command, key: "t")].displayString == "cmd+t")
+    }
+
+    @Test func keybindGlyphStringRunsChordsTogether() {
+        let keybind: Keybind = [Chord(mods: .control, key: "space"), Chord(mods: [], key: "s")]
+        #expect(keybind.glyphString == "⌃␣>S")
+        #expect([Chord(mods: .command, key: "t")].glyphString == "⌘T")
+    }
+
+    // MARK: alternativeKeybinds
+
+    /// The raw spelling a surviving alternative is quoted and stored under, spliced back together.
+    private func rawAlternatives(_ s: String) -> String? {
+        alternativeKeybinds(s).map { $0.map(\.raw).joined(separator: "|") }
+    }
+
+    @Test func alternativeKeybindsDropsARepeat() {
+        #expect(rawAlternatives("cmd+t|cmd+t") == "cmd+t")
+        #expect(rawAlternatives("cmd+t|ctrl+space>s|cmd+t") == "cmd+t|ctrl+space>s")
+    }
+
+    @Test func alternativeKeybindsKeepsTheRawSpellingOfTheSurvivor() {
+        #expect(rawAlternatives("command+shift+a|cmd+shift+a") == "command+shift+a")
+        #expect(rawAlternatives("CMD+T|cmd+t") == "CMD+T")
+    }
+
+    @Test func alternativeKeybindsLeavesADistinctListUntouched() {
+        #expect(rawAlternatives("cmd+t") == "cmd+t")
+        #expect(rawAlternatives("cmd+t|ctrl+t") == "cmd+t|ctrl+t")
+        #expect(rawAlternatives("a|b echo") == nil, "a shell tail is no binding at all")
+    }
+
+    // the discriminator between a typo in one alternative and a shell line that happens to lead with a pipe.
+    @Test func malformedAlternativeIsToldApartFromAShellPipeline() {
+        #expect(hasMalformedAlternative("cmd+e|f1"))
+        #expect(hasMalformedAlternative("f1|cmd+e"))
+        #expect(!hasMalformedAlternative("ls|grep"), "neither half is a keybind, so this is a pipeline")
+        #expect(!hasMalformedAlternative("f1"), "a lone token carries no alternative to be malformed")
     }
 }

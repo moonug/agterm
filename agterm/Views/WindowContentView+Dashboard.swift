@@ -110,6 +110,7 @@ extension WindowContentView {
                 pillColor: dashboardPillColor,
                 pillTextColor: dashboardPillTextColor,
                 focusAllowed: pick.pending == nil,
+                showsTopHairline: toolbarMode != .hidden,
                 onClick: { clickDashboardMember($0) },
                 onSelect: { selectDashboardMember($0) },
                 onClose: { closeDashboardFromKeyboard() }
@@ -118,7 +119,7 @@ extension WindowContentView {
     }
 
     /// Title-bar opener for the view-only grid — the frontmost window's most-recently-used sessions,
-    /// auto-sized (the `AppActions.toggleDashboard` / ⌘⇧D / Navigate ▸ Dashboard path). A single glyph,
+    /// auto-sized (the `AppActions.toggleDashboard` / ⌘⇧G / Navigate ▸ Dashboard path). A single glyph,
     /// never a 2-state toggle: an open dashboard swaps the whole titlebar for `dashboardTitlebar`, so this
     /// renders only while closed. Disabled with no sessions; non-private so `titlebarRow` can place it.
     var dashboardButton: some View {

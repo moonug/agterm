@@ -108,6 +108,19 @@ func latinKey(forKeyCode keyCode: UInt16) -> String? {
     }
 }
 
+/// The macOS virtual key code that produces a chord's base key, or nil when no ANSI position does.
+///
+/// The inverse of `namedKey(forKeyCode:)`/`latinKey(forKeyCode:)`, derived by scanning them rather than
+/// spelled as a third table, so a name or position added to either is reachable here with no second edit.
+/// `RegisterEventHotKey` is the caller: a system-wide hotkey is registered by physical position, never by
+/// produced character, so it keeps firing when the user switches to a non-Latin layout.
+public func keyCode(forChordKey key: String) -> UInt16? {
+    // named keys first: their codes are outside the ANSI table, and neither map claims the same code.
+    for code in UInt16(0)...127 where namedKey(forKeyCode: code) == key { return code }
+    for code in UInt16(0)...127 where latinKey(forKeyCode: code) == key { return code }
+    return nil
+}
+
 /// The base key for a key press. `produced` is the character the ACTIVE layout puts on that key with no
 /// modifiers applied, `layoutIsASCIICapable` whether that layout can type ASCII at all.
 ///
@@ -233,6 +246,23 @@ public struct Chord: Equatable, Hashable, Sendable {
 /// (e.g. `ctrl+a > b`).
 public typealias Keybind = [Chord]
 
+public extension Array where Element == Chord {
+    /// The keybind in kitty syntax, chords joined with `>` (`ctrl+a>g`) — the spelling `keymap.conf` uses.
+    var displayString: String { map(\.displayString).joined(separator: ">") }
+
+    /// The keybind as macOS glyphs, chords joined with `>` (`⌃A>T`). Run together they read as one chord
+    /// (`⌃AT` looks like Ctrl-Alt-T), and a space is taken: callers list a binding's ALTERNATIVES
+    /// space-separated. `>` is what `keymap.conf` already spells, so the hint matches what the user typed.
+    var glyphString: String { map(\.glyphString).joined(separator: ">") }
+}
+
+/// What a keybind fires: a custom command by id, or a built-in action. One matcher carries both verbs'
+/// monitor-bound binds, and the conflict pass names whichever side lost.
+public enum KeybindTarget: Hashable, Sendable {
+    case command(UUID)
+    case builtin(BuiltinAction)
+}
+
 /// Parse a keybind string into a `Keybind`, or `nil` when it is empty, malformed, or names an unknown modifier.
 ///
 /// The grammar is chords separated by `>`, each a `+`-joined list of modifier words and a final base key,
@@ -250,6 +280,50 @@ public func parseKeybind(_ s: String) -> Keybind? {
         keybind.append(chord)
     }
     return keybind
+}
+
+/// Parse a binding token into its alternatives, splitting on `|` — the tier above `>` (chords in a sequence)
+/// and `+` (modifiers in a chord). Alternatives live inside ONE whitespace-delimited token, with no spaces
+/// around the `|`, so `parseCommandLine`'s shell-line tokenizer needs no change.
+///
+/// Returns `nil` when ANY alternative is malformed, which kills the whole line: binding the half that parsed
+/// would hide the typo behind a line that looks like it worked. A token with no `|` yields a one-element list
+/// wrapping exactly `parseKeybind`'s result.
+///
+/// `|` being the separator makes it unspellable as a base key: `cmd+|` splits before `parseChord` sees it.
+/// Harmless — no unshifted key produces `|`, so such a binding could never fire; the spelling that does is
+/// `shift+\`.
+func parseKeybinds(_ s: String) -> [Keybind]? {
+    var keybinds: [Keybind] = []
+    for part in s.split(separator: "|", omittingEmptySubsequences: false) {
+        guard let keybind = parseKeybind(String(part)) else { return nil }
+        keybinds.append(keybind)
+    }
+    return keybinds.isEmpty ? nil : keybinds
+}
+
+/// Whether a token `parseKeybinds` rejected still reads as an intended binding: it offers `|` alternatives and
+/// at least one of them parses. A `command` line's first token may legitimately be shell text (`ls|grep foo`),
+/// so this is what separates a typo in one alternative from a pipeline that happens to lead the line.
+func hasMalformedAlternative(_ s: String) -> Bool {
+    let parts = s.split(separator: "|", omittingEmptySubsequences: false)
+    guard parts.count > 1 else { return false }
+    return parts.contains { parseKeybind(String($0)) != nil }
+}
+
+/// A binding token's alternatives as raw-substring / parsed-keybind pairs in file order, every repeat of an
+/// earlier keybind dropped. `nil` when any alternative is malformed, exactly as `parseKeybinds`. The raw
+/// substrings ride along so diagnostics and `CustomCommand.shortcut` quote the user's own spelling instead of
+/// a canonicalized re-render (`command+shift+a` must not become `cmd+shift+a`).
+func alternativeKeybinds(_ s: String) -> [(raw: String, keybind: Keybind)]? {
+    guard let keybinds = parseKeybinds(s) else { return nil }
+
+    let parts = s.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+    var kept: [(raw: String, keybind: Keybind)] = []
+    for (part, keybind) in zip(parts, keybinds) where !kept.contains(where: { $0.keybind == keybind }) {
+        kept.append((part, keybind))
+    }
+    return kept
 }
 
 /// Parse a single chord (a `+`-joined list of modifier words plus one base key), or `nil` when it is empty,
@@ -287,40 +361,55 @@ private func modifier(for token: String) -> Modifier? {
     }
 }
 
-/// A pair of custom commands whose shortcuts conflict — either identical or one a sequence-prefix
-/// of the other (the wait-or-fire ambiguity). Carries both ids so the UI can point at the offenders.
+/// A pair of monitor-bound binds that conflict — either identical or one a sequence-prefix of the other (the
+/// wait-or-fire ambiguity). Each side names its target AND the exact keybind that lost, because a target may
+/// own several alternatives and only the offending one is dropped.
 public struct KeybindConflict: Equatable, Sendable {
-    public let first: UUID
-    public let second: UUID
+    public struct Side: Hashable, Sendable {
+        public let target: KeybindTarget
+        public let keybind: Keybind
 
-    public init(first: UUID, second: UUID) {
+        public init(target: KeybindTarget, keybind: Keybind) {
+            self.target = target
+            self.keybind = keybind
+        }
+    }
+
+    public let first: Side
+    public let second: Side
+
+    public init(first: Side, second: Side) {
         self.first = first
         self.second = second
     }
 }
 
-/// Find shortcut conflicts across a list of custom commands. Two parseable, non-empty shortcuts conflict when
-/// one keybind is a prefix of the other (a duplicate is the degenerate equal-length case): the shorter would
-/// fire — or be forced to wait — ambiguously while the longer is still being typed. Commands with an empty or
-/// unparseable shortcut are skipped (palette-only / surfaced separately).
-public func keybindConflicts(_ commands: [CustomCommand]) -> [KeybindConflict] {
-    let parsed: [(id: UUID, keybind: Keybind)] = commands.compactMap { command in
-        guard !command.shortcut.isEmpty, let keybind = parseKeybind(command.shortcut) else { return nil }
-        return (command.id, keybind)
-    }
-
+/// Find conflicts across every monitor-bound bind, from both verbs and every alternative of each. Two binds
+/// conflict when one keybind is a prefix of the other (a duplicate is the degenerate equal-length case): the
+/// shorter would fire — or be forced to wait — ambiguously while the longer is still being typed. Callers pass
+/// already-parsed binds, so an empty or unparseable shortcut never reaches here.
+public func keybindConflicts(_ binds: [(keybind: Keybind, target: KeybindTarget)]) -> [KeybindConflict] {
     var conflicts: [KeybindConflict] = []
-    for i in parsed.indices {
-        for j in parsed.index(after: i)..<parsed.endIndex where isPrefix(parsed[i].keybind, of: parsed[j].keybind) {
-            conflicts.append(KeybindConflict(first: parsed[i].id, second: parsed[j].id))
+    for i in binds.indices {
+        for j in binds.index(after: i)..<binds.endIndex where isPrefix(binds[i].keybind, of: binds[j].keybind) {
+            conflicts.append(KeybindConflict(
+                first: KeybindConflict.Side(target: binds[i].target, keybind: binds[i].keybind),
+                second: KeybindConflict.Side(target: binds[j].target, keybind: binds[j].keybind)))
         }
     }
     return conflicts
 }
 
 /// Whether one keybind is a prefix of another (equal length counts — a duplicate is a prefix of itself).
-/// Order-independent: it checks the shorter-or-equal against the longer, so callers pass one direction only.
+/// Order-independent: it checks both directions, so callers pass one only.
 private func isPrefix(_ a: Keybind, of b: Keybind) -> Bool {
-    let (shorter, longer) = a.count <= b.count ? (a, b) : (b, a)
-    return Array(longer.prefix(shorter.count)) == shorter
+    a == b || isStrictKeybindPrefix(a, of: b) || isStrictKeybindPrefix(b, of: a)
+}
+
+/// Whether `prefix` is a STRICT (shorter, leading) prefix of `keybind` — the relation that decides which of
+/// two binds can never fire: `KeybindMatcher` fires the exact shorter match rather than waiting out the
+/// longer one.
+func isStrictKeybindPrefix(_ prefix: Keybind, of keybind: Keybind) -> Bool {
+    guard prefix.count < keybind.count else { return false }
+    return Array(keybind.prefix(prefix.count)) == prefix
 }

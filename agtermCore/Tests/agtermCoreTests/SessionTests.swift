@@ -513,6 +513,23 @@ struct SessionTests {
         #expect(session.takePendingRestoreOverride(pane: .left) == "claude --resume main")
     }
 
+    @Test func clearPendingForegroundCommandsDropsBothCapturesAndKeepsTheRestorePins() {
+        // what restore.clear needs: the launch parks captures in the pending slots until each surface
+        // mounts, so clearing only the persisted fields would answer ok and still let them run. The
+        // session.restore pins are sticky and must survive.
+        let session = Session(initialCwd: "/repo")
+        session.pendingForegroundCommand = ["tee", "/tmp/m"]
+        session.pendingSplitForegroundCommand = ["tail", "-f", "/var/log/x"]
+        session.restoreCommand = "claude --resume main"
+        session.pendingRestoreCommand = session.restoreCommand
+
+        session.clearPendingForegroundCommands()
+        #expect(session.takePendingForegroundCommand(pane: .left) == nil)
+        #expect(session.takePendingForegroundCommand(pane: .right) == nil)
+        #expect(session.takePendingRestoreOverride(pane: .left) == "claude --resume main")
+        #expect(session.restoreCommand == "claude --resume main")
+    }
+
     @Test func clearPendingRestoreOverridesDropsBothPayloadsAndKeepsThePins() {
         // the same object comes back on undo, so an unconsumed payload must not survive the round trip —
         // while the persisted pins stay, to fire on the next launch.

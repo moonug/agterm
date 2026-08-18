@@ -9,11 +9,14 @@ public enum BuiltinAction: String, CaseIterable, Sendable {
     case duplicateSession = "duplicate_session"
     case closeSession = "close_session", reopenRecent = "reopen_recent", undoClose = "undo_close", clearStatus = "clear_status"
     case increaseFontSize = "increase_font_size", decreaseFontSize = "decrease_font_size", resetFontSize = "reset_font_size"
-    case toggleSplit = "toggle_split", toggleScratch = "toggle_scratch", toggleTerminalZoom = "toggle_terminal_zoom"
+    case toggleSplit = "toggle_split", toggleHorizontalSplit = "toggle_horizontal_split"
+    case toggleScratch = "toggle_scratch", toggleTerminalZoom = "toggle_terminal_zoom"
     case toggleSearch = "toggle_search", openLinkAtCursor = "open_link_at_cursor"
     case toggleSidebar = "toggle_sidebar", selectTheme = "select_theme", toggleFullscreen = "toggle_fullscreen"
     case toggleFlaggedView = "toggle_flagged_view", toggleFlag = "toggle_flag", focusWorkspace = "focus_workspace"
     case toggleWorkspaceFilter = "toggle_workspace_filter"
+    case previousWorkspace = "previous_workspace", nextWorkspace = "next_workspace"
+    case toggleWorkspaceCollapse = "toggle_workspace_collapse"
     case focusLeftPane = "focus_left_pane", focusRightPane = "focus_right_pane"
     case previousSession = "previous_session", nextSession = "next_session"
     case previousAttentionSession = "previous_attention_session", nextAttentionSession = "next_attention_session"
@@ -39,6 +42,7 @@ public enum BuiltinAction: String, CaseIterable, Sendable {
         case .decreaseFontSize: return Chord(mods: [.command], key: "-")
         case .resetFontSize: return Chord(mods: [.command], key: "0")
         case .toggleSplit: return Chord(mods: [.command], key: "d")
+        case .toggleHorizontalSplit: return Chord(mods: [.command, .shift], key: "d")
         case .toggleScratch: return Chord(mods: [.command], key: "j")
         case .toggleTerminalZoom: return Chord(mods: [.command, .shift], key: "return")
         case .toggleSearch: return Chord(mods: [.command], key: "f")
@@ -50,7 +54,7 @@ public enum BuiltinAction: String, CaseIterable, Sendable {
         case .commandPalette: return Chord(mods: [.control, .shift], key: "p")
         case .customCommandPalette: return Chord(mods: [.control, .shift], key: "o")
         case .showAttention: return Chord(mods: [.control, .shift], key: "i")
-        case .dashboard: return Chord(mods: [.command, .shift], key: "d")
+        case .dashboard: return Chord(mods: [.command, .shift], key: "g")
         case .focusLeftPane: return Chord(mods: [.command, .option], key: "left")
         case .focusRightPane: return Chord(mods: [.command, .option], key: "right")
         case .previousSession: return Chord(mods: [.command, .option], key: "up")
@@ -59,7 +63,7 @@ public enum BuiltinAction: String, CaseIterable, Sendable {
         case .nextAttentionSession: return Chord(mods: [.control, .option], key: "down")
         case .renameWindow, .deleteWindow, .renameWorkspace, .deleteWorkspace, .renameSession, .duplicateSession,
              .clearStatus, .firstSession, .lastSession, .selectTheme, .toggleFlaggedView, .focusWorkspace,
-             .toggleWorkspaceFilter, .openLinkAtCursor:
+             .toggleWorkspaceFilter, .previousWorkspace, .nextWorkspace, .toggleWorkspaceCollapse, .openLinkAtCursor:
             return nil
         }
     }

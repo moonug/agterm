@@ -11,9 +11,9 @@ public enum TerminalZoomSurface: String, CaseIterable, Codable, Equatable, Senda
 
     public init?(controlName: String) {
         switch controlName {
-        case "left", "primary":
+        case "left", "top", "primary":
             self = .primary
-        case "right", "split":
+        case "right", "bottom", "split":
             self = .split
         case "scratch":
             self = .scratch
@@ -25,6 +25,20 @@ public enum TerminalZoomSurface: String, CaseIterable, Codable, Equatable, Senda
             self = .overlayRight
         default:
             return nil
+        }
+    }
+
+    /// The live surface occupying this slot, nil when nothing has been created there. Availability is a
+    /// separate question — `isAvailable` answers whether the slot is ADDRESSABLE, which a session can be
+    /// while its surface has yet to come up.
+    @MainActor public func surface(in session: Session) -> (any TerminalSurface)? {
+        switch self {
+        case .primary: return session.surface
+        case .split: return session.splitSurface
+        case .scratch: return session.scratchSurface
+        case .overlay: return session.overlaySurface
+        case .overlayLeft: return session.leftOverlaySurface
+        case .overlayRight: return session.rightOverlaySurface
         }
     }
 
@@ -190,8 +204,10 @@ public final class TerminalZoomController {
         target = nil
     }
 
-    public static func resolveTarget(store: AppStore, quickTerminalVisible: Bool) -> TerminalZoomTarget? {
-        if quickTerminalVisible { return .quick }
+    /// The surface a bare zoom toggle fills THIS window with. The quick terminal is deliberately absent: it
+    /// is one detached panel per app, so it is not a surface any window can zoom, and `.quick` is instead
+    /// owned by `QuickTerminalController.isZoomed`.
+    public static func resolveTarget(store: AppStore) -> TerminalZoomTarget? {
         guard let session = store.activeSession else { return nil }
         // one source of truth for the active-surface precedence: `isActive(in:)` defines mutually
         // exclusive predicates per case, so the first (only) active one is the zoom target. The
@@ -200,10 +216,12 @@ public final class TerminalZoomController {
         return .session(session.id, surface)
     }
 
-    public static func isTargetValid(_ target: TerminalZoomTarget, in store: AppStore, quickTerminalVisible: Bool) -> Bool {
+    /// Whether a WINDOW's zoom target still exists. `.quick` never reaches a window controller (see
+    /// `resolveTarget`), so it can only be a stale value and is always invalid here.
+    public static func isTargetValid(_ target: TerminalZoomTarget, in store: AppStore) -> Bool {
         switch target {
         case .quick:
-            return quickTerminalVisible
+            return false
         case let .session(sessionID, surface):
             guard let session = store.session(withID: sessionID) else { return false }
             return surface.isAvailable(in: session)

@@ -366,9 +366,14 @@ extension GhosttySurfaceView {
 
 extension GhosttySurfaceView: @preconcurrency NSTextInputClient {
     func insertText(_ string: Any, replacementRange _: NSRange) {
+        // the AX path commits our copy of a live composition and THEN tears the IME session down; an input
+        // method that finalizes on that teardown would re-send the same characters here. See
+        // `commitOrDiscardComposition` — the flag is set only for that one synchronous call.
+        guard !committingComposition else { return }
         let text = (string as? String) ?? (string as? NSAttributedString)?.string ?? ""
         guard !text.isEmpty else { return }
         _markedRange = NSRange(location: NSNotFound, length: 0)
+        _markedText = ""
         if let surface { ghostty_surface_preedit(surface, nil, 0) }
         if currentKeyEvent != nil {
             keyTextAccumulator.append(text)
@@ -382,23 +387,76 @@ extension GhosttySurfaceView: @preconcurrency NSTextInputClient {
         }
     }
 
+    /// Units matter twice here, and `text.count` (grapheme clusters) is wrong for both.
+    /// `ghostty_surface_preedit` takes a BYTE length over the UTF-8 buffer `withCString` hands it — the same
+    /// contract `insertPasted` honors with `text.utf8.count` — so a 3-character `にほん` reported as 3 had
+    /// libghostty render the first 3 BYTES, i.e. one truncated character, for every CJK/emoji/combining
+    /// composition. `NSRange`, meanwhile, is UTF-16 over the string AppKit sees, so `markedRange()` owes
+    /// `utf16.count`.
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange _: NSRange) {
         guard let surface else { return }
         let text = (string as? String) ?? (string as? NSAttributedString)?.string ?? ""
-        _markedRange = text.isEmpty ? NSRange(location: NSNotFound, length: 0) : NSRange(location: 0, length: text.count)
+        _markedRange = text.isEmpty
+            ? NSRange(location: NSNotFound, length: 0)
+            : NSRange(location: 0, length: text.utf16.count)
+        _markedText = text
         _selectedRange = selectedRange
-        text.withCString { ghostty_surface_preedit(surface, $0, UInt(text.count)) }
+        text.withCString { ghostty_surface_preedit(surface, $0, UInt(text.utf8.count)) }
     }
 
     func unmarkText() {
         guard let surface else { return }
         _markedRange = NSRange(location: NSNotFound, length: 0)
+        _markedText = ""
         ghostty_surface_preedit(surface, nil, 0)
     }
 
     func selectedRange() -> NSRange { _selectedRange }
     func markedRange() -> NSRange { _markedRange }
     func hasMarkedText() -> Bool { _markedRange.location != NSNotFound }
+
+    /// End any in-flight IME composition before a PROGRAMMATIC insert — by COMMITTING it, not throwing it
+    /// away. Lives here, beside the `_markedText`/`_markedRange` state it operates on, because every
+    /// programmatic writer owes it: the AX dictation insert, a file/text drop (`insertPasted`) and
+    /// `session.type` (`inject`). Left alone, the composition survives the insert and re-commits on the
+    /// next keystroke, landing the user's half-typed word after whatever was inserted.
+    ///
+    /// The composition is text the user has already typed. `discardMarkedText()` alone abandons the
+    /// conversion session without committing, so a CJK user mid-word when an insert arrives lost those
+    /// characters outright. AppKit's own behaviour when a field gives up an active composition (a click
+    /// away, a focus change) is to commit it, so that is what this does: send our copy of the marked string
+    /// through the ordinary `insertText` path first, THEN `discardMarkedText()` so the input context drops
+    /// its now-committed session and cannot re-commit the same characters. Exactly once, either way.
+    ///
+    /// The copy is needed because libghostty owns the preedit for rendering and hands nothing back, and
+    /// `attributedSubstring(forProposedRange:)` returns nil — `_markedText` is the only source for it.
+    ///
+    /// "Exactly once" is enforced, not assumed. `discardMarkedText()` is documented to abandon the session
+    /// without committing, but an input method that FINALIZES on teardown instead would push the same
+    /// characters back through `insertText` and land them a second time (`今日今日` ahead of the inserted
+    /// text). `committingComposition` fences that one synchronous call so a re-entrant insert is dropped;
+    /// nothing else can legitimately type inside it. Whether any shipping IME behaves that way is the one
+    /// thing that cannot be settled without a live IME — this makes the answer not matter.
+    ///
+    /// Two guards make it safe on the paths that reach a NON-focused surface (`inject` types into any
+    /// realized session, focused or not). `hasMarkedText()` is per-view state, so a pane with no
+    /// composition of its own does nothing at all. And the input context is only torn down when this view
+    /// actually holds first responder: `inputContext` resolves to the SHARED context, so discarding from a
+    /// background pane would abandon the composition of whichever view is really composing. A background
+    /// pane's own stale composition is still committed — only the IME session teardown is skipped, and
+    /// that session isn't ours to end.
+    func commitOrDiscardComposition() {
+        guard hasMarkedText() else { return }
+        if _markedText.isEmpty {
+            unmarkText()
+        } else {
+            insertText(_markedText, replacementRange: NSRange(location: NSNotFound, length: 0))
+        }
+        guard window?.firstResponder === self else { return }
+        committingComposition = true
+        inputContext?.discardMarkedText()
+        committingComposition = false
+    }
 
     func attributedSubstring(forProposedRange _: NSRange, actualRange _: NSRangePointer?) -> NSAttributedString? {
         nil

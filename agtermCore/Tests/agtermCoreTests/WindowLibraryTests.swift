@@ -647,6 +647,224 @@ final class WindowLibraryTests {
         #expect(reloaded.restoreCommand == "claude --resume abc")
     }
 
+    @Test func allClosedExitPinsFrontmostSoRelaunchReopensTheExitWindow() throws {
+        // closing the LAST open window persists an index with no open entries, so the next launch takes
+        // reopen's never-windowless fallback — without the pin it opens windows.first (the OLDEST library
+        // entry), silently dropping the exit window's captured-command replay whenever the two differ.
+        let oldest = UUID(uuidString: "0A11AAAA-0000-0000-0000-000000000011")!
+        let exitWindow = UUID(uuidString: "7B33CCCC-0000-0000-0000-000000000013")!
+        let sessionID = UUID()
+        let workspaceID = UUID()
+        try writeWindowFile(oldest, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "old", sessions: [])]))
+        try writeWindowFile(exitWindow, Snapshot(workspaces: [WorkspaceSnapshot(
+            id: workspaceID, name: "work",
+            sessions: [SessionSnapshot(id: sessionID, customName: nil, cwd: "/a")])]))
+        try writeIndex(WindowsIndex(frontmost: exitWindow, windows: [
+            WindowEntry(id: oldest, name: "old", isOpen: false),
+            WindowEntry(id: exitWindow, name: "work", isOpen: true),
+        ]))
+
+        let library = WindowLibrary(directory: directory)
+        library.closeWindow(exitWindow)
+        #expect(library.frontmostWindowID == exitWindow)
+        // stand in for the app target's `willClose`, which captures the live argv on the app-exit close;
+        // agtermCore has no surfaces to read one from.
+        try writeWindowFile(exitWindow, Snapshot(workspaces: [WorkspaceSnapshot(
+            id: workspaceID, name: "work",
+            sessions: [SessionSnapshot(id: sessionID, customName: nil, cwd: "/a",
+                                       foregroundCommand: ["tee", "/tmp/m"])])]))
+
+        let relaunched = WindowLibrary(directory: directory)
+        #expect(relaunched.openIDs() == [exitWindow])
+        let session = relaunched.store(for: exitWindow)?.session(withID: sessionID)
+        #expect(session?.pendingForegroundCommand == ["tee", "/tmp/m"])
+    }
+
+    @Test func allClosedExitPinsFrontmostEvenWhenRemoveWindowClearedIt() throws {
+        // the case the unconditional pin adds over reassigning only when the closing window WAS frontmost:
+        // removeWindow nils frontmostWindowID (:491), and an inactive app gets no didBecomeKey to repair it,
+        // so the exit close finds nil and the next launch would fall back to windows.first.
+        let oldest = UUID(uuidString: "0A11AAAA-0000-0000-0000-000000000021")!
+        let deleted = UUID(uuidString: "3C22BBBB-0000-0000-0000-000000000022")!
+        let exitWindow = UUID(uuidString: "7B33CCCC-0000-0000-0000-000000000023")!
+        for (id, name) in [(oldest, "old"), (deleted, "gone"), (exitWindow, "work")] {
+            try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: name, sessions: [])]))
+        }
+        try writeIndex(WindowsIndex(frontmost: deleted, windows: [
+            WindowEntry(id: oldest, name: "old", isOpen: false),
+            WindowEntry(id: deleted, name: "gone", isOpen: true),
+            WindowEntry(id: exitWindow, name: "work", isOpen: true),
+        ]))
+
+        let library = WindowLibrary(directory: directory)
+        library.removeWindow(deleted)
+        #expect(library.frontmostWindowID == nil)
+
+        library.closeWindow(exitWindow)
+        #expect(library.frontmostWindowID == exitWindow)
+        #expect(WindowLibrary(directory: directory).openIDs() == [exitWindow])
+    }
+
+    @Test func launchRestoreArmsTheCaptureInMemoryButStripsItFromDisk() throws {
+        // the surface factory consumes the capture in memory only, so without stripping the file here the
+        // argv outlives its one replay and a crash before the next structural save runs it a SECOND time on
+        // the following launch. The armed copy lives in the transient slots, and the persisted fields go
+        // nil, so no save landing before the surfaces spawn can write it back.
+        let id = UUID()
+        let sessionID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a", isSplit: true,
+                                      foregroundCommand: ["tee", "/tmp/m"],
+                                      splitForegroundCommand: ["tail", "-f", "/var/log/x"])
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [session])]))
+        try writeIndex(WindowsIndex(frontmost: id, windows: [WindowEntry(id: id, name: "work", isOpen: true)]))
+
+        let library = WindowLibrary(directory: directory)
+        let armed = try #require(library.store(for: id)?.session(withID: sessionID))
+        #expect(armed.pendingForegroundCommand == ["tee", "/tmp/m"])
+        #expect(armed.pendingSplitForegroundCommand == ["tail", "-f", "/var/log/x"])
+        #expect(armed.foregroundCommand == nil)
+        #expect(armed.splitForegroundCommand == nil)
+        // a save between arming and consumption must not resurrect the argv on disk
+        try #require(library.store(for: id)).save()
+
+        let persisted = PersistenceStore(directory: directory.appendingPathComponent("windows"),
+                                         fileName: "\(id.uuidString).json").load()
+        #expect(persisted.workspaces[0].sessions[0].foregroundCommand == nil)
+        #expect(persisted.workspaces[0].sessions[0].splitForegroundCommand == nil)
+        // the rest of the snapshot must survive the rewrite
+        #expect(persisted.workspaces[0].sessions[0].cwd == "/a")
+        #expect(persisted.workspaces[0].name == "work")
+    }
+
+    @Test func aFailedStripDisarmsBothPanesInsteadOfLeavingAReplayItCouldNotRecord() throws {
+        // the other half of the launch branch: when the rewrite fails the capture must not fire at all,
+        // because nothing would record that it had and it would run again on every later launch. Both
+        // panes, since disarming only the main one leaves the split replaying forever.
+        let id = UUID()
+        let sessionID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a", isSplit: true,
+                                      foregroundCommand: ["tee", "/tmp/m"],
+                                      splitForegroundCommand: ["tail", "-f", "/var/log/x"],
+                                      restoreCommand: "claude --resume abc")
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [session])]))
+        try writeIndex(WindowsIndex(frontmost: id, windows: [WindowEntry(id: id, name: "work", isOpen: true)]))
+
+        let windowsDir = directory.appendingPathComponent("windows")
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: windowsDir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: windowsDir.path) }
+
+        let library = WindowLibrary(directory: directory)
+        let armed = try #require(library.store(for: id)?.session(withID: sessionID))
+        #expect(armed.pendingForegroundCommand == nil)
+        #expect(armed.pendingSplitForegroundCommand == nil)
+        // the sticky override is not one-shot, so a failed strip must leave it armed
+        #expect(armed.pendingRestoreCommand == "claude --resume abc")
+    }
+
+    @Test func launchRestoreLeavesAStickyOverrideOnDiskWhileStrippingTheCapture() throws {
+        // the strip is one-shot captures only: session.restore is sticky and must survive to fire again.
+        let id = UUID()
+        let sessionID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a",
+                                      foregroundCommand: ["tee", "/tmp/m"],
+                                      restoreCommand: "claude --resume abc")
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [session])]))
+        try writeIndex(WindowsIndex(frontmost: id, windows: [WindowEntry(id: id, name: "work", isOpen: true)]))
+
+        let library = WindowLibrary(directory: directory)
+        #expect(library.store(for: id)?.session(withID: sessionID)?.pendingRestoreCommand == "claude --resume abc")
+
+        let persisted = PersistenceStore(directory: directory.appendingPathComponent("windows"),
+                                         fileName: "\(id.uuidString).json").load()
+        #expect(persisted.workspaces[0].sessions[0].foregroundCommand == nil)
+        #expect(persisted.workspaces[0].sessions[0].restoreCommand == "claude --resume abc")
+    }
+
+    @Test func midProcessReloadScrubsCapturedCommandsFromDisk() throws {
+        // the launch-only gate drops a captured foreground command from the LIVE sessions, but the
+        // snapshot on disk still carries it — without a write-back, a force-quit after the reopen
+        // replays the stale command on the next launch, after the user last saw a plain shell.
+        let anchor = UUID()
+        let id = UUID()
+        let sessionID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a",
+                                      foregroundCommand: ["tee", "/tmp/m"],
+                                      splitForegroundCommand: ["tail", "-f", "/var/log/x"])
+        try writeWindowFile(anchor, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "open", sessions: [])]))
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [session])]))
+        // the anchor stays open so the bootstrap fallback doesn't open the target window itself —
+        // loading the target below is then a genuine mid-run reopen, not a launch restore.
+        try writeIndex(WindowsIndex(frontmost: anchor, windows: [
+            WindowEntry(id: anchor, name: "open", isOpen: true),
+            WindowEntry(id: id, name: "work", isOpen: false),
+        ]))
+
+        let library = WindowLibrary(directory: directory)
+        let reloaded = try #require(library.loadStore(for: id)?.session(withID: sessionID))
+        #expect(reloaded.foregroundCommand == nil)
+
+        let persisted = PersistenceStore(directory: directory.appendingPathComponent("windows"),
+                                         fileName: "\(id.uuidString).json").load()
+        #expect(persisted.workspaces[0].sessions[0].foregroundCommand == nil)
+        #expect(persisted.workspaces[0].sessions[0].splitForegroundCommand == nil)
+    }
+
+    @Test func midProcessReloadScrubsASplitOnlyCaptureFromDisk() throws {
+        // the write-back gate is an OR over both fields; a snapshot whose only capture is the split pane
+        // must still trigger the rewrite, or a "simplified" gate checking just foregroundCommand would
+        // leave the split's stale argv on disk.
+        let anchor = UUID()
+        let id = UUID()
+        let sessionID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a", isSplit: true,
+                                      splitForegroundCommand: ["tail", "-f", "/var/log/x"])
+        try writeWindowFile(anchor, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "open", sessions: [])]))
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [session])]))
+        try writeIndex(WindowsIndex(frontmost: anchor, windows: [
+            WindowEntry(id: anchor, name: "open", isOpen: true),
+            WindowEntry(id: id, name: "work", isOpen: false),
+        ]))
+
+        let library = WindowLibrary(directory: directory)
+        _ = try #require(library.loadStore(for: id))
+
+        let persisted = PersistenceStore(directory: directory.appendingPathComponent("windows"),
+                                         fileName: "\(id.uuidString).json").load()
+        #expect(persisted.workspaces[0].sessions[0].splitForegroundCommand == nil)
+    }
+
+    @Test func orphanRecoveryDropsCapturedCommandsButArmsTheStickyOverride() throws {
+        // recovery cannot tell a deliberately-closed window's surviving file from one open at the index
+        // loss, so the one-shot capture must not replay there — while the sticky `session.restore`
+        // override (pinned to fire every restart) still arms.
+        let id = UUID()
+        let sessionID = UUID()
+        let splitOnlyID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a",
+                                      foregroundCommand: ["ssh", "prod"],
+                                      restoreCommand: "claude --resume abc")
+        // a session whose ONLY capture is the split pane exercises the other half of the strip condition.
+        let splitOnly = SessionSnapshot(id: splitOnlyID, customName: nil, cwd: "/b", isSplit: true,
+                                        splitForegroundCommand: ["tail", "-f", "/var/log/x"])
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work",
+                                                                        sessions: [session, splitOnly])]))
+        // no index at all -> bootstrap falls through to recoverOrphanedWindows
+
+        let library = WindowLibrary(directory: directory)
+        let recovered = try #require(library.store(for: id)?.session(withID: sessionID))
+        // the ARMED slot is what recovery has to disarm: the persisted field is nil after any launch
+        // restore, so asserting on it would pass whether or not the strip ran.
+        #expect(recovered.pendingForegroundCommand == nil)
+        #expect(recovered.pendingRestoreCommand == "claude --resume abc")
+        let recoveredSplitOnly = try #require(library.store(for: id)?.session(withID: splitOnlyID))
+        #expect(recoveredSplitOnly.pendingSplitForegroundCommand == nil)
+
+        let persisted = PersistenceStore(directory: directory.appendingPathComponent("windows"),
+                                         fileName: "\(id.uuidString).json").load()
+        #expect(persisted.workspaces[0].sessions[0].foregroundCommand == nil)
+        #expect(persisted.workspaces[0].sessions[1].splitForegroundCommand == nil)
+    }
+
     @Test func loadStoreUnknownIdReturnsNil() {
         let library = WindowLibrary(directory: directory)
         #expect(library.loadStore(for: UUID()) == nil)

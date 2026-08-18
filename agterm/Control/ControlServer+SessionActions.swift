@@ -265,10 +265,16 @@ extension ControlServer: ControlActions {
         }
     }
 
-    /// Drive the split on the target's OWN store, not active-only `AppActions.toggleSplit()`. `on|off|toggle`
-    /// is computed against `isSplit`, so both are idempotent. Always `AppStore.toggleSplit` — a ⌘D-style
-    /// keep-alive hide/show that never tears the hidden pane's surface down (`closeSplit` is shell-exit-only).
+    /// Compatibility entry point. An omitted axis preserves an existing split's axis and defaults a new
+    /// split to left/right.
     func splitSession(_ target: String?, window: String?, mode: String?) -> ControlResponse {
+        splitSession(target, window: window, mode: mode, axis: nil)
+    }
+
+    /// Drive the split on the target's own store. An explicit axis creates or transposes; `nil` preserves
+    /// the current axis. `on|off|toggle` is computed against `isSplit` and keeps a hidden pane alive;
+    /// `session.split.close` is the teardown verb.
+    func splitSession(_ target: String?, window: String?, mode: String?, axis: SplitAxis?) -> ControlResponse {
         return resolver.resolveSession(target, window: window) { store, id in
             guard let session = store.session(withID: id) else {
                 return ControlResponse(ok: false, error: "no such session: \(target ?? "active")")
@@ -276,11 +282,32 @@ extension ControlServer: ControlActions {
             guard let parsedMode = ControlToggleMode.parse(mode) else {
                 return ControlResponse(ok: false, error: "invalid split mode: \(mode ?? "toggle")")
             }
-            let want = parsedMode.desiredValue(current: session.isSplit)
-            if want != session.isSplit {
-                store.toggleSplit(id)
+            switch parsedMode {
+            case .on:
+                store.setSplitVisibility(id, shown: true, axis: axis)
+            case .off:
+                store.setSplitVisibility(id, shown: false)
+            case .toggle:
+                store.toggleSplit(id, axis: axis)
             }
             actions.focusSplitPane(session, wantSplit: session.splitFocused)
+            return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
+        }
+    }
+
+    /// Tear the target's split pane down, which `session.split off` cannot: it hides and keeps the shell.
+    /// Kills whatever the pane runs, the point of it — `session.type $'exit\n'` reaches only a shell at a
+    /// prompt. Idempotent: no right pane answers ok, so a script need not read `tree` first.
+    func closeSessionSplit(_ target: String?, window: String?) -> ControlResponse {
+        return resolver.resolveSession(target, window: window) { store, id in
+            guard let session = store.session(withID: id) else {
+                return ControlResponse(ok: false, error: "no such session: \(target ?? "active")")
+            }
+            guard session.hasSplit else {
+                return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
+            }
+            store.closeSplit(id)
+            actions.focusSplitPane(session, wantSplit: false)
             return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
         }
     }
@@ -335,8 +362,8 @@ extension ControlServer: ControlActions {
     }
 
     /// Resize a split's divider (control-native — the GUI only drags it, or double-clicks it for an even
-    /// split). `ratio` is an absolute left-pane
-    /// fraction, `delta` a signed nudge (positive grows the left pane) on the current fraction (0.5 when
+    /// split). `ratio` is an absolute primary-pane
+    /// fraction, `delta` a signed nudge (positive grows the primary pane) on the current fraction (0.5 when
     /// never moved); exactly one must be set. `applySplitRatio` clamps + persists, then
     /// `.agtermApplySplitRatio` pokes the session's `SplitProbeView` to move the live divider — a no-op
     /// while the split is hidden, where the stored value applies on next show. Errors without a split, and
@@ -639,6 +666,14 @@ extension ControlServer: ControlActions {
         if rawTarget == "active" {
             return setActiveSurfaceZoom(window: window, mode: mode)
         }
+        // `quick` names the detached panel, which no window's zoom controller can hold — it fills its own
+        // screen instead of a window. It takes no `--window` for the same reason.
+        if rawTarget == "quick" {
+            guard QuickTerminalController.shared.setZoom(mode) else {
+                return ControlResponse(ok: false, error: "surface not available: quick")
+            }
+            return ControlResponse(ok: true, result: ControlResult(id: "quick"))
+        }
         switch resolveSurfaceZoom(rawTarget, window: window) {
         case .failure(let response):
             return response
@@ -655,8 +690,7 @@ extension ControlServer: ControlActions {
             // vanished (an exited overlay auto-clears the zoom) while the end state holds; `set(.off, …)`
             // on a non-matching target is a no-op.
             if mode != .off {
-                guard TerminalZoomController.isTargetValid(resolved.target, in: resolved.store,
-                                                           quickTerminalVisible: quickVisible(in: resolved.windowID)) else {
+                guard TerminalZoomController.isTargetValid(resolved.target, in: resolved.store) else {
                     return ControlResponse(ok: false, error: "surface not available: \(resolved.controlID)")
                 }
             }
@@ -687,12 +721,10 @@ extension ControlServer: ControlActions {
                 guard mode != .off else {
                     return ControlResponse(ok: true)
                 }
-                let quickVisible = quickVisible(in: windowID)
-                guard let zoomTarget = TerminalZoomController.resolveTarget(store: store,
-                                                                            quickTerminalVisible: quickVisible) else {
+                guard let zoomTarget = TerminalZoomController.resolveTarget(store: store) else {
                     return ControlResponse(ok: false, error: "no active surface")
                 }
-                guard TerminalZoomController.isTargetValid(zoomTarget, in: store, quickTerminalVisible: quickVisible) else {
+                guard TerminalZoomController.isTargetValid(zoomTarget, in: store) else {
                     return ControlResponse(ok: false, error: "surface not available: \(zoomTarget.controlID)")
                 }
                 effectiveTarget = zoomTarget
@@ -711,17 +743,7 @@ extension ControlServer: ControlActions {
 
     private func resolveSurfaceZoom(_ target: String, window: String?)
         -> ControlTargetResolver.Resolution<SurfaceZoomResolution> {
-        // `quick` is the control id this command emits for a quick-terminal zoom, so it must be accepted
-        // back as a target; visibility is checked by the caller's shared `isTargetValid` gate.
-        if target == "quick" {
-            switch resolveOpenWindow(window) {
-            case .failure(let response):
-                return .failure(response)
-            case .success(let (windowID, store)):
-                return .success(SurfaceZoomResolution(windowID: windowID, store: store,
-                                                      target: .quick, controlID: "quick"))
-            }
-        }
+        // `quick` never arrives here — `setSurfaceZoom` routes it to the panel before resolving a window.
         guard let surfaceID = TerminalSurfaceID(rawValue: target) else {
             return .failure(ControlResponse(ok: false, error: "invalid surface: \(target)"))
         }
@@ -735,7 +757,7 @@ extension ControlServer: ControlActions {
         }
     }
 
-    private func resolveOpenWindow(_ window: String?) -> ControlTargetResolver.Resolution<(WindowInfo.ID, AppStore)> {
+    func resolveOpenWindow(_ window: String?) -> ControlTargetResolver.Resolution<(WindowInfo.ID, AppStore)> {
         guard let window = trimmed(window) else {
             guard let windowID = library.activeWindowID, let store = library.store(for: windowID) else {
                 return .failure(ControlResponse(ok: false, error: "no open window"))
@@ -753,7 +775,7 @@ extension ControlServer: ControlActions {
         }
     }
 
-    private func resolveSurfaceOwner(_ surfaceID: TerminalSurfaceID, window: String?)
+    func resolveSurfaceOwner(_ surfaceID: TerminalSurfaceID, window: String?)
         -> ControlTargetResolver.Resolution<(WindowInfo.ID, AppStore)> {
         if trimmed(window) != nil {
             switch resolveOpenWindow(window) {
@@ -773,7 +795,4 @@ extension ControlServer: ControlActions {
         return .success((windowID, store))
     }
 
-    private func quickVisible(in windowID: WindowInfo.ID) -> Bool {
-        QuickTerminalRegistry.shared.controller(for: windowID)?.isVisible ?? false
-    }
 }

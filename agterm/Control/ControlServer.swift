@@ -2,6 +2,9 @@ import AppKit
 import agtermCore
 import Darwin
 import Foundation
+import os
+
+private let logger = Logger(subsystem: "com.umputun.agterm", category: "ControlServer")
 
 /// The programmatic control channel: a POSIX unix-domain-socket listener turning newline-delimited JSON
 /// `ControlRequest`s into calls on the `AppActions`/`AppStore` seam the toolbar, menu bar and palettes
@@ -27,13 +30,27 @@ final class ControlServer {
     /// The listening socket fd, or -1 when not listening. `start()` is idempotent on this.
     private var listenFD: Int32 = -1
 
+    /// The held ownership lock fd, or -1 when this process does not own `socketPath`.
+    private var lockFD: Int32 = -1
+
+    /// Set when `start()` found another live instance owning the path, so this one will never serve it.
+    private var refused = false
+
     /// The bound socket path, nil when not listening (bind failed or never started).
     var boundSocketPath: String? { listenFD >= 0 ? socketPath : nil }
 
-    /// The path the listener will bind, resolved at init via `defaultSocketPath()`. The surface factories
-    /// read it into `AGTERM_SOCKET`: the launch window's surfaces can materialize BEFORE `start()` binds,
-    /// and a nil `boundSocketPath` would leak `AGTERM_SOCKET` permanently. Equals it once bound.
-    var resolvedSocketPath: String { socketPath }
+    /// Suffix marking the stand-in path a refused instance advertises. Nothing ever creates it, so every
+    /// connection to it fails.
+    static let unavailableSuffix = ".unavailable"
+
+    /// The path spawned surfaces point `AGTERM_SOCKET` at. Once this instance has REFUSED the real path
+    /// because another one owns it, this becomes an unbindable sibling: a shell here must not reach the
+    /// other app, which for a second instance sharing state is the user's live terminal (persisted session
+    /// ids resolve there too). Leaving the variable UNSET is worse than a dead value — the shipped status
+    /// hooks drop `--socket` when it is absent, and `agtermctl` then resolves the very default the other
+    /// instance is serving. Not `boundSocketPath`: the launch window's surfaces can materialize BEFORE
+    /// `start()` binds, and a nil there would leak `AGTERM_SOCKET` permanently. Equals it once bound.
+    var resolvedSocketPath: String { refused ? socketPath + ControlServer.unavailableSuffix : socketPath }
     private let acceptQueue = DispatchQueue(label: "com.umputun.agterm.control.accept")
 
     /// Thread-safe window-list cache: refreshed on the main actor after every dispatched command, read under
@@ -100,6 +117,12 @@ final class ControlServer {
         self.settingsModel = settingsModel
         self.resolver = ControlTargetResolver(library: library)
         self.socketPath = socketPath ?? ControlServer.defaultSocketPath()
+        // ownership is decided HERE, not in `start()`. The launch window's surfaces are built during the
+        // initial render pass and SNAPSHOT `AGTERM_SOCKET` into the pty environment (`GhosttySurfaceView.env`
+        // is a `let` read at spawn), while `start()` runs from the scene's `.task` afterwards. Deciding late
+        // would hand that first shell the owner's live socket, which is the one thing this guard exists to
+        // prevent. Binding stays in `start()`; this only answers who owns the path.
+        _ = acquireOwnership()
         // keep the `active` flag fresh across async frontmost changes; the server lives for the app's
         // lifetime, so the observer needs no removal.
         NotificationCenter.default.addObserver(forName: .agtermWindowFrontmostChanged, object: nil, queue: .main) { [weak self] _ in
@@ -154,25 +177,25 @@ final class ControlServer {
             return
         }
 
+        // normally taken at init; retry here for the instance refused while the owner was still alive, which
+        // reaches this again on a later window. `lockFD >= 0` first because flock is per open file
+        // description: a second `open` of a file THIS process already locked conflicts with itself.
+        guard lockFD >= 0 || acquireOwnership() else { return }
+
+        // every failure below KEEPS the lock. Releasing it would let another instance bind the path while
+        // this one still advertises it, which is the leak the lock exists to close, and it buys nothing:
+        // the next window's `start()` retries the bind through the `lockFD >= 0` arm above.
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
             log("control socket() failed: \(String(cString: strerror(errno)))")
             return
         }
 
-        // unlink any stale socket file first (a force-quit that skipped applicationWillTerminate leaves one).
+        // unlink the stale socket file. Holding the lock is what makes this safe: nobody else is serving
+        // the path, so whatever is on disk is a force-quit leftover.
         unlink(socketPath)
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = socketPath.utf8CString
-        withUnsafeMutablePointer(to: &addr.sun_path) { dst in
-            dst.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { buf in
-                pathBytes.withUnsafeBufferPointer { src in
-                    buf.update(from: src.baseAddress!, count: src.count)
-                }
-            }
-        }
+        var addr = ControlServer.unixAddress(for: socketPath)
 
         let bound = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
@@ -199,10 +222,68 @@ final class ControlServer {
     }
 
     func stop() {
+        // outside the guard: the lock is taken in `init`, so an instance that never bound (path too long,
+        // or a bind that failed) still holds one and would otherwise keep it for the whole process.
+        defer { releaseOwnership() }
         guard listenFD >= 0 else { return }
         close(listenFD)
         listenFD = -1
         unlink(socketPath)
+    }
+
+    /// Take the exclusive advisory lock that marks this process the owner of `socketPath`, held from init
+    /// until `stop()`, and set `refused` when another live instance holds it.
+    ///
+    /// `connect` cannot answer the ownership question on Darwin. A live listener whose backlog is full
+    /// refuses with the same `ECONNREFUSED` a socket nobody listens on returns (measured: the app's
+    /// backlog is 8 and one stalled client parks the serial accept loop for up to `readDeadlineSeconds`,
+    /// so saturation is reachable), and a blocking `connect` against it returns immediately rather than
+    /// stalling. `flock` carries no such ambiguity, is atomic against a second instance launching in the
+    /// same moment, and the kernel releases it when a force-quit kills the holder — which is the case the
+    /// `unlink` in `start()` exists for.
+    private func acquireOwnership() -> Bool {
+        let lockPath = socketPath + ".lock"
+        let fd = open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            log("control lock open(\(lockPath)) failed: \(String(cString: strerror(errno)))")
+            return false
+        }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            refused = true
+            log("control socket \(socketPath) is already served by another instance — not binding")
+            return false
+        }
+        lockFD = fd
+        // clear it: `start()` re-runs from every window scene's task, so an instance refused while the
+        // owner was alive reaches this line once the owner quits, and a stale `refused` would leave it
+        // advertising the unavailable path forever on a socket it now serves.
+        refused = false
+        return true
+    }
+
+    /// Drop the ownership lock. The lock FILE is deliberately left behind: unlinking it would let the next
+    /// instance create a fresh inode and lock that instead, which excludes nobody.
+    private func releaseOwnership() {
+        guard lockFD >= 0 else { return }
+        close(lockFD)
+        lockFD = -1
+    }
+
+    /// Fill a `sockaddr_un` with `path`. Callers guard the ~104-byte `sun_path` limit first; a longer path
+    /// would overrun the tuple.
+    nonisolated private static func unixAddress(for path: String) -> sockaddr_un {
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = path.utf8CString
+        withUnsafeMutablePointer(to: &addr.sun_path) { dst in
+            dst.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { buf in
+                pathBytes.withUnsafeBufferPointer { src in
+                    buf.update(from: src.baseAddress!, count: src.count)
+                }
+            }
+        }
+        return addr
     }
 
     // MARK: - Accept / read loop
@@ -337,15 +418,18 @@ final class ControlServer {
         switch request.cmd {
         case .tree, .eventsRead, .sessionNew, .sessionDuplicate, .sessionSelect, .sessionGo, .sessionClose, .sessionRename,
                 .sessionReveal, .sessionMove,
-                .workspaceNew, .workspaceSelect, .workspaceRename, .workspaceDelete, .workspaceMove, .workspaceFocus,
+                .workspaceNew, .workspaceSelect, .workspaceGo, .workspaceRename, .workspaceDelete, .workspaceMove,
+                .workspaceFocus,
                 .workspaceFilter, .workspaceCollapse, .workspaceExpand,
-                .sessionSplit, .sessionScratch, .sessionFocus, .sessionResize, .surfaceZoom,
+                .sessionSplit, .sessionSplitClose, .sessionScratch, .sessionFocus, .sessionResize, .surfaceZoom,
+                .surfaceCursor,
                 .sessionStatus, .sessionFlag, .sessionSeen, .sessionRestore, .notify,
                 .fontInc, .fontDec, .fontReset, .keymapReload, .keymapList, .configReload, .themeSet, .themeList,
                 .sidebar, .sidebarMode, .sidebarExpand, .sidebarCollapse, .sessionType, .sessionCopy,
                 .sessionPaste, .sessionSelectAll, .sessionOpenLinkAtCursor,
                 .sessionSearch, .sessionOverlayOpen, .sessionOverlayClose, .sessionOverlayResize,
-                .sessionOverlayResult, .sessionBackground, .sessionText, .quick, .quickType, .quickText,
+                .sessionOverlayResult, .sessionOverlayCopy, .sessionOverlayText,
+                .sessionBackground, .sessionText, .quick, .quickType, .quickText,
                 .windowNew, .windowList, .windowSelect,
                 .windowClose, .windowRename, .windowDelete, .windowResize, .windowMove, .windowZoom,
                 .windowFullscreen, .windowMinimize,
@@ -393,10 +477,16 @@ final class ControlServer {
     /// shells. The live fields are usually already nil (consumed at restore); the SAVE is what wipes the
     /// on-disk copy from the last quit, closing the force-quit re-fire window. App-global like
     /// `keymap.reload`: no `--window` selector, every open window is cleared.
+    ///
+    /// Also disarms the PENDING capture slots, where a launch restore parks the argv until each surface
+    /// mounts: the socket binds before the later windows' decks do, so a clear arriving in that gap would
+    /// answer ok and then watch those windows run the commands anyway. The `session.restore` pins are
+    /// deliberately untouched — they are sticky, and this command clears captures.
     func clearRestoreCommands() -> ControlResponse {
         for session in library.allOpenSessions() {
             session.foregroundCommand = nil
             session.splitForegroundCommand = nil
+            session.clearPendingForegroundCommands()
         }
         library.saveAllOpen()
         return ControlResponse(ok: true)
@@ -491,7 +581,8 @@ final class ControlServer {
     }
 
     /// Project a window's workspace tree into the wire `ControlTree`, marking the active session and the
-    /// active workspace (the one owning the selected session).
+    /// active workspace (`currentWorkspaceID`, what `--target active` resolves to — not necessarily the
+    /// selected session's owner, since an empty or foreground-created workspace becomes current on its own).
     func buildTree(in store: AppStore) -> ControlTree {
         let shellBasename = ProcessInfo.processInfo.environment["SHELL"].map(CommandRestore.basename)
         // the projected window owns its quick terminal; find its id by store identity to read the live
@@ -514,8 +605,13 @@ final class ControlServer {
             fontSize: { ($0.addressableSurface as? GhosttySurfaceView)?.currentFontSize() },
             splitFontSize: { ($0.splitSurface as? GhosttySurfaceView)?.currentFontSize() },
             scratchFontSize: { ($0.scratchSurface as? GhosttySurfaceView)?.currentFontSize() },
-            quickVisible: { windowID.flatMap { QuickTerminalRegistry.shared.controller(for: $0)?.isVisible } ?? false },
-            zoomedSurface: { windowID.flatMap { TerminalZoomRegistry.shared.controller(for: $0)?.target?.controlID } },
+            // both are app-level facts now that the quick terminal is one detached panel, so every projected
+            // window reports the same value for them rather than one of its own.
+            quickVisible: { QuickTerminalController.shared.isVisible },
+            zoomedSurface: {
+                if QuickTerminalController.shared.isZoomed { return TerminalZoomTarget.quick.controlID }
+                return windowID.flatMap { TerminalZoomRegistry.shared.controller(for: $0)?.target?.controlID }
+            },
             // resolved through the projected window's registry entry on every tree build, and tree-only:
             // window.list is cache-backed, so mirroring a GUI-resolved pick there would go stale.
             pickPending: { windowID.flatMap { PickRegistry.shared.controller(for: $0)?.pending?.id } },
@@ -568,8 +664,9 @@ final class ControlServer {
     }
 
     /// Internal, not private: the `ControlServer+*.swift` extensions holding the command arms cannot reach a
-    /// private member declared here.
-    func log(_ message: @autoclosure () -> String) {
-        NSLog("agterm: %@", message())
+    /// private member declared here. `.public` because a redacted path or errno says nothing about why the
+    /// socket is missing, which is what these are read for.
+    func log(_ message: String) {
+        logger.notice("\(message, privacy: .public)")
     }
 }

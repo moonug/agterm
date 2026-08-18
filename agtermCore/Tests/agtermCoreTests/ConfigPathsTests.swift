@@ -37,7 +37,7 @@ struct ConfigPathsTests {
         #expect(starter.contains("command \"<name>\" [chord] <shell...>"))
         #expect(starter.contains("single chord OR a leader like `ctrl+a>g`"))
         #expect(starter.contains("command \"Open in Zed\"  cmd+shift+e  open -a Zed \"$AGT_SESSION_PWD\""))
-        #expect(starter.contains("command \"Lazygit\"      ctrl+a>g     agtermctl session overlay open lazygit --socket \"$AGT_SOCKET\""))
+        #expect(starter.contains("command \"Lazygit\"      ctrl+a>g     agtermctl session overlay open 'zsh -lc lazygit' --socket \"$AGT_SOCKET\""))
         #expect(starter.contains("command \"Deploy\"                    ./deploy.sh"))
         #expect(starter.contains("ctrl+shift+p"))
         #expect(!starter.contains("super"))
@@ -78,6 +78,33 @@ struct ConfigPathsTests {
         #expect(parsed.keymap.builtinOverrides.isEmpty)
         #expect(parsed.keymap.commands.isEmpty)
         #expect(parsed.diagnostics.isEmpty)
+    }
+
+    // issue #405: a shipped map example once used a chord a later built-in default took,
+    // so uncommenting the starter's own suggestion silently bound nothing. A `command` example rots the
+    // same way, `validateCommands` dropping a custom shortcut a built-in has since claimed.
+    @Test func starterKeymapExamplesApplyWhenUncommented() {
+        let examples = ConfigPaths.starterKeymapConf().split(separator: "\n").compactMap { line -> String? in
+            let text = line.drop { $0 == "#" || $0.isWhitespace }
+            let verb = text.prefix { !$0.isWhitespace }
+            // `<` skips the two verb-syntax lines, which state a grammar rather than an example.
+            guard verb == "map" || verb == "command", !text.contains("<") else { return nil }
+            return String(text)
+        }
+        // an example silently dropped from the guard must fail here: three `map` lines and three `command`.
+        #expect(examples.count == 6)
+        var bound = 0
+        for example in examples {
+            let (keymap, diagnostics) = parseKeymap(example)
+            #expect(diagnostics.isEmpty, "starter example '\(example)' is skipped: \(diagnostics.map(\.message))")
+            // an unparseable command chord is absorbed as shell text without a diagnostic, so count the
+            // shortcuts that survived rather than the commands that parsed.
+            bound += keymap.builtinOverrides.count + keymap.commands.filter { !$0.shortcut.isEmpty }.count
+                + keymap.builtinSequences.values.reduce(0) { $0 + $1.count }
+        }
+        // all three `map` examples and the two chorded `command` ones; `Deploy` is palette-only by design.
+        // the alternatives example counts twice, its menu chord and its monitor-bound half.
+        #expect(bound == 6)
     }
 
     @Test func ghosttyConfigPathIsGhosttyConfInDir() {

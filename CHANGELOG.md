@@ -1,5 +1,102 @@
 # Changelog
 
+## v0.24.0 - 2026-08-17
+
+### New Features
+
+- the quick terminal is a floating panel with a system-wide hotkey, so it can be summoned over any application and dismissed straight back to it. `keymap.conf` gains a `global-hotkey` verb for the chord #441 @umputun
+- keyboard navigation between workspaces: `previous_workspace` and `next_workspace` builtins, `workspace.go --to next|prev`, and `toggle_workspace_collapse` to fold the workspace you are in. All three ship keyless #436 @umputun
+- `session.overlay.copy` and `session.overlay.text` read an overlay's own surface. Both `session copy` and `session text` address the pane underneath, so a selection made inside an overlay used to read as `no selection` #437 @umputun
+- `surface.cursor` reports a surface's cursor column, printed as a bare number so it drops into a command substitution #451 @umputun
+
+### Improved
+
+- libghostty advances to upstream main, fixing a crash on surface teardown and lifting the pin held since April. Building now needs Zig 0.16 #449 @umputun
+- the shipped app drops three hardened-runtime exceptions it never used. The TCC entitlements are untouched #450 @umputun
+- `ControlServer` logs through `os.Logger`, so the control socket is queryable under the subsystem `docs/troubleshooting.md` tells you to filter on #442 @umputun
+- a cookbook recipe reporting a hook-driven agent's status onto its sidebar row when the agent runs inside a container #428 @nquo
+
+### Bug Fixes
+
+- an unattended restart lost every captured running command. The quit confirmation went up even for a quit the system asked for, and with nobody there to answer it the app was killed before it could save. Shutdown, restart and logout skip the prompt now, while a scripted quit still gets it. Reported by @ssgreg, who also sent the follow-up #446 #447 @umputun @ssgreg
+- two `keymap.conf` lines colliding on one chord were settled by file order, so reordering unrelated lines could silently take a custom command's shortcut away #444 @umputun
+
+## v0.23.0 - 2026-08-13
+
+### New Features
+
+- splits can run top and bottom, not only side by side. `⌘⇧D` splits horizontally and `⌘D` keeps the vertical one, each action creating, revealing, hiding or transposing as needed, so a live split changes orientation without recreating either terminal. `session.split` and `agtermctl` take an optional `vertical`/`horizontal` axis, `top`/`bottom` join `left`/`right` as pane aliases, and the axis survives restore. Dashboard moves to `⌘⇧G` #427 @umputun
+- Close Split tears a split pane down, from the palette and as `session.split.close`. ⌘D only hid one: `hasSplit` stayed set and the shell behind it stayed alive, so the only teardown was typing `exit` in the pane, which does nothing for a shell inside docker, an ssh or an agent sitting past a prompt. The palette row shows whenever a split exists, so a hidden pane is reachable #421 @umputun
+- a `map` or `command` line in `keymap.conf` can carry several alternative keybinds separated by `|`, so a mac-native chord and a tmux-style leader sequence can both reach one action instead of forcing a choice. It also gives built-in actions their first leader sequence: they dispatch as menu key equivalents and `NSMenuItem` holds exactly one character, so the parser used to reject one outright #420 @umputun
+
+### Improved
+
+- a cookbook recipe listing the SQLite databases in the session's repo in the native picker, newest first with size and age, opening the pick in tabiew. Files are matched on the SQLite magic header rather than the extension, and dependency directories are pruned as a rule #426 @umputun
+- a cookbook recipe listing the repo's `docs/backlog` items in the picker and handing the pick to Claude Code as `/backlog <slug>`, each row carrying the item's triage call, age and location #422 @umputun
+- a cookbook recipe opening the pane's selection, or its last 50 lines when nothing is selected, in revdiff inside an overlay, pasting the notes back at the prompt with each one quoting the line it hangs on. Where annotate-claude-replies reads Claude's own transcript, this reads the terminal, so it works on any agent, a stack trace or a `terraform plan` #419 @umputun
+- README is a product synopsis again rather than the full reference, with the depth it carried moved onto the site's docs page #424 @umputun
+
+### Bug Fixes
+
+- a session created while the display was asleep never started, so a scheduled job's `--command` never ran although `session new` had already answered `ok`. `ghostty_surface_new` returns NULL for as long as the display sleeps, measured at 21 consecutive failures over 40s with a valid backing size, and nothing re-attempted, because the deck's retries ride SwiftUI layout and that does not run for an off-display window. Creation retries on display wake now, and `tree` reports `realized` per session #417 @umputun
+- `session.paste`, `session.selectall` and `session.copy` answered as though they had acted when the target pane had no terminal behind it, the state a session sits in while the display sleeps. All three checked only that the surface slot was filled, which a parked view passes, so a script branching on the error text took the wrong branch or believed a paste that never happened. All three report `session not realized` now #425 @umputun
+- a second instance resolving the same socket path took the running app's control socket for good, and only a restart recovered it. Ownership is an exclusive `flock` now rather than the unconditional unlink before `bind`, and a refused instance advertises `<socket>.unavailable`, so the shells it spawns cannot reach the owner's terminal #418 @umputun
+- a tool capturing system audio inside a session got silence and no permission prompt. Core Audio process taps go through TCC's audio-capture service, macOS holds agterm responsible for whatever it spawns, and the Info.plist carried no `NSAudioCaptureUsageDescription`, so `tccd` refused to prompt and left nothing to grant by hand in System Settings either #432 @umputun
+- the Install Agent Status Hooks alert could grow past the bottom of the screen, taking its OK button with it, `NSAlert` sizing itself to fit text it will not scroll. The two Codex manual-merge cases embedded the full 29-line hooks block; every outcome is one short sentence now, with an Open Docs button where the printed steps used to be #430 @umputun
+
+## v0.22.0 - 2026-08-09
+
+### New Features
+
+- voice dictation and other assistive tools work over the terminal. MacWhisper's hold-to-dictate widget never appeared in agterm though it does in NSTextView-based terminals: the Metal-backed surface was absent from the accessibility tree, and such tools probe `AXFocusedUIElement` for a focused text field before engaging, finding nothing at all over agterm. The interactive surface now reports itself as the minimal shape of an editable text field #246 @pbldbl
+- `session hud --position` takes the nine anchors of a 3x3 grid, spelled exactly as `session background` spells them, so a panel can sit in a corner instead of over the text being read, and every anchor off center holds a fixed edge margin on each axis it names. The bare `top` and `bottom` it shipped with stay accepted as aliases for the middle column and normalize on read-back, so existing callers keep working and `tree` reports one spelling. `hud update` also recolors the panel's text in place #386 @umputun
+- a workspace or session row's name can be copied from the sidebar context menu. The row's text field is not selectable outside rename mode, so reading a name to reuse elsewhere meant retyping it or entering rename mode and copying out of the field, which risks committing an edit to a name you only wanted to read #385 @skkap
+
+### Improved
+
+- `tree` reports `hasSplit` beside `split`, so a caller can tell a session with a hidden second pane from one with no split at all. `split` means the split is shown side by side, and a pane hidden with ⌘D read as `false` there while `splitRatio` and `splitFocused` stayed populated beside it; `agtermctl tree` tags that case `(split hidden)` a585694 @umputun
+- a cookbook recipe that lists a session directory's past Claude Code conversations in the native picker, each named for what it turned out to be about rather than its opening prompt, and types the resume into the pane the chord fired from #381 @umputun
+- a cookbook recipe that reopens each tab's own Kimi Code conversation after a restart, completing the session-resume family. Kimi's SessionStart hook receives the new conversation's id, so the recipe pins the tab's restore command from the hook instead of wrapping the launch #391 @x9x9x9x9x9x91
+- a cookbook recipe joining Kiro CLI to the agent-status integration. Kiro declares hooks per agent with no global file, so it is the one agent that cannot reach the sidebar glyph through the bundled adapters #383 @bitcldr
+- a cookbook recipe that syncs the active pane's working directory to the other half of a split, splitting first when none is shown, and refusing when the target pane is running a foreground program #388 @vladislav-yevtushenko
+- the annotate-claude-replies recipe dropped revdiff's file-level notes, its header regex requiring a `:line` part that a file-level note does not carry #387 @denysshnurenko
+
+### Bug Fixes
+
+- a command-line tool run inside a session could never be granted Automation, Camera, Contacts, Calendars, Location or Photos. Under hardened runtime those services need an entitlement the app did not carry, and macOS treats agterm as the responsible process for everything it spawns, so `tccd` refused to prompt and recorded nothing. No dialog appeared, and with no record there was no entry in System Settings to grant by hand either. Grants agterm already held kept working, which is what made this easy to miss. The bundled `agtermctl` also stopped inheriting the app's entitlement set, which the build's re-seal had been stamping onto it #398 @skkap
+- the View menu showed two full screen items, agterm's own and AppKit's, both carrying the same icon as Toggle Terminal Zoom. AppKit appends its item as the menu is prepared for display and the documented opt-out is ignored on macOS 26, so agterm's own item is gone instead and a key monitor keeps its chord #412 @umputun
+- ⌘W with the Settings window open closed the active terminal session instead of Settings, and the same for the About and Open Directory panels. File ▸ Close Session is a main-menu item with no window scoping, so the keystroke reached the terminal deck whichever window was key #403 @umputun
+- a custom command bound in `keymap.conf` could not run a bare `agtermctl` or a bare Homebrew binary. It spawns as a detached `/bin/sh -c` inheriting launchd's `PATH`, and that is neither a login nor an interactive shell, so the command exited 127 with the shell's own diagnostic discarded #395 @umputun
+- a selected row at the bottom of the command palette painted over the panel's rounded corner and squared it off: the panel drew a rounded background and a stroke but never clipped to either. The `pick` free-text path showed it on every press that matched nothing #415 @umputun
+- palette rows have been full-width click targets since they were built, but nothing painted under the pointer, so there was no way to tell what a click would run without clicking it #414 @umputun
+- clicking a workspace row expanded or collapsed it without animation while the disclosure triangle beside it animated, so one toggle rendered two ways depending on where it was hit #413 @umputun
+- the starter `keymap.conf` suggested uncommenting `map cmd+shift+d toggle_split`, a line that can never apply: `cmd+shift+d` is the dashboard's own default, so the override is dropped as a built-in collision. Both examples now use a free chord, and the header points at where a skipped line is reported #411 @umputun
+- a literal substring match in a long path could rank below a scattered match on another row, the substring band being unbounded and able to score past the subsequence floor #390 @x9x9x9x9x9x91
+
+## v0.21.0 - 2026-08-06
+
+### New Features
+
+- the command palette, the control-API picker and the Ctrl-Tab switcher rendered at a hardcoded 13pt with no way to change them. A new Settings ▸ Interface font size (9...20, default 13) drives all three plus the title-bar popover rows, separate from the sidebar's own size and with no fallback between them, since the sidebar is a density knob and the palette a readability one. All three now center over the terminal area rather than the whole window, which read as off-center whenever the sidebar was up, and each panel is bounded against the window so a cramped one degrades to whole-window centering instead of clipping #367 @umputun
+- `session.hud` posts a small floating panel over a session while an agent prepares something slow: computing picker items, spawning an overlay program, waiting on a network call. It shows a message, an optional detail line and an optional spinner, and updates or closes from a later call. The panel is passive, so the session keeps first responder and typing into the terminal underneath still works #361 @umputun
+
+### Improved
+
+- a fish port of the claude-session-resume cookbook recipe, so a fish user gets the same per-tab conversation resume the existing versions give #365 @Arelav
+- a cookbook recipe that opens Claude's replies in revdiff for inline annotation and sends the notes back #364 @p4elkin
+
+### Bug Fixes
+
+- a dark launch with a conditional `theme = light:X,dark:Y` spawned every restored surface with no `AGTERM_*` variables, no restore replay and no `session new --command`; only the cwd survived. The renderer rebuilds a surface's config whenever the app's conditional state disagrees with the config's, and that rebuild replays the config files alone, dropping the per-surface environment, initial input and command the host set. A host-built config always resolves light while the app is already dark, so the two disagree at launch and agree later, which is why this looked specific to restore. The app config is now re-sided before any scene mounts #378 @umputun
+- with Restore running commands on restart enabled, quitting by closing the window lost every captured command and each pane came back a plain shell: the close tore each surface down before the quit-time capture could read it, so the save persisted nulls. ⌘Q was unaffected. Closing a window that was not the last captured nothing at all #370 @i-kozlov
+- a captured foreground command could replay on more than one launch, re-running the program every time until it was cleared by hand a8b5252 @umputun
+- exiting by closing every window brought back the wrong window on the next launch: a multi-window user got window 1 rather than the one he was working in, because closing the last window dropped the record of which was frontmost #377 @umputun
+- ⌘D, the title-bar split button, View ▸ Split and the palette each flipped the split behind a shown scratch pane. The screen could not change, so the only sign was the glyph moving, and the layout you came back to was not the one you left. The press now dismisses the scratch, the same cover-first rule ⌘W already uses, and a second press splits #376 @umputun
+- ⌘C with nothing selected typed a stray key report into the running program, which shows up in Claude Code and other TUIs that turn the kitty keyboard protocol on. The Edit menu disables Copy without a selection, so the press reached the key binding, failed to perform and fell through to key encoding. It is not layout-specific, contrary to how the report scoped it #375 @umputun
+- with Settings ▸ Appearance ▸ Window ▸ Toolbar set to Hidden, a 1px line ran across the top edge of the window, most visible in native fullscreen on a notched display where it separated the black band from the terminal. It is the separator that belongs under the custom titlebar row, which has no height in that mode, and the dashboard drew its own copy in the same place #379 @umputun
+- an unrecognized value in `workspaces.json`, written by a newer build or a hand edit, failed the whole snapshot decode, and the recovery path starts fresh: every workspace and session was wiped over one non-essential display field. Each optional now drops to nil on its own instead of taking the tree with it #363 @x9x9x9x9x9x91
+- a non-interactive fish `claude` call did not pass through to the real binary, so anything scripting it broke under the session-resume wrapper #366 @Arelav
+
 ## v0.20.2 - 2026-08-03
 
 ### Improved

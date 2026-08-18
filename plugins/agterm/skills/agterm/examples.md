@@ -140,8 +140,8 @@ the pane you duplicated from.
 ws=$(agtermctl workspace new "build" --json | jq -r '.result.id')
 a=$(agtermctl session new --workspace "$ws" --cwd "$HOME/proj" --json | jq -r '.result.id')
 agtermctl session rename "server" --target "$a"
-agtermctl session split on --target "$a"          # second shell side by side
-agtermctl session resize --split-ratio 0.7 --target "$a"   # left pane gets 70% (prints 0.700)
+agtermctl session split on --axis horizontal --target "$a" # second shell below the primary
+agtermctl session resize --split-ratio 0.7 --target "$a"   # top pane gets 70% (prints 0.700)
 b=$(agtermctl session new --workspace "$ws" --json | jq -r '.result.id')
 agtermctl session rename "logs" --target "$b"
 ```
@@ -235,6 +235,33 @@ Manual open + poll for status instead of `--block`:
 agtermctl session overlay open "make test" --target "$AGTERM_SESSION_ID"   # this session
 agtermctl session overlay result --json   # errors "still running" until it exits, then result.exitCode
 ```
+
+## Read what the user highlighted inside an overlay
+
+`session copy` and `session text` address the pane the overlay COVERS, so a selection the user made in
+the overlay reads as `no selection` there and `session text --pane right` returns the shell underneath.
+`session overlay copy`/`text` read the covering surface instead:
+
+```bash
+agtermctl session overlay copy --target "$AGTERM_SESSION_ID" --json   # result.text = the overlay's selection
+agtermctl session overlay text --target "$AGTERM_SESSION_ID" --lines 40
+```
+
+Both take the overlay family's `--pane left|right` for a pane-scoped overlay; omit it for the
+session-wide one.
+
+A chord bound to a custom command gets this for free — `$AGT_SELECTION` already carries the selection of
+the surface the chord fired in, the overlay included, while `$AGT_PANE` keeps naming the pane underneath
+so the reply routes back with `session type --pane`:
+
+```bash
+# keymap.conf: command "note" ctrl+a>n ...
+printf '%s' "$AGT_SELECTION" > /tmp/note.txt
+agtermctl session type "see /tmp/note.txt" --target "$AGT_SESSION_ID" --pane "$AGT_PANE"
+```
+
+Reach for `session overlay copy` when the read is NOT chord-driven — an agent polling from outside, or a
+script that needs the selection some time after the fact.
 
 ## Cover only your own pane, leaving the user's other pane usable
 
@@ -587,6 +614,12 @@ agtermctl events --json --kind session.closed |
   done
 ```
 
+The stream does not say what closed a session: a closed row, another client's `session.close`, and the
+exit of a `session.new --command` process are identical in it. Creating that session with `--wait`
+removes the third, parking the row on the exit prompt rather than closing it, so a `session.closed`
+under `--wait` is always a person or a client. App quit
+emits no `session.closed` at all, since window teardown is skipped while terminating.
+
 For resumable consumers, save the `run` and `next` fields from raw `events.read` batch responses and
 restart with `agtermctl events --run "$run" --after "$next" --json`. The streaming JSON lines are bare
 events and do not include the run id. If the command reports `event run changed`, `event cursor
@@ -660,6 +693,25 @@ agtermctl tree --json | jq -r '.result.tree.zoomedSurface'
 `surface zoom` is not `window zoom`: it does not move/resize the macOS window and must not change split
 ratios, sidebar state, focus, or split/scratch visibility. Surface ids come from `tree --json`.
 
+## Read a surface's cursor column
+
+```bash
+# The active surface's zero-based column, as a plain number.
+col=$(agtermctl surface cursor)
+
+# Any addressable surface, including a pane that is not on screen.
+agtermctl surface cursor --target "surface:${AGTERM_SESSION_ID:?}:right"
+
+# Under --json it is nested, so a future row would not move it.
+agtermctl surface cursor --json | jq -r '.result.cursor.column'
+```
+
+Use it as a ONE-WAY signal about the line the caret is on. A column past the prompt proves the line is not
+empty. A column AT the prompt proves nothing — the caret may have been moved back over text that is still
+there — so never read it as "the input is empty". There is no row: the pinned libghostty exposes no cursor
+accessor, and the vertical metrics it does export cannot recover a row that survives a custom
+`adjust-font-baseline`. The command reports no field in `tree`, so poll it when you need it.
+
 ## Watch several sessions at once in a dashboard grid
 
 The dashboard shows several sessions' live output in one view-only grid — for watching several agents or
@@ -669,7 +721,7 @@ suffix, capped at 9 cells total. No cell takes input:
 the keyboard navigates a highlight (arrows), Enter jumps into the highlighted session AND focuses that
 exact pane then closes, Esc closes. Open it over the socket with explicit session ids, or with `--mru` to
 pull the window's most-recently-used sessions automatically. The most-recently-used grid also has a built-in
-opener — **⌘⇧D** (the `dashboard` action), **Navigate ▸ Dashboard**, or the command palette's **Dashboard**
+opener: **⌘⇧G** (the `dashboard` action), **Navigate ▸ Dashboard**, or the command palette's **Dashboard**
 toggle it auto-sized (the `dashboard --mru --auto-size` equivalent), so the recent-sessions view needs no
 script for the common case.
 
@@ -707,7 +759,7 @@ agtermctl tree --json | jq '.result.tree | {dashboardMembers, dashboardHighlight
 agtermctl dashboard --close
 ```
 
-The MRU grid is already on **⌘⇧D** (the built-in `dashboard` action) — rebind that chord in `keymap.conf`
+The MRU grid is already on **⌘⇧G** (the built-in `dashboard` action). Rebind that chord in `keymap.conf`
 with `map <chord> dashboard`. To dashboard a FIXED set of explicit ids instead, bind a `keymap.conf` custom
 action (then `agtermctl keymap reload`):
 
@@ -802,13 +854,17 @@ choice=$(printf '%s\n' "$branches" | agtermctl pick --prompt "Check out which br
 agtermctl session hud close --target "$me"
 ```
 
-`hud update` repaints in place, no re-spawn and no blink, and it replaces the whole spec: `--detail` and
-the spinner are dropped unless repeated. `--spinner-style bar|braille|circle|blocks|dot` picks the look and
+`hud update` repaints in place, no re-spawn and no blink, and it replaces the whole spec: `--detail`,
+the spinner and `--text-color` are dropped unless repeated. `--spinner-style bar|braille|circle|blocks|dot` picks the look and
 turns the spinner on by itself (`dot` blinks instead of animating, for a panel up for minutes), and an
 update may switch style mid-flight; `--spinner-style none` stops it, which is also what a read-back's
-`none` echoes back to. `--position top|center|bottom` moves the panel (default `center`;
-`top`/`bottom` keep a fixed margin off the pane edge on their own), and `--size-percent N` overrides the
-panel's WIDTH; its height always follows the message.
+`none` echoes back to. `--position` anchors the panel to any of the nine
+`top-left|top-center|top-right|center-left|center|center-right|bottom-left|bottom-center|bottom-right`
+(default `center`), the same anchors `session background` takes, each off-center one keeping a fixed margin
+off that pane edge on its own — a corner is what keeps the panel clear of the text being read, and the bare
+`top`/`bottom` still work for the middle column. `--text-color #rrggbb` colors the text (an update can
+change it, unlike `--background-color`), and `--size-percent N` overrides the panel's WIDTH; its height
+always follows the message.
 
 Read it back from the session node, and note the panel does NOT set `overlay` — one slot, and whichever
 occupant holds it is the one that reports:
@@ -828,6 +884,8 @@ a RUNNING program is refused instead: a message is replaceable, a program is not
 ```bash
 agtermctl session go --to next            # step selection to the next session
 agtermctl session go --to next-attention  # jump to the next blocked/completed session
+agtermctl workspace go --to next          # step a whole workspace, landing on its first session
+agtermctl workspace go --to prev          # wraps at both ends; no --target, it is relative
 w=$(agtermctl window new "scratch" --json | jq -r '.result.id')
 # or park one in the Dock right after creating it (it appears briefly on its way there):
 # p=$(agtermctl window new "proj-b" --minimized --json | jq -r '.result.id')
@@ -958,16 +1016,17 @@ agtermctl keymap list --json \
   | jq -r '.result.keymap.menu[] | select(.enabled == false) | "\(.chord)  \(.menu) > \(.title)"'
 ```
 
-Find every chord already in use before picking one for a new binding. All THREE sources matter: a
-custom command's shortcut is delivered by the key monitor rather than a menu item, so it appears in
-`commands` and can never show up under `menu`. Miss it and a new `map` line on the same chord makes the
-next reload drop the custom binding.
+Find every chord already in use before picking one for a new binding. All FOUR sources matter: a custom
+command's shortcut and a built-in's `alternates` are delivered by the key monitor rather than a menu item,
+so they can never show up under `menu`. Miss one and a new `map` line on the same chord makes the next
+reload drop that binding. A shortcut holding alternatives is one `|`-joined string, so split it.
 
 ```bash
 agtermctl keymap list --json | jq -r '
   [ .result.keymap.actions[].chord,
-    .result.keymap.commands[].shortcut,
-    .result.keymap.menu[].chord ] | map(select(. != null)) | unique | .[]'
+    (.result.keymap.actions[].alternates // [] | .[]),
+    (.result.keymap.commands[].shortcut // "" | split("|") | .[]),
+    .result.keymap.menu[].chord ] | map(select(. != null and . != "")) | unique | .[]'
 ```
 
 Read the parse problems in full rather than just their count:

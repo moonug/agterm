@@ -98,7 +98,7 @@ struct WorkspaceSidebar: NSViewRepresentable {
         // reload; a touch inside viewFor wouldn't register it. The badge-visibility toggle
         // (GhosttyApp.notificationBadgeEnabled) is NOT observable and drives a re-reconcile via
         // .agtermAppearanceChanged, like toolbarMode.
-        _ = store.workspaces.map { ($0.id, $0.name, $0.unseenCount, $0.sessions.map { ($0.id, $0.displayName, $0.hasSplit, $0.unseenCount, $0.agentIndicator, $0.flagged) }) }
+        _ = store.workspaces.map { ($0.id, $0.name, $0.unseenCount, $0.sessions.map { ($0.id, $0.displayName, $0.hasSplit, $0.splitAxis, $0.unseenCount, $0.agentIndicator, $0.flagged) }) }
         _ = store.selectedSessionID
         _ = store.sidebarSelectionIDs
         // sidebarMode flips the whole data source (tree ↔ flat flagged list), so a mode change must rebuild.
@@ -137,7 +137,17 @@ struct WorkspaceSidebar: NSViewRepresentable {
         /// Workspace ids the user has expanded, tracked via the expand/collapse callbacks. The source of
         /// truth for restoring expansion on rebuild: NSOutlineView discards its own expansion state for
         /// items it no longer renders, and the flagged-mode reload drops every workspace node.
-        private var expandedWorkspaceIDs = Set<UUID>()
+        /// Mirrored into the store on every assignment — a suppressed reveal opens a row without touching
+        /// `Workspace.isExpanded`, so the persisted flag alone cannot answer "is this row open right now",
+        /// which is what Collapse/Expand Workspace has to fold. One `didSet` rather than a push beside each
+        /// of the seven mutation sites, because a missed site desynchronizes silently. Deliberately NOT
+        /// delta-guarded: a fresh Coordinator starts empty, so seeding an all-collapsed tree assigns empty
+        /// over empty and a guard would skip the push, leaving the PREVIOUS mount's ids in the store while
+        /// the outline shows every row folded. The store field is `@ObservationIgnored`, so a redundant
+        /// push costs one set copy and invalidates nothing.
+        private var expandedWorkspaceIDs = Set<UUID>() {
+            didSet { store.noteSidebarExpansion(expandedWorkspaceIDs) }
+        }
         /// Set true around PROGRAMMATIC `expandItem`/`collapseItem` (the launch/rebuild re-apply, the
         /// `syncSelection` reveal, the focus force-expand): the didExpand/DidCollapse callbacks still update
         /// the visual `expandedWorkspaceIDs` but SKIP the persist write-back, so a view-only reveal never
@@ -311,7 +321,8 @@ struct WorkspaceSidebar: NSViewRepresentable {
             collapseOthers()
         }
 
-        /// Sync the sidebar to a SINGLE workspace's collapse/expand (`workspace.collapse`/`.expand`).
+        /// Sync the sidebar to a SINGLE workspace's collapse/expand — `workspace.collapse`/`.expand` and the
+        /// GUI's own Collapse/Expand Workspace, which share `AppActions.setWorkspaceExpanded`.
         /// `AppActions.setWorkspaceExpanded` has ALREADY persisted `Workspace.isExpanded` — the source of
         /// truth, independent of this Coordinator — so this handler only keeps the tracked
         /// `expandedWorkspaceIDs` in step (letting the intent survive a flagged-mode or focused-away row and
@@ -343,6 +354,7 @@ struct WorkspaceSidebar: NSViewRepresentable {
         private struct RowContent: Equatable {
             let label: String
             let hasSplit: Bool
+            let splitAxis: SplitAxis
             let unseen: Int
             let indicator: AgentIndicator
             /// Whether the session is flagged (tree-mode filled-icon variant). A change re-badges just this
@@ -430,7 +442,8 @@ struct WorkspaceSidebar: NSViewRepresentable {
         /// The visible content of a workspace row. One builder shared by `reloadChangedContentRows` and
         /// `snapshotRowContent` so the snapshot and the diff can't drift.
         private func rowContent(forWorkspace workspace: Workspace) -> RowContent {
-            RowContent(label: workspace.name, hasSplit: false, unseen: effectiveUnseen(workspace.unseenCount),
+            RowContent(label: workspace.name, hasSplit: false, splitAxis: .leftRight,
+                       unseen: effectiveUnseen(workspace.unseenCount),
                        indicator: AgentIndicator(), flagged: false,
                        focusMember: store.focusedWorkspaceIDs.contains(workspace.id))
         }
@@ -440,6 +453,7 @@ struct WorkspaceSidebar: NSViewRepresentable {
         /// `workspaceName` in, so the label needs no per-session lookup and the reconcile stays linear.
         private func rowContent(forSession session: Session, workspaceName: String) -> RowContent {
             RowContent(label: rowLabel(for: session, workspaceName: workspaceName), hasSplit: session.hasSplit,
+                       splitAxis: session.splitAxis,
                        unseen: effectiveUnseen(session.unseenCount),
                        indicator: effectiveIndicator(forSession: session.id), flagged: session.flagged,
                        focusMember: false)
@@ -730,9 +744,11 @@ struct WorkspaceSidebar: NSViewRepresentable {
         lazy var workspaceIcon = Self.rowIcon("square.grid.2x2")
         lazy var focusedWorkspaceIcon = Self.rowIcon("square.grid.2x2", weight: .black)
         lazy var splitSessionIcon = Self.rowIcon("rectangle.split.2x1")
+        lazy var horizontalSplitSessionIcon = Self.rowIcon("rectangle.split.1x2")
         lazy var sessionIcon = Self.rowIcon("terminal")
         lazy var flaggedSessionIcon = Self.rowIcon("terminal.fill")
         lazy var flaggedSplitSessionIcon = Self.rowIcon("rectangle.split.2x1.fill")
+        lazy var flaggedHorizontalSplitSessionIcon = Self.rowIcon("rectangle.split.1x2.fill")
 
         private static func rowIcon(_ symbolName: String, weight: NSFont.Weight = .regular) -> NSImage? {
             let config = NSImage.SymbolConfiguration(pointSize: 13, weight: weight)
@@ -795,8 +811,9 @@ extension Notification.Name {
     /// one, with the frontmost window's `AppStore` as the object so only that window's sidebar reacts.
     static let agtermExpandWorkspaces = Notification.Name("agterm.expandWorkspaces")
     static let agtermCollapseWorkspaces = Notification.Name("agterm.collapseWorkspaces")
-    /// Posted by the `workspace.collapse`/`workspace.expand` control arm for a SINGLE workspace, with the
-    /// target window's `AppStore` as the object and the workspace id + desired state in `userInfo`.
+    /// Posted for a SINGLE workspace by the `workspace.collapse`/`workspace.expand` control arm and by the
+    /// GUI's Collapse/Expand Workspace, with the target window's `AppStore` as the object and the workspace
+    /// id + desired state in `userInfo`.
     static let agtermSetWorkspaceExpanded = Notification.Name("agterm.setWorkspaceExpanded")
     /// Posted by the `session.resize` control arm after storing a new split-divider fraction, with the
     /// target `Session` as the object so only that session's `SplitProbeView` (in `ContentView`) moves its

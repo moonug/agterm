@@ -206,8 +206,13 @@ struct SocketClient {
             // keymap.reload reports its parse-diagnostic count; 0 reads as a clean reload.
             return count == 0 ? "ok" : "\(count) diagnostic(s)"
         }
+        if let cursor = response.result?.cursor {
+            // the bare column, scriptable as a command substitution. This stays one value even if the
+            // payload ever gains a row: a second field belongs under --json, not in a format callers parse.
+            return "\(cursor.column)"
+        }
         if let ratio = response.result?.ratio {
-            // session.resize echoes the applied (clamped) left-pane fraction, scriptable as a bare number.
+            // session.resize echoes the applied (clamped) primary-pane fraction, scriptable as a bare number.
             return String(format: "%.3f", ratio)
         }
         if echoID, let id = response.result?.id {
@@ -233,6 +238,8 @@ struct SocketClient {
     /// Render the `keymap.list` payload as sections: the resolved built-ins, then custom commands, parse
     /// diagnostics, and the live menu key equivalents (no trailing newline). An overridden built-in is
     /// marked `*`, a keyless one prints `-` rather than being dropped, so the listing is the full action set.
+    /// The chord column carries the whole binding set joined with `|`: the menu key equivalent first, then the
+    /// monitor-bound alternatives, each in canonical kitty syntax rather than the file's own spelling.
     ///
     /// The menu section is the point of the command: comparing it against the actions above is what shows
     /// a chord the keymap resolved but the menu is not carrying. Menu items print in menu-bar order.
@@ -242,7 +249,8 @@ struct SocketClient {
         for action in keymap.actions {
             let mark = action.overridden == true ? "*" : " "
             let name = action.action.padding(toLength: max(width, action.action.count), withPad: " ", startingAt: 0)
-            lines.append("  \(mark) \(name)  \(action.chord ?? "-")")
+            let binds = ((action.chord.map { [$0] } ?? []) + (action.alternates ?? [])).joined(separator: "|")
+            lines.append("  \(mark) \(name)  \(binds.isEmpty ? "-" : binds)")
         }
         if !keymap.commands.isEmpty {
             lines.append(contentsOf: ["", "commands:"])
@@ -285,7 +293,13 @@ struct SocketClient {
             lines.append("\(mark) \(workspace.name)  [\(workspace.id)]")
             for session in workspace.sessions {
                 let smark = session.active ? "*" : " "
-                let tags = (session.split ? " (split)" : "") + (session.overlay ? " (overlay)" : "")
+                // a hidden split still owns a live pane, so it needs a tag of its own: without one it
+                // reads exactly like a session that has no split at all.
+                let splitTag = session.split ? " (split)" : (session.hasSplit == true ? " (split hidden)" : "")
+                // a session whose main pane has no terminal looks identical to a working one here, which is
+                // the whole complaint in #416 — it is listed, named, and does nothing.
+                let realizedTag = session.realized == false ? " (not realized)" : ""
+                let tags = splitTag + realizedTag + (session.overlay ? " (overlay)" : "")
                     + (session.scratch ? " (scratch)" : "")
                 let titleSuffix = session.title.map { "  title: \($0)" } ?? ""
                 lines.append("  \(smark) \(session.name)\(tags)  [\(session.id)]  \(session.cwd)\(titleSuffix)")

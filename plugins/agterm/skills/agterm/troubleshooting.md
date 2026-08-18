@@ -19,8 +19,8 @@ You are inside agterm (`AGTERM_ENABLED=1`). Use:
   key equivalents the menu bar is actually dispatching. If the action's `chord` looks right but no `menu`
   entry carries it (or a different item does), the keymap is fine and the menu is the problem: SwiftUI
   rebuilds the menu only on the next app activation, so switch to another app and back, then relaunch if it
-  persists. Exception: `undo_close` (⌘Z) is delivered by a key monitor rather than a menu item, so it never
-  appears under `menu` and its absence there means nothing.
+  persists. Exceptions: `undo_close` (⌘Z) and `toggle_fullscreen` (⌃⌘F) are delivered by a key monitor
+  rather than a menu item, so they never appear under `menu` and their absence there means nothing.
 - **Ghostty settings** - `agtermctl config reload` re-reads the ghostty config and prints the diagnostic
   count (`0` = clean). The count covers every config source, not just `ghostty.conf` (libghostty does not
   record which file a diagnostic came from), so check the Console log for the offending line. `ghostty.conf`
@@ -34,7 +34,8 @@ You are inside agterm (`AGTERM_ENABLED=1`). Use:
   ```bash
   log show --predicate 'subsystem == "com.umputun.agterm"' --info --last 30m
   ```
-  Categories: `CustomCommandRunner`, `SettingsModel`, `GhosttyApp`, `NotificationManager`, `ControlServer`.
+  Categories: `GhosttyApp`, `GhosttySurfaceView`, `WatermarkRenderer`, `NotificationManager`,
+  `SettingsView`, `SettingsModel`, `CustomCommandRunner`, `ControlServer`.
 - **Files** — keymap `~/.config/agterm/keymap.conf`; agterm-scoped ghostty config
   `~/.config/agterm/ghostty.conf`; settings `~/Library/Application Support/agterm/settings.json`;
   socket path in `$AGTERM_SOCKET`.
@@ -136,6 +137,16 @@ To separate "never posted" from "posted but not shown": `tree --json` shows a ri
 target session whenever the command reached the notification path, and the log above records both the
 posted and the suppressed case under the `NotificationManager` category.
 
+### "a tool cannot get a macOS permission"
+
+Programs run in a session request Automation, Camera, Microphone, Contacts, Calendars, Reminders, Photos,
+Location, Bluetooth, local network, speech recognition, system administration and system audio recording
+THROUGH agterm: macOS treats agterm as the responsible app, so the prompt names agterm and the answer is
+recorded against agterm, not the tool. One grant then covers every program in every session with no
+further prompt, and a dismissed prompt is never re-offered (`osascript` keeps returning "Not authorized
+to send Apple events"). The user changes the answer in System Settings ▸ Privacy & Security under the
+matching service, e.g. Automation ▸ agterm. This is macOS policy, not an agterm bug: do not file it.
+
 ### "The agent-status glyph does not update"
 
 Install the hooks from Help ▸ Install Agent Status Hooks…. For shell-integrated agents, start a fresh shell
@@ -172,6 +183,18 @@ mishandles it. agterm emits correct paired focus-in/focus-out and is already mac
 refocus click is not forwarded into the pty), so the terminal is not at fault. Tracked as
 anthropics/claude-code#72188 (mouse-click variant #72273). Workaround: answer before switching away, or
 `Esc` the stuck prompt and let it re-ask.
+
+### "⌘-hover does not underline links inside tmux or vim"
+
+By design, NOT a bug. Do not file an agterm issue for it. libghostty detects links only while the
+foreground program has mouse reporting OFF, so a program that captures the mouse takes link handling with
+it: ⌘-hover stops underlining, the pointer stays a text bar, and ⌘-click opens nothing, all four together
+and only inside that program. Ghostty.app behaves the same. It is per-program, not per-category:
+`tmux` with `mouse on` and stock `vim` (`defaults.vim` sets `mouse=a`) suppress it, while an agent CLI
+that never enables mouse reporting keeps links working. Workaround: hold shift too (⌘⇧-hover, ⌘⇧-click).
+A program can claim shift via `XTSHIFTESCAPE`, so `mouse-shift-capture = never` in
+`~/.config/agterm/ghostty.conf` makes shift always win; `mouse-reporting = false` there turns reporting
+off for every program, trading in-program mouse support for always-on selection and links.
 
 ## Reporting: decide bug vs unsupported FIRST
 

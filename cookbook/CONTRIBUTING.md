@@ -8,7 +8,7 @@ These rules cover recipes. The project-wide rules for everything else are in [CO
 
 ## Layout
 
-One directory per recipe, kebab-case, named after what the recipe does rather than after its script (`park-and-resume`, not `agt-park`). It holds a `README.md` and the scripts, nothing else.
+One directory per recipe, kebab-case, named after what the recipe does rather than after its script (`park-and-resume`, not `agt-park`). It holds a `README.md` and the scripts, nothing else — with one exception: a recipe whose chord hands work to a coding agent may ship the agent skill it needs, as `SKILL.md` beside the scripts, and *Setup* says where to copy it. The skill is part of the recipe and is read the same way, so keep it to what this recipe needs rather than shipping your whole configuration.
 
 Name scripts by their language, because the extension decides what CI does with them:
 
@@ -51,13 +51,22 @@ When you are porting someone else's work, credit him by name with a link to his 
 
 ## Index row
 
-Add a row to the table in [README.md](README.md) in the same pull request:
+Add a row to [README.md](README.md) in the same pull request:
 
 | recipe | what it does | needs |
 |---|---|---|
 | [project-switcher](project-switcher/) | show only one project's workspaces | 0.18.0, jq |
 
-CI compares the directory set against the index in both directions, so a directory with no row fails, and a row pointing at a directory that does not exist fails too. The check matches the link by its trailing slash, so keep it.
+The index is split into four tables, grouped by what the reader is trying to do, alphabetical within each. Pick the one that matches the goal rather than the tool, since the agent a recipe needs is already in its *needs* column:
+
+- **Workspaces and projects** — arranging workspaces, windows, and where a session opens.
+- **Sessions across restarts** — a tab coming back to what it was running.
+- **Agent status and workflows** — reporting what an agent is doing, or driving one from a chord.
+- **Panes, pickers and input** — splits, overlays, dashboards, and getting text into the shell.
+
+A recipe that genuinely fits two goes in the one its *What it does* line leads with. If none fits, say so in the pull request rather than forcing it: a fifth group is a fair outcome.
+
+CI compares the directory set against the index in both directions, so a directory with no row fails, and a row pointing at a directory that does not exist fails too. It reads every table, so which one you pick does not affect the check. The check matches the link by its trailing slash, so keep it.
 
 ## Rules for the scripts
 

@@ -111,6 +111,63 @@ final class ControlServerSessionActionsTests: XCTestCase {
         XCTAssertEqual(store.selectedSessionID, other.id, "typing without select must leave the selection where it was")
     }
 
+    // a pane parked in the slot with no libghostty surface is the state a display-asleep create leaves
+    // behind (#416). It used to answer `failed to read surface buffer`, naming a cause that never happened,
+    // while every sibling command called the same state `session not realized`.
+    func testTextOnAnUnrealizedPaneReportsNotRealizedRatherThanAReadFailure() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let target = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        let parked = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        target.surface = parked
+        XCTAssertFalse(parked.isRealized, "a detached view never runs createSurface, which is the point here")
+
+        let response = server.readSessionText(target.id.uuidString, window: nil,
+                                              options: ControlSessionTextOptions(pane: nil, all: false, lines: nil))
+
+        XCTAssertFalse(response.ok)
+        XCTAssertEqual(response.error, "session not realized",
+                       "an empty slot and a parked-but-unrealized view are one state to a caller")
+    }
+
+    // the same parked pane, one command over: `surfaceBindingAction`'s cast proves only that the SLOT is
+    // filled, so both used to discard `performBindingAction`'s false and answer ok with nothing pasted or
+    // selected, while their neighbours called that state `session not realized`.
+    func testPasteAndSelectAllOnAnUnrealizedPaneReportNotRealized() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let target = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        let parked = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        target.surface = parked
+        XCTAssertFalse(parked.isRealized, "a detached view never runs createSurface, which is the point here")
+
+        let paste = server.pasteSession(target.id.uuidString, window: nil)
+        XCTAssertFalse(paste.ok, "session.paste pasted nothing and must not report a false ok")
+        XCTAssertEqual(paste.error, "session not realized")
+
+        let selectAll = server.selectAllSession(target.id.uuidString, window: nil)
+        XCTAssertFalse(selectAll.ok, "session.selectall selected nothing and must not report a false ok")
+        XCTAssertEqual(selectAll.error, "session not realized")
+    }
+
+    // `session.copy` is `session.selectall`'s documented read-back, so the pair has to name this state the
+    // same way. `readSelection` returns nil for an unrealized pane exactly as it does for an empty buffer,
+    // which the arm used to report as `no selection`.
+    func testCopyOnAnUnrealizedPaneReportsNotRealizedRatherThanNoSelection() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let target = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        let parked = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        target.surface = parked
+        XCTAssertFalse(parked.isRealized, "a detached view never runs createSurface, which is the point here")
+
+        let response = server.copySelection(target.id.uuidString, window: nil)
+
+        XCTAssertFalse(response.ok)
+        XCTAssertEqual(response.error, "session not realized",
+                       "`no selection` blames an empty buffer for a pane that has no terminal")
+    }
+
     // the true side of that branch: deleting the body of `if select` leaves every other test green while
     // `--select` silently stops selecting, so this asserts the move itself rather than the typed text.
     func testTypeWithSelectStillSelectsWhenTheSurfaceIsNotReady() async throws {
@@ -174,6 +231,37 @@ final class ControlServerSessionActionsTests: XCTestCase {
         let sessionWide = server.sessionOverlayResult(session.id.uuidString, window: nil, pane: nil)
         XCTAssertFalse(sessionWide.ok)
         XCTAssertEqual(sessionWide.error, "no overlay result", "a pane overlay must not fill the session slot")
+    }
+
+    // MARK: - session.overlay.copy / .text
+
+    // #434: an empty slot and a filled-but-unrealized one are different answers.
+    func testOverlayReadsSeparateAnEmptySlotFromAnUnrealizedSurface() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let session = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        let sessionWide = ControlSessionOverlayTextOptions(pane: nil, all: false, lines: nil)
+        let leftPane = ControlSessionOverlayTextOptions(pane: .left, all: false, lines: nil)
+
+        XCTAssertEqual(server.copySessionOverlaySelection(session.id.uuidString, window: nil, pane: nil).error,
+                       "no overlay")
+        XCTAssertEqual(server.readSessionOverlayText(session.id.uuidString, window: nil, options: sessionWide).error,
+                       "no overlay")
+        XCTAssertEqual(server.copySessionOverlaySelection(session.id.uuidString, window: nil, pane: .left).error,
+                       "no overlay")
+
+        XCTAssertNil(store.openPaneOverlay(session.id, pane: .left, command: "true"))
+        XCTAssertEqual(server.copySessionOverlaySelection(session.id.uuidString, window: nil, pane: .left).error,
+                       "overlay not realized", "the slot is filled; it is the cover that has no terminal yet")
+        XCTAssertEqual(server.readSessionOverlayText(session.id.uuidString, window: nil, options: leftPane).error,
+                       "overlay not realized")
+
+        // the other half of that branch: a view parked in the slot whose libghostty surface never came up
+        session.setPaneOverlaySurface(GhosttySurfaceView(workingDirectory: NSTemporaryDirectory()), pane: .left)
+        XCTAssertEqual(server.copySessionOverlaySelection(session.id.uuidString, window: nil, pane: .left).error,
+                       "overlay not realized")
+        XCTAssertEqual(server.copySessionOverlaySelection(session.id.uuidString, window: nil, pane: .right).error,
+                       "no overlay", "the sibling slot is independent, not borrowed from the open one")
     }
 
     // MARK: - session.hud.*
@@ -316,10 +404,28 @@ final class ControlServerSessionActionsTests: XCTestCase {
         XCTAssertEqual(session.hudFile, file)
         XCTAssertEqual(bodyText(session), expectedBody(update))
         XCTAssertEqual(session.overlaySizePercent, 40)
-        // the grid rides in the body's header line, which is what lets a running helper re-centre
+        // the grid rides in the body's header line, which is what lets a running helper re-centre. The
+        // trailing `-` is the no-text-color sentinel, spelled out because this pins the wire format.
         XCTAssertEqual(bodyText(session)?.split(separator: "\n").first.map(String.init),
                        "\(HudLayout.box(for: update).columns) \(HudLayout.box(for: update).rows) 0 "
-                           + "\(Self.ownerPid) \(HudSpinner.staticInterval)")
+                           + "\(Self.ownerPid) \(HudSpinner.staticInterval) -")
+    }
+
+    // the text color rides that same header, so an update recolors the live panel without re-opening the
+    // slot — the half of a HUD's color an update can change, unlike the surface-read background.
+    func testHudUpdateRecolorsTheTextThroughTheHeaderInPlace() throws {
+        let (_, session) = try makeHudSession()
+        XCTAssertTrue(server.openHud(session.id.uuidString, window: nil,
+                                     spec: HudSpec(message: "first", textColor: "#e0e0e0")).ok)
+        let generation = session.overlaySlotGeneration
+
+        let update = HudSpec(message: "second", textColor: "#7ec07e")
+        XCTAssertTrue(server.updateHud(session.id.uuidString, window: nil, spec: update).ok)
+
+        XCTAssertEqual(session.overlaySlotGeneration, generation, "a recolor must not re-open the slot")
+        XCTAssertEqual(bodyText(session)?.split(separator: "\n").first.map(String.init)?
+            .hasSuffix(" 38;2;126;192;126"), true)
+        XCTAssertEqual(session.hudSpec?.textColor, "#7ec07e")
     }
 
     func testHudCloseClearsTheSlotAndRemovesTheBodyFile() throws {
@@ -396,6 +502,24 @@ final class ControlServerSessionActionsTests: XCTestCase {
                        "no overlay result", "a closed hud records no exit code either")
     }
 
+    // `overlayActive` is true for a hud too, so the refusal has to name it.
+    func testOverlayReadsRefuseAHudByName() throws {
+        let (store, session) = try makeHudSession()
+        XCTAssertTrue(server.openHud(session.id.uuidString, window: nil, spec: HudSpec(message: "working")).ok)
+        let options = ControlSessionOverlayTextOptions(pane: nil, all: false, lines: nil)
+
+        XCTAssertEqual(server.copySessionOverlaySelection(session.id.uuidString, window: nil, pane: nil).error,
+                       "no overlay to read: the slot holds a hud")
+        XCTAssertEqual(server.readSessionOverlayText(session.id.uuidString, window: nil, options: options).error,
+                       "no overlay to read: the slot holds a hud")
+        XCTAssertTrue(session.hudActive, "a refused read must leave the panel up")
+        XCTAssertEqual(server.copySessionOverlaySelection(session.id.uuidString, window: nil, pane: .left).error,
+                       "no overlay", "the pane-scoped arm reads its own slot, uncoloured by a session hud")
+        XCTAssertTrue(store.closeHud(session.id))
+        XCTAssertEqual(server.copySessionOverlaySelection(session.id.uuidString, window: nil, pane: nil).error,
+                       "no overlay")
+    }
+
     func testOverlayCloseClosesAHudAndRemovesItsBody() throws {
         let (_, session) = try makeHudSession()
         XCTAssertTrue(server.openHud(session.id.uuidString, window: nil, spec: HudSpec(message: "working")).ok)
@@ -426,6 +550,92 @@ final class ControlServerSessionActionsTests: XCTestCase {
         XCTAssertFalse(full.ok)
         XCTAssertEqual(full.error, "a hud is always floating: pass --size-percent, not --full")
         XCTAssertEqual(session.overlaySizePercent, 35, "a refused resize must leave the panel where it was")
+    }
+
+    private func splitSession() throws -> (AppStore, Session) {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let session = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        store.toggleSplit(session.id)
+        return (store, session)
+    }
+
+    func testSplitVisibilityDefaultsLeftRightAndAcceptsHorizontalAxis() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let session = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+
+        XCTAssertTrue(server.splitSession(session.id.uuidString, window: nil, mode: "on", axis: nil).ok)
+        XCTAssertTrue(session.isSplit)
+        XCTAssertEqual(session.splitAxis, .leftRight)
+
+        XCTAssertTrue(server.splitSession(session.id.uuidString, window: nil, mode: "on", axis: .topBottom).ok)
+        XCTAssertTrue(session.isSplit, "on with another axis transposes rather than hides")
+        XCTAssertEqual(session.splitAxis, .topBottom)
+    }
+
+    func testAxisSpecificControlToggleUsesTheSameHideTransposeMatrixAsTheGui() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let session = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+
+        XCTAssertTrue(server.splitSession(session.id.uuidString, window: nil,
+                                          mode: "toggle", axis: .topBottom).ok)
+        XCTAssertTrue(session.isSplit)
+        XCTAssertEqual(session.splitAxis, .topBottom)
+
+        XCTAssertTrue(server.splitSession(session.id.uuidString, window: nil,
+                                          mode: "toggle", axis: .leftRight).ok)
+        XCTAssertTrue(session.isSplit)
+        XCTAssertEqual(session.splitAxis, .leftRight)
+
+        XCTAssertTrue(server.splitSession(session.id.uuidString, window: nil,
+                                          mode: "toggle", axis: .leftRight).ok)
+        XCTAssertFalse(session.isSplit)
+        XCTAssertTrue(session.hasSplit)
+        XCTAssertEqual(session.splitAxis, .leftRight)
+    }
+
+    func testSplitCloseTearsThePaneDown() throws {
+        let (_, session) = try splitSession()
+        session.splitRatio = 0.7
+
+        let response = server.closeSessionSplit(session.id.uuidString, window: nil)
+
+        XCTAssertTrue(response.ok, response.error ?? "")
+        XCTAssertEqual(response.result?.id, session.id.uuidString)
+        XCTAssertFalse(session.hasSplit)
+        XCTAssertFalse(session.isSplit)
+        XCTAssertFalse(session.splitFocused)
+        XCTAssertNil(session.splitRatio)
+    }
+
+    func testSplitCloseReachesAHiddenPane() throws {
+        let (store, session) = try splitSession()
+        store.toggleSplit(session.id)
+        XCTAssertTrue(session.hasSplit)
+
+        let response = server.closeSessionSplit(session.id.uuidString, window: nil)
+
+        XCTAssertTrue(response.ok, response.error ?? "")
+        XCTAssertFalse(session.hasSplit)
+    }
+
+    func testSplitCloseWithoutASplitAnswersOk() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let session = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+
+        let response = server.closeSessionSplit(session.id.uuidString, window: nil)
+
+        XCTAssertTrue(response.ok, response.error ?? "")
+        XCTAssertFalse(session.hasSplit)
+    }
+
+    func testSplitCloseRejectsAnUnknownSession() throws {
+        let response = server.closeSessionSplit(UUID().uuidString, window: nil)
+
+        XCTAssertFalse(response.ok)
     }
 
     // the helper centers on the grid in the body's header, so a resize that changes the panel must rewrite
