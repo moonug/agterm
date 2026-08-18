@@ -348,18 +348,6 @@ struct Session: ParsableCommand {
         }
     }
 
-    struct OpenLinkAtCursor: RequestCommand {
-        static let configuration = CommandConfiguration(
-            commandName: "open-link-at-cursor",
-            abstract: "Open the link (URL or task key) under the mouse cursor in a session, per link-rules.conf.")
-        @OptionGroup var target: TargetOptions
-        @OptionGroup var options: ClientOptions
-
-        func makeRequest() throws -> ControlRequest {
-            ControlRequest(cmd: .sessionOpenLinkAtCursor, target: target.target, args: options.withWindow())
-        }
-    }
-
     struct Text: RequestCommand {
         static let configuration = CommandConfiguration(abstract: "Print a session's terminal buffer as plain text (does not touch the system clipboard).")
         @Flag(name: .long, help: "Read the full screen + scrollback instead of just the visible screen.") var all = false
@@ -992,6 +980,20 @@ struct Session: ParsableCommand {
             func makeRequest() throws -> ControlRequest {
                 ControlRequest(cmd: .sessionHudClose, target: target.target, args: options.withWindow())
             }
+        }
+    }
+}
+
+extension Session {
+    struct OpenLinkAtCursor: RequestCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "open-link-at-cursor",
+            abstract: "Open the link (URL or task key) under the mouse cursor in a session, per link-rules.conf.")
+        @OptionGroup var target: TargetOptions
+        @OptionGroup var options: ClientOptions
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .sessionOpenLinkAtCursor, target: target.target, args: options.withWindow())
         }
     }
 }

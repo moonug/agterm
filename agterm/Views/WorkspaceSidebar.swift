@@ -224,8 +224,7 @@ struct WorkspaceSidebar: NSViewRepresentable {
                                                    name: .agtermAccessibilityDisplayOptionsChanged, object: nil)
         }
 
-        isolated deinit {
-            pendingSpringLoadedExpansion?.workItem.cancel()
+        deinit {
             NotificationCenter.default.removeObserver(self)
         }
 

@@ -153,6 +153,7 @@ extension AppActions {
         case .sessionPalette: return toggleSessionPalette
         case .commandPalette: return toggleActionPalette
         case .customCommandPalette: return toggleCustomCommandPalette
+        case .openLinkAtCursor: return openLinkAtCursor
         default: return nil
         }
     }

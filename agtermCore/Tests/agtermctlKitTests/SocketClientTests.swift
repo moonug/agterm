@@ -253,6 +253,7 @@ struct SocketClientTests {
             toggle_scratch              cmd+j
             toggle_terminal_zoom        cmd+shift+return
             toggle_search               cmd+f
+            open_link_at_cursor         -
           * toggle_sidebar              t
             select_theme                -
             toggle_fullscreen           ctrl+cmd+f

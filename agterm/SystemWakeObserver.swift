@@ -13,7 +13,7 @@ import Foundation
 /// LOCKED, so wake is the earliest correct moment to re-attempt and no unlock hook is needed.
 @MainActor
 final class SystemWakeObserver {
-    private var wakeObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var wakeObserver: NSObjectProtocol?
 
     /// Register once for the process — the scene `.task` runs for every window, so this must be idempotent
     /// like `SystemAccessibilityObserver.start()`.
@@ -33,7 +33,7 @@ final class SystemWakeObserver {
         }
     }
 
-    isolated deinit {
+    deinit {
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
         }
