@@ -43,8 +43,8 @@ public enum ControlPaneFocusMode: Equatable, Sendable {
 
     public static func parse(_ pane: String?) -> ControlPaneFocusMode? {
         switch pane ?? "other" {
-        case "left", "primary": return .primary
-        case "right", "split": return .split
+        case "left", "top", "primary": return .primary
+        case "right", "bottom", "split": return .split
         case "other", "toggle": return .toggle
         default: return nil
         }
@@ -188,6 +188,18 @@ public struct ControlSessionStatusUpdate: Equatable, Sendable {
         self.sound = sound
         self.color = color
         self.shape = shape
+        self.pane = pane
+        self.paneID = paneID
+    }
+}
+
+/// The optional pane coordinate space for a HUD. The dispatcher parses `pane`; the app resolves `paneID`
+/// against live surfaces first and uses `pane` only as its fallback.
+public struct ControlHudPlacement: Equatable, Sendable {
+    public let pane: OverlayPane?
+    public let paneID: String?
+
+    public init(pane: OverlayPane? = nil, paneID: String? = nil) {
         self.pane = pane
         self.paneID = paneID
     }

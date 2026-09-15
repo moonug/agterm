@@ -7,7 +7,7 @@ import agtermCore
 /// hooks merged into `~/.claude/settings.json`, the six Codex lifecycle hooks into `~/.codex/config.toml`,
 /// and — when each is configured — Pi's lifecycle extension into `~/.pi/agent/extensions/` and OpenCode's
 /// plugin into `~/.config/opencode/plugins/`. Claude/Codex configs get a `.bak` first; the Codex step parses
-/// TOML and surfaces a manual block instead when that file already has hooks or does not parse. The
+/// TOML and points at the docs for a manual merge when that file already has hooks or does not parse. The
 /// host-free string/JSON/TOML transforms and the Pi/OpenCode ownership policy live in
 /// `agtermCore.AgentHooksInstall`; this type owns the AppKit filesystem glue. Idempotent: a re-run refreshes
 /// the baked `agtermctl` path (healing a moved bundle) and no-ops on already-present entries.
@@ -30,7 +30,7 @@ enum AgentHooksInstaller {
     }
 
     // the outcome of the Codex config.toml merge, decided by parsing the existing file.
-    private enum CodexResult {
+    enum CodexResult {
         case merged, alreadyConfigured, hooksExist, unparseable, unreadable, noCodex
 
         // warning: agterm could not auto-merge and the user must act (add the block by hand, or fix config).
@@ -38,6 +38,14 @@ enum AgentHooksInstaller {
             switch self {
             case .hooksExist, .unparseable, .unreadable: return true
             case .merged, .alreadyConfigured, .noCodex: return false
+            }
+        }
+
+        // the two outcomes whose alert text sends the user to the docs for the block to paste in by hand.
+        var needsManualMerge: Bool {
+            switch self {
+            case .hooksExist, .unparseable: return true
+            case .merged, .alreadyConfigured, .unreadable, .noCodex: return false
             }
         }
     }
@@ -85,7 +93,8 @@ enum AgentHooksInstaller {
             let outcome = try install()
             present(style: outcome.isWarning ? .warning : .informational,
                     title: outcome.isWarning ? "Agent Status Hooks Installed — with a warning" : "Agent Status Hooks Installed",
-                    text: successText(outcome))
+                    text: successText(outcome),
+                    docs: outcome.codex.needsManualMerge ? codexManualDocsURL : nil)
         } catch let error as InstallError {
             present(style: .warning, title: "Install Failed", text: error.message)
         } catch {
@@ -116,41 +125,18 @@ enum AgentHooksInstaller {
         try fm.copyItem(at: source, to: destination)
     }
 
-    // sentinel for the installer-baked AGTERMCTL default; a re-run replaces it instead of duplicating it.
-    private static let agtermctlMarker = "# >>> agterm agtermctl path (installer-baked) >>>"
-
     // bake the bundled agtermctl's absolute path into the installed wrappers so the hooks fire even when the
-    // CLI was never symlinked into PATH. `[ -n "${AGTERMCTL:-}" ] ||` assigns only when unset, so an explicit
-    // env override still wins (order 1 > 2 > PATH); shellQuote keeps spaces / metacharacters inert.
+    // CLI was never symlinked into PATH. The transform itself is host-free in `AgentHooksInstall`.
+    // `claudeWrapperName` is deliberately absent: the Claude adapter never calls agtermctl, it `exec`s the
+    // generic wrapper — which carries the baked path — so there is nothing to bake into it.
     private static func bakeAgtermctlPath() throws {
         guard let tool = bundledTool else { return } // no bundled CLI: leave the PATH fallback in place
         for name in [AgentHooksInstall.wrapperName, AgentHooksInstall.codexWrapperName] {
             let wrapper = destinationFolder.appendingPathComponent(name)
             let original = try String(contentsOf: wrapper, encoding: .utf8)
-            let stripped = stripBakedBlock(from: original)
-            let block = agtermctlMarker + "\n[ -n \"${AGTERMCTL:-}\" ] || AGTERMCTL=\(AgentHooksInstall.shellQuote(tool.path))\n"
-            let baked = insertAfterShebang(stripped, block: block)
+            let baked = AgentHooksInstall.bakeAgtermctlPath(into: original, toolPath: tool.path)
             try writePreservingSymlink(baked, to: wrapper)
         }
-    }
-
-    private static func stripBakedBlock(from text: String) -> String {
-        let lines = text.components(separatedBy: "\n")
-        var result: [String] = []
-        var skip = 0
-        for line in lines {
-            if skip > 0 { skip -= 1; continue }
-            if line == agtermctlMarker { skip = 1; continue } // drop the marker and the assignment below it
-            result.append(line)
-        }
-        return result.joined(separator: "\n")
-    }
-
-    private static func insertAfterShebang(_ text: String, block: String) -> String {
-        var lines = text.components(separatedBy: "\n")
-        let insertAt = lines.first?.hasPrefix("#!") == true ? 1 : 0
-        lines.insert(contentsOf: block.components(separatedBy: "\n").dropLast(), at: insertAt)
-        return lines.joined(separator: "\n")
     }
 
     // write text PRESERVING an existing symlink: a dotfiles-managed link (`~/.claude/settings.json`,
@@ -353,8 +339,9 @@ enum AgentHooksInstaller {
     // the success-alert text, calling out anything an integration could not safely update and left alone.
     private static func successText(_ outcome: InstallOutcome) -> String {
         let claudeLine = outcome.settingsSkipped
-            ? "Your ~/.claude/settings.json isn't valid JSON (or couldn't be read), so the Claude Code hooks were NOT added "
-              + "(the file was left untouched). Fix it and run this again, or add the hooks manually."
+            ? "Your ~/.claude/settings.json couldn't be safely read or merged, so the Claude Code hooks were NOT added "
+              + "(the file was left untouched). It is unreadable, not valid JSON, or has a hooks entry in a shape we "
+              + "don't recognize. Fix it and run this again, or add the hooks manually."
             : "Claude Code hooks merged into ~/.claude/settings.json."
         return """
         Scripts installed to \(destinationFolder.path).
@@ -368,20 +355,22 @@ enum AgentHooksInstaller {
         """
     }
 
-    // the Codex portion of the alert; hooks-exist and unparseable include the block for a manual add.
-    private static func codexText(_ codex: CodexResult) -> String {
+    // the Codex portion of the alert. Every case stays one line and embeds no generated block: NSAlert sizes
+    // itself to fit `informativeText` with no scroll and no cap, so the hooks block's long `command =` lines
+    // wrapped several times each and grew the window past the bottom of a laptop screen (#430). Sentence
+    // count is not the constraint — the two manual-merge cases send the user to the docs instead.
+    static func codexText(_ codex: CodexResult) -> String {
         let approve = "Run /hooks in Codex to review and approve them before they take effect."
+        let manual = "See the Add Codex hooks by hand section of the agterm docs for the block to add, then run /hooks in Codex."
         switch codex {
         case .merged:
             return "Codex lifecycle hooks merged into ~/.codex/config.toml (any old codex-notify.sh notify line was removed). " + approve
         case .alreadyConfigured:
             return "Codex lifecycle hooks are already present in ~/.codex/config.toml. " + approve
         case .hooksExist:
-            return "Your ~/.codex/config.toml already defines its own hooks, so agterm left it untouched. "
-                + "Add these lifecycle hooks yourself, then run /hooks in Codex:\n\n" + codexBlock
+            return "Your ~/.codex/config.toml already defines its own hooks, so agterm left it untouched. " + manual
         case .unparseable:
-            return "Your ~/.codex/config.toml isn't valid TOML, so agterm left it untouched. "
-                + "Fix it, or add these lifecycle hooks yourself, then run /hooks in Codex:\n\n" + codexBlock
+            return "Your ~/.codex/config.toml isn't valid TOML, so agterm left it untouched. Fix it and run this again. " + manual
         case .unreadable:
             return "Your ~/.codex/config.toml exists but couldn't be read, so agterm left it untouched."
         case .noCodex:
@@ -427,16 +416,27 @@ enum AgentHooksInstaller {
         }
     }
 
-    // the Codex lifecycle-hooks block, for the alert's manual-add fallback cases.
-    private static var codexBlock: String {
-        AgentHooksInstall.codexHooksBlock(scriptDir: destinationFolder.path)
-    }
+    /// The docs anchor covering a manual Codex hooks merge, opened by the alert's second button. An NSAlert
+    /// renders `informativeText` as plain, unselectable text, so a printed URL would have to be retyped.
+    static let codexManualDocsURL = URL(string: "https://agterm.com/docs#codex-hooks-manual")
 
-    private static func present(style: NSAlert.Style, title: String, text: String) {
+    /// The result alert, with a second button when `docs` is set. Split out of `present()` so a hosted test
+    /// can check the buttons without running a modal.
+    static func makeAlert(style: NSAlert.Style, title: String, text: String, docs: URL?) -> NSAlert {
         let alert = NSAlert()
         alert.alertStyle = style
         alert.messageText = title
         alert.informativeText = text
-        alert.runModal()
+        if docs != nil {
+            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "Open Docs")
+        }
+        return alert
+    }
+
+    private static func present(style: NSAlert.Style, title: String, text: String, docs: URL? = nil) {
+        let alert = makeAlert(style: style, title: title, text: text, docs: docs)
+        guard alert.runModal() == .alertSecondButtonReturn, let docs else { return }
+        NSWorkspace.shared.open(docs)
     }
 }

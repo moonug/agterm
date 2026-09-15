@@ -37,6 +37,26 @@ struct AppStoreDuplicateTests {
         #expect(dupe.initialCwd == "/split-pane")
     }
 
+    @Test func duplicateOfARemoteSessionIsALocalShellUnderTheLocalDirectoryRule() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agterm-duplicate-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let source = try #require(store.addSession(toWorkspace: ws.id, cwd: home, remoteHost: "user@box"))
+
+        source.currentCwd = root.appendingPathComponent("only-on-the-remote").path
+        let fallback = try #require(store.duplicateSession(source.id))
+        #expect(fallback.initialCwd == home)
+        #expect(fallback.remoteHost == nil)
+
+        source.currentCwd = root.path
+        let twin = try #require(store.duplicateSession(source.id))
+        #expect(twin.initialCwd == root.path)
+    }
+
     @Test func duplicateSessionTracksLiveCwd() {
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
@@ -55,6 +75,7 @@ struct AppStoreDuplicateTests {
         source.flagged = true
         source.isSplit = true
         source.hasSplit = true
+        source.splitPaneIdentity = UUID()
         source.fontSize = 18
 
         let dupe = try! #require(store.duplicateSession(source.id))
@@ -67,6 +88,8 @@ struct AppStoreDuplicateTests {
         #expect(dupe.hasSplit == false)
         #expect(dupe.fontSize == nil)
         #expect(dupe.id != source.id)
+        #expect(dupe.paneIdentity != source.paneIdentity)
+        #expect(dupe.splitPaneIdentity == nil)
     }
 
     @Test func duplicateSessionCopiesNoRestoreOverride() {

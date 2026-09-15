@@ -5,10 +5,14 @@ import agtermCore
 
 /// App-side host for `session.hud.*`. Validation, error text and response shape stay in
 /// `ControlDispatcher+Hud`; this layer supplies the three things agtermCore cannot resolve — the bundled
-/// helper's path, the terminal font's cell size, and the pane's live geometry — plus the body file the
-/// helper reads.
+/// helper's path, the terminal font's cell size, and live geometry, plus the body file the helper reads.
 extension ControlServer {
     func openHud(_ target: String?, window: String?, spec: HudSpec) -> ControlResponse {
+        openHud(target, window: window, spec: spec, placement: ControlHudPlacement())
+    }
+
+    func openHud(_ target: String?, window: String?, spec: HudSpec,
+                 placement: ControlHudPlacement) -> ControlResponse {
         resolver.resolveSession(target, window: window) { store, id in
             guard let session = store.session(withID: id) else {
                 return ControlResponse(ok: false, error: "no such session")
@@ -16,15 +20,25 @@ extension ControlServer {
             guard let command = Self.helperCommand() else {
                 return ControlResponse(ok: false, error: "hud helper is not bundled in this build")
             }
+            let paneIdentity: UUID?
+            let pane: OverlayPane?
+            switch self.resolvePanePlacement(placement.pane, paneID: placement.paneID, in: session,
+                                            requireVisible: true, invalidPaneError: "hud pane must be left or right") {
+            case .resolved(let identity, let targetPane):
+                paneIdentity = identity
+                pane = targetPane
+            case .rejected(let response): return response
+            }
             let file = Self.bodyFile(for: id)
             // measured ONCE and threaded through: the sizing and the header describe the same panel, and
             // both a font lookup and a pane-geometry union would otherwise run twice per command.
-            let metrics = self.paneMetrics(for: session)
+            let metrics = self.paneMetrics(for: session, pane: pane)
             // open FIRST, write second: replacing a live HUD tears its surface down, and that teardown
             // deletes the body file at this same per-session path — writing first would lose it. The
             // header's grid also comes from the size the store RESOLVED, which only exists after this call.
             guard store.openHud(id, command: command, spec: spec, file: file,
-                                size: HudLayout.panelSize(for: spec, pane: metrics)) else {
+                                size: HudLayout.panelSize(for: spec, pane: metrics),
+                                paneIdentity: paneIdentity) else {
                 return ControlResponse(ok: false, error: "overlay already open")
             }
             // the rolled-back HUD never realized a surface, and a replaced predecessor's file sits at this
@@ -41,6 +55,11 @@ extension ControlServer {
     /// `HudLayout.renderedBody`. A failed write rolls the store back, as `openHud` does with `closeHud`:
     /// the panel still paints the old message, and `tree` must not claim the new one.
     func updateHud(_ target: String?, window: String?, spec: HudSpec) -> ControlResponse {
+        updateHud(target, window: window, spec: spec, placement: ControlHudPlacement())
+    }
+
+    func updateHud(_ target: String?, window: String?, spec: HudSpec,
+                   placement: ControlHudPlacement) -> ControlResponse {
         resolver.resolveSession(target, window: window) { store, id in
             // `hudActive` is the occupancy question, asked once and separately from the mutation below, so
             // a store that refused for another reason cannot come back as `noHud`.
@@ -49,11 +68,23 @@ extension ControlServer {
                   let previousHeight = session.hudHeightPercent else {
                 return ControlResponse(ok: false, error: OverlayHudError.noHud)
             }
-            let metrics = self.paneMetrics(for: session)
-            store.updateHud(id, spec: spec, size: HudLayout.panelSize(for: spec, pane: metrics))
+            let paneIdentity: UUID?
+            let pane: OverlayPane?
+            switch self.resolvePanePlacement(placement.pane, paneID: placement.paneID, in: session,
+                                            requireVisible: false, invalidPaneError: "hud pane must be left or right") {
+            case .resolved(let identity, let targetPane):
+                paneIdentity = identity
+                pane = targetPane
+            case .rejected(let response): return response
+            }
+            let previousPaneIdentity = session.hudPaneIdentity
+            let metrics = self.paneMetrics(for: session, pane: pane)
+            store.updateHud(id, spec: spec, size: HudLayout.panelSize(for: spec, pane: metrics),
+                            paneIdentity: paneIdentity)
             guard self.writeHudBody(session, pane: metrics) else {
                 store.updateHud(id, spec: previous,
-                                size: HudPanelSize(widthPercent: previousSize, heightPercent: previousHeight))
+                                size: HudPanelSize(widthPercent: previousSize, heightPercent: previousHeight),
+                                paneIdentity: previousPaneIdentity)
                 return ControlResponse(ok: false, error: OverlayHudError.writeFailed)
             }
             return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
@@ -78,24 +109,35 @@ extension ControlServer {
     /// shifts the centering by about a column, as the estimated cell already can.
     private static let windowPadding = (horizontal: 8.0, vertical: 6.0)
 
-    /// Cell size from the CONFIGURED terminal font (the session's own size override, else the Settings
-    /// base) and pane size from the surfaces currently laid out. libghostty reports no cell metrics —
-    /// `GHOSTTY_ACTION_CELL_SIZE` discards its payload — so this measurement may round differently from the
-    /// cell it actually renders. That divergence is ACCEPTED, not corrected: the min/max clamp only bounds
-    /// the percentage, so a wider real cell overruns the helper's centering by a column or two. A session
-    /// with nothing on screen measures zero and takes the clamp's maximum.
-    func paneMetrics(for session: Session) -> PaneMetrics {
+    /// Cell size comes from the configured font. A scoped call reads the deck-frame cache, falling back to its
+    /// deck-hosted surface before the preference arrives; zoom and dashboard hosts are excluded. An unscoped
+    /// call unions the live pane frames, so a hidden focused split contributes its one maximized surface.
+    /// libghostty reports no cell metrics; an unmeasured session takes the cap.
+    func paneMetrics(for session: Session, pane: OverlayPane? = nil) -> PaneMetrics {
         let cell = Self.cellSize(family: settingsModel.settings.fontFamily,
                                  size: session.fontSize ?? GhosttyApp.shared.baseFontSize)
-        // the panel is laid out over the whole detail area, so the pane is the union of the laid-out panes:
-        // a hidden-but-focused split shows one pane maximized, and only the one in a window measures right.
-        let frames = [session.surface, session.splitSurface]
-            .compactMap { $0 as? GhosttySurfaceView }
-            .filter { $0.window != nil }
-            .map { $0.convert($0.bounds, to: nil) }
-        let area = frames.dropFirst().reduce(frames.first ?? .zero) { $0.union($1) }
+        let size: (width: Double, height: Double)
+        if let pane, let frame = session.hudPaneFrames[pane] {
+            size = (frame.width, frame.height)
+        } else if let pane {
+            let surface = pane == .left ? session.surface : session.splitSurface
+            if let view = surface as? GhosttySurfaceView,
+               view.window != nil, !view.suppressFocusChange {
+                let frame = view.convert(view.bounds, to: nil)
+                size = (frame.width, frame.height)
+            } else {
+                size = (0, 0)
+            }
+        } else {
+            let frames = [session.surface, session.splitSurface]
+                .compactMap { $0 as? GhosttySurfaceView }
+                .filter { $0.window != nil }
+                .map { $0.convert($0.bounds, to: nil) }
+            let area = frames.dropFirst().reduce(frames.first ?? .zero) { $0.union($1) }
+            size = (area.width, area.height)
+        }
         return PaneMetrics(cellWidth: cell.width, cellHeight: cell.height,
-                           paneWidth: area.width, paneHeight: area.height,
+                           paneWidth: size.width, paneHeight: size.height,
                            paddingWidth: Self.windowPadding.horizontal,
                            paddingHeight: Self.windowPadding.vertical)
     }

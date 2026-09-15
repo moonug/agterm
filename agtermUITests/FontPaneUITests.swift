@@ -71,15 +71,23 @@ final class FontPaneUITests: ControlAPITestCase {
                        "should report no scratch terminal: \(response)")
     }
 
+    // the parse moved to the dispatcher, so this now answers before the app is reached — with the same
+    // wording, which is the point: a raw socket client runs no `validate()` and must see no change.
     func testFontRejectsInvalidPaneServerSide() throws {
         let response = try sendCommand(#"{"cmd":"font.dec","target":"active","args":{"pane":"middle"}}"#)
         XCTAssertEqual(response["ok"] as? Bool, false, "font pane:middle should fail server-side: \(response)")
         XCTAssertEqual(response["error"] as? String, "invalid pane: middle", "should report the invalid pane: \(response)")
     }
 
-    // when the primary pane's shell exits, closePrimaryPane tears the primary surface down (surface == nil)
-    // and promotes the split shell. Both the default WRITE and the tree's fontSize read-back must resolve
-    // addressableSurface (= surface ?? splitSurface): a read off bare `surface` would OMIT fontSize here.
+    // the aliases `validatePaneArgument` accepts used to validate on the client and then fail on the server.
+    func testFontAcceptsAPaneAlias() throws {
+        let response = try sendCommand(#"{"cmd":"font.reset","target":"active","args":{"pane":"primary"}}"#)
+        XCTAssertEqual(response["ok"] as? Bool, true, "font --pane primary should reach the main pane: \(response)")
+    }
+
+    // when the primary pane's shell exits, closePrimaryPane moves the split survivor into `surface` and nils
+    // `splitSurface`, so the default WRITE and the tree's fontSize read-back must both land on the survivor
+    // as the MAIN pane rather than following the split fields it no longer occupies.
     func testFontDefaultTargetsPromotedSplitSurvivor() throws {
         let id = try activeSessionID()
 
@@ -94,7 +102,7 @@ final class FontPaneUITests: ControlAPITestCase {
                       "exiting the primary should promote the split survivor (session survives, split -> false)")
 
         let baseline = try XCTUnwrap(pollMainFontSize(target: id, timeout: 8),
-                                     "fontSize must read the promoted survivor via addressableSurface (surface is nil)")
+                                     "fontSize must read the promoted survivor, which is now the main pane")
 
         for _ in 0..<4 {
             let response = try sendCommand(fontRequest(cmd: "font.dec", target: id, pane: nil))

@@ -47,8 +47,12 @@ extension WorkspaceSidebar.Coordinator {
         renameController.beginEditing(node: node)
     }
 
+    /// Animated to match the disclosure triangle; `.claude/rules/sidebar.md` owns why, why it is not gated on
+    /// Reduce Motion, and which sites stay unanimated. The proxy fires didExpand/didCollapse synchronously, so
+    /// the persist write-back still runs and the other sites' `suppressExpansionPersist` brackets still hold.
     private func toggleExpansion(of node: SidebarNode, in outline: NSOutlineView) {
-        if outline.isItemExpanded(node) { outline.collapseItem(node) } else { outline.expandItem(node) }
+        let proxy = outline.animator()
+        if outline.isItemExpanded(node) { proxy.collapseItem(node) } else { proxy.expandItem(node) }
     }
 
     /// Builds the per-row context menu, resolving the clicked row lazily so one menu serves every row.
@@ -75,6 +79,13 @@ extension WorkspaceSidebar.Coordinator {
             rename.target = self
             rename.representedObject = node
             menu.addItem(rename)
+        }
+
+        if node.kind == .workspace || sessionCount == 1 {
+            let copyName = NSMenuItem(title: "Copy Name", action: #selector(menuCopyName(_:)), keyEquivalent: "")
+            copyName.target = self
+            copyName.representedObject = node
+            menu.addItem(copyName)
         }
 
         switch node.kind {
@@ -181,6 +192,21 @@ extension WorkspaceSidebar.Coordinator {
     @objc private func menuRename(_ sender: NSMenuItem) {
         guard let node = sender.representedObject as? SidebarNode else { return }
         renameController.beginEditing(node: node)
+    }
+
+    /// Copies the clicked row's name — `Session.displayName`, or the workspace's — to the general
+    /// pasteboard.
+    @objc private func menuCopyName(_ sender: NSMenuItem) {
+        guard let node = sender.representedObject as? SidebarNode else { return }
+        let name = switch node.kind {
+        case .session: store.session(withID: node.id)?.displayName
+        case .workspace: store.workspaceName(node.id)
+        }
+        // a row gone between the right-click and the choice, or a blank workspace name: leave the
+        // pasteboard as the user had it rather than clearing it to write nothing.
+        guard let name else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(name, forType: .string)
     }
 
     @objc private func menuMove(_ sender: NSMenuItem) {

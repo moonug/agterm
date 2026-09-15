@@ -14,6 +14,7 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       swift: ${{ steps.filter.outputs.swift }}
       cookbook: ${{ steps.filter.outputs.cookbook }}
@@ -47,6 +48,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.swift == 'true'
     runs-on: macos-26
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - name: swift test (with coverage)
@@ -80,6 +82,7 @@ jobs:
     # the coveralls action installs its reporter via a brew tap on macOS (now blocked
     # by homebrew's tap-trust gate); on linux it downloads a binary, so upload here
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
@@ -101,6 +104,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.swift == 'true'
     runs-on: macos-26
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - name: Install swiftlint
@@ -113,8 +117,18 @@ jobs:
     needs: changes
     if: needs.changes.outputs.swift == 'true'
     runs-on: macos-26
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - name: Read pinned helper revisions
+        id: revisions
+        shell: bash
+        run: |
+          ghostty=$(sed -nE 's/^GHOSTTY_REV="([^"]+)".*/\1/p' scripts/setup.sh)
+          zmx=$(sed -nE 's/^ZMX_REV="([^"]+)".*/\1/p' scripts/setup.sh)
+          [ -n "$ghostty" ] && [ -n "$zmx" ]
+          echo "ghostty=$ghostty" >> "$GITHUB_OUTPUT"
+          echo "zmx=$zmx" >> "$GITHUB_OUTPUT"
       - name: Cache libghostty (GhosttyKit + resources)
         uses: actions/cache@v6
         with:
@@ -122,11 +136,94 @@ jobs:
             GhosttyKit.xcframework
             agterm/Resources/ghostty
             agterm/Resources/terminfo
-          key: ghosttykit-${{ hashFiles('scripts/setup.sh') }}
+            .ghostty-build-stamp
+          key: ghosttykit-v1-${{ steps.revisions.outputs.ghostty }}
+      - name: Cache zmx
+        uses: actions/cache@v6
+        with:
+          path: |
+            agterm/Resources/zmx
+            .zmx-build-stamp
+          key: zmx-v1-${{ steps.revisions.outputs.zmx }}
       - name: Install xcodegen
         run: brew install xcodegen
       - name: Build libghostty + app (Release)
         run: scripts/build.sh
+      # The session-host fixtures attach to a real zmx daemon, so they skip in the Unit tests job,
+      # which stages no artifacts. This job has them.
+      - name: Session host fixtures against the staged zmx
+        working-directory: agtermCore
+        run: swift test --filter SessionHostServerTests
+      # Nested helpers are standalone executables. A deep app re-seal with entitlements can stamp the
+      # app's TCC grants onto them while leaving the build green (issue #396).
+      - name: Verify helper signatures and entitlements
+        shell: bash
+        run: |
+          app=build/DerivedData/Build/Products/Release/agterm.app
+          for name in agtermctl zmx agterm-session-host; do
+            helper="$app/Contents/MacOS/$name"
+            [ -f "$helper" ] || { echo "$name not found at $helper" >&2; exit 1; }
+            codesign --verify --strict "$helper"
+            if codesign -d --entitlements - "$helper" 2>/dev/null | grep -q 'com.apple.security'; then
+              echo "$name carries app entitlements" >&2
+              exit 1
+            fi
+          done
+      # the Debug-only hardened-runtime exceptions (allow-jit, allow-unsigned-executable-memory,
+      # disable-library-validation) must never reach a shipped build, and the TCC set must not shrink
+      # either — losing one silently removes the user's only path to granting that permission (#396).
+      # Pin the exact Release set; adding or dropping a key is a deliberate act that edits this list.
+      - name: Verify the app's Release entitlements
+        shell: bash
+        run: |
+          app=build/DerivedData/Build/Products/Release/agterm.app
+          [ -d "$app" ] || { echo "app not found at $app" >&2; exit 1; }
+          # values and their types, not just names. A key set to <false/> is not granted and macOS treats
+          # it exactly like a missing one, so a name-only compare would pass that through; and codesign
+          # accepts <string>true</string>, which renders as bare true without the tojson below.
+          expected=$(printf '%s=true\n' \
+            com.apple.security.automation.apple-events \
+            com.apple.security.device.audio-input \
+            com.apple.security.device.camera \
+            com.apple.security.personal-information.addressbook \
+            com.apple.security.personal-information.calendars \
+            com.apple.security.personal-information.location \
+            com.apple.security.personal-information.photos-library)
+          # get-task-allow is added by the ad-hoc "Sign to Run Locally" identity this job builds with,
+          # and never survives the Developer ID re-sign in scripts/release.sh. Drop it, then match exactly.
+          actual=$(codesign -d --entitlements - --xml "$app" 2>/dev/null \
+            | plutil -convert json -o - -- - \
+            | jq -r 'to_entries[] | select(.key != "com.apple.security.get-task-allow")
+                     | "\(.key)=\(.value|tojson)"' | sort)
+          if [ "$actual" != "$expected" ]; then
+            echo "Release entitlements changed. expected:" >&2; echo "$expected" >&2
+            echo "actual:" >&2; echo "$actual" >&2
+            exit 1
+          fi
+      # the split states the shipping set twice, and only the Release copy is pinned above. A TCC key
+      # added to the shipping file and missed here leaves Debug unable to prompt for it, with every job
+      # green — the failure surfaces only when someone verifies the new permission by hand in a Debug
+      # instance. Derive Debug's expected content from the shipping file so the two cannot drift.
+      - name: Verify the Debug entitlements are the shipping set plus the exceptions
+        shell: bash
+        run: |
+          keys() { plutil -convert json -o - -- "$1" | jq -r 'to_entries[] | "\(.key)=\(.value|tojson)"' | sort; }
+          release=$(keys agterm/agterm.entitlements)
+          debug=$(keys agterm/agterm-debug.entitlements)
+          exceptions=$(printf '%s=true\n' \
+            com.apple.security.cs.allow-jit \
+            com.apple.security.cs.allow-unsigned-executable-memory \
+            com.apple.security.cs.disable-library-validation | sort)
+          expected=$(printf '%s\n%s\n' "$release" "$exceptions" | sort)
+          if [ "$debug" != "$expected" ]; then
+            echo "agterm-debug.entitlements is not the shipping set plus the three exceptions." >&2
+            diff <(echo "$expected") <(echo "$debug") >&2 || true
+            exit 1
+          fi
+      # ZmxSupport requires a zsh password-database shell. Configure the disposable runner so the
+      # plain-shell seam test runs.
+      - name: Give the runner account a zsh login shell
+        run: sudo dscl . -create "/Users/$(id -un)" UserShell /bin/zsh
       - name: Application-hosted unit tests
         run: scripts/test-app.sh
 
@@ -135,6 +232,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.cookbook == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - name: recipe layout, index and headings
@@ -178,7 +276,7 @@ jobs:
             if ! head -c 2 "$f" | grep -q '#!'; then
               echo "::error::$f has no shebang"; fail=1
             fi
-          done < <(find cookbook -type f \( -name '*.sh' -o -name '*.zsh' -o -name '*.py' \) -print0)
+          done < <(find cookbook -type f \( -name '*.sh' -o -name '*.zsh' -o -name '*.fish' -o -name '*.py' \) -print0)
 
           exit $fail
       - name: shellcheck
@@ -186,15 +284,21 @@ jobs:
         # without it a failed find would leave the step green having checked nothing
         shell: bash
         run: find cookbook -type f -name '*.sh' -print0 | xargs -0 -r shellcheck
-      - name: Install zsh
-        # not on the ubuntu-latest image, unlike shellcheck
-        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Install recipe shells
+        # neither is on the ubuntu-latest image; fish runs a recipe regression test
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
       - name: zsh syntax check
         # shellcheck cannot parse zsh, so a parse is the only gate .zsh recipes get.
         # -n1 because zsh -n reads one script and treats the rest as its arguments;
         # bash explicitly, for pipefail, same reason as the shellcheck step above
         shell: bash
         run: find cookbook -type f -name '*.zsh' -print0 | xargs -0 -r -n1 zsh -n
+      - name: fish syntax check
+        # nothing lints .fish either, so a parse is the only gate these recipes get.
+        # -n1 because fish --no-execute parses its first argument and ignores the rest,
+        # so a batched call would leave the step green having checked one file
+        shell: bash
+        run: find cookbook -type f -name '*.fish' -print0 | xargs -0 -r -n1 fish --no-execute
       - name: Install ruff
         # not on the ubuntu-latest image, unlike shellcheck. pipx, because the runner's
         # python is externally managed and a bare pip install into it fails
@@ -207,3 +311,8 @@ jobs:
         # out. bash explicitly, for pipefail, same reason as the shellcheck step above
         shell: bash
         run: find cookbook -type f -name '*.py' -print0 | xargs -0 -r ruff check --ignore EXE001
+      - name: Python recipe tests
+        # one process per file keeps recipes independent and gives each test script its own argv.
+        # bash explicitly, for pipefail, same reason as the ruff step above.
+        shell: bash
+        run: find cookbook -type f -name 'test_*.py' -print0 | xargs -0 -r -n1 python3

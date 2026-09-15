@@ -3,7 +3,8 @@ import XCTest
 import agtermCore
 
 /// Hosted coverage for `AppActions.toggleSplit`'s cover rung — ⌘D / the toolbar button / View ▸ Split /
-/// the palette all funnel through it. Lives here rather than in `agtermUITests` for the same reasons as
+/// the palette all funnel through it — and for `closeSplit`, the palette's teardown beside it.
+/// Lives here rather than in `agtermUITests` for the same reasons as
 /// `SessionNavRevealTests`: it reaches `AppActions` through `@testable import agterm`, observes MODEL flags
 /// (`isSplit`, `scratchActive`) that need no terminal surface, and runs on every push via `scripts/test-app.sh`.
 @MainActor
@@ -44,6 +45,48 @@ final class SplitToggleCoverTests: XCTestCase {
 
         XCTAssertTrue(session.isSplit, "the cover rung must not disarm the ordinary split toggle")
         XCTAssertTrue(session.hasSplit)
+        XCTAssertEqual(session.splitAxis, .leftRight)
+    }
+
+    func testHorizontalActionCreatesAndTogglesAHorizontalSplit() throws {
+        let session = try activeSession()
+
+        actions.toggleHorizontalSplit()
+        XCTAssertTrue(session.isSplit)
+        XCTAssertEqual(session.splitAxis, .topBottom)
+
+        actions.toggleHorizontalSplit()
+        XCTAssertFalse(session.isSplit)
+        XCTAssertTrue(session.hasSplit)
+        XCTAssertEqual(session.splitAxis, .topBottom)
+    }
+
+    func testOrientationActionsTransposeAShownSplitWithoutChangingItsState() throws {
+        let session = try activeSession()
+        actions.toggleSplit()
+        session.splitRatio = 0.7
+        let focused = session.splitFocused
+
+        actions.toggleHorizontalSplit()
+
+        XCTAssertTrue(session.isSplit)
+        XCTAssertEqual(session.splitAxis, .topBottom)
+        XCTAssertEqual(session.splitRatio, 0.7)
+        XCTAssertEqual(session.splitFocused, focused)
+        XCTAssertTrue(session.hasSplit)
+    }
+
+    func testTitlebarStyleTogglePreservesTheCurrentAxis() throws {
+        let session = try activeSession()
+        actions.toggleHorizontalSplit()
+
+        actions.toggleCurrentSplit()
+        XCTAssertFalse(session.isSplit)
+        XCTAssertEqual(session.splitAxis, .topBottom)
+
+        actions.toggleCurrentSplit()
+        XCTAssertTrue(session.isSplit)
+        XCTAssertEqual(session.splitAxis, .topBottom)
     }
 
     func testShownScratchIsDismissedInsteadOfSplitting() throws {
@@ -112,5 +155,81 @@ final class SplitToggleCoverTests: XCTestCase {
         actions.toggleSplit()
 
         XCTAssertTrue(session.isSplit)
+    }
+
+    func testCloseSplitTearsTheShownPaneDown() throws {
+        let session = try activeSession()
+        actions.toggleSplit()
+        session.splitRatio = 0.7
+
+        actions.closeSplit()
+
+        XCTAssertFalse(session.isSplit)
+        XCTAssertFalse(session.hasSplit, "closing is what clears the flag a hide leaves set")
+        XCTAssertFalse(session.splitFocused)
+        XCTAssertNil(session.splitRatio)
+    }
+
+    func testCloseSplitReachesAHiddenPane() throws {
+        let session = try activeSession()
+        actions.toggleSplit()
+        actions.toggleSplit()
+        XCTAssertFalse(session.isSplit)
+        XCTAssertTrue(session.hasSplit)
+
+        actions.closeSplit()
+
+        XCTAssertFalse(session.hasSplit)
+    }
+
+    func testCloseSplitWithoutASplitLeavesEveryOtherSessionAlone() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let sibling = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        store.selectSession(sibling.id)
+        actions.toggleSplit()
+        let plain = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        store.selectSession(plain.id)
+
+        actions.closeSplit()
+
+        XCTAssertTrue(sibling.hasSplit, "the split belongs to another session and must survive")
+        XCTAssertNotNil(store.session(withID: plain.id), "an inert action must not remove the session")
+        XCTAssertEqual(store.selectedSessionID, plain.id)
+        XCTAssertFalse(plain.hasSplit)
+    }
+
+    func testShownScratchIsDismissedInsteadOfClosingTheSplit() throws {
+        let session = try activeSession()
+        actions.toggleSplit()
+        session.scratchActive = true
+
+        actions.closeSplit()
+
+        XCTAssertFalse(session.scratchActive, "the cover goes first, as it does for ⌘D and ⌘W")
+        XCTAssertTrue(session.hasSplit, "a live pane must not be destroyed behind a cover that hides it")
+    }
+
+    func testPressAfterTheScratchIsGoneClosesTheSplit() throws {
+        let session = try activeSession()
+        actions.toggleSplit()
+        session.scratchActive = true
+
+        actions.closeSplit()
+        actions.closeSplit()
+
+        XCTAssertFalse(session.scratchActive)
+        XCTAssertFalse(session.hasSplit)
+    }
+
+    func testFullOverlayMakesCloseSplitInert() throws {
+        let session = try activeSession()
+        actions.toggleSplit()
+        session.overlayActive = true
+        session.overlaySizePercent = nil
+
+        actions.closeSplit()
+
+        XCTAssertTrue(session.hasSplit, "the panes are invisible under a full overlay and must not be torn down")
     }
 }

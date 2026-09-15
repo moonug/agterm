@@ -19,7 +19,7 @@ public struct PendingPick: Equatable, Sendable {
     }
 }
 
-/// Owns the pending picker and the recently answered pickers for one window.
+/// Owns the window modal slot and retained pick results; AskRegistry retains ask results.
 @Observable
 @MainActor
 public final class PickController {
@@ -35,13 +35,23 @@ public final class PickController {
     public private(set) var pending: PendingPick?
     /// Terminal results in resolution order, oldest first, capped at `retainedResultLimit`.
     public private(set) var recentResults: [ResolvedPick] = []
+    /// The GUI ask currently awaiting an answer in this window.
+    public private(set) var pendingAsk: PendingAsk?
+    fileprivate var windowID: WindowInfo.ID?
+    /// Reserves the window modal slot for a pick or GUI ask.
+    public var modalPending: Bool { pending != nil || pendingAsk != nil }
+    /// pendingModalError names the modal blocking another control action, or nil when the slot is free.
+    public var pendingModalError: String? {
+        guard modalPending else { return nil }
+        return pendingAsk == nil ? "pick pending" : "ask pending"
+    }
 
     public init() {}
 
-    /// Opens `pick` unless another picker is already pending. Prior results stay readable by their own id.
+    /// open reserves the modal slot unless a pick or ask already owns it.
     @discardableResult
     public func open(_ pick: PendingPick) -> Bool {
-        guard pending == nil else { return false }
+        guard !modalPending else { return false }
         pending = pick
         return true
     }
@@ -70,9 +80,46 @@ public final class PickController {
         }
         return recentResults.last { $0.id == id }?.result
     }
+
+    /// openAsk reserves the modal slot unless a pick or ask already owns it.
+    @discardableResult
+    public func openAsk(_ ask: PendingAsk) -> Bool {
+        guard !modalPending else { return false }
+        pendingAsk = ask
+        return true
+    }
+
+    /// resolveAsk retains the outcome before releasing the modal slot.
+    public func resolveAsk(_ outcome: ControlAskResult) {
+        guard let pendingAsk else { return }
+        guard outcome.result != .pending else { return }
+        if let windowID, AskRegistry.shared.owner(for: pendingAsk.id) == .window(windowID) {
+            AskRegistry.shared.retain(id: pendingAsk.id, result: outcome, window: windowID)
+        }
+        self.pendingAsk = nil
+    }
+
+    /// cancelAsk cancels without synthesizing a named button answer.
+    public func cancelAsk() {
+        resolveAsk(ControlAskResult(result: .cancelled))
+    }
+
+    /// escapeAsk retains a user dismissal separately from administrative cancellation.
+    public func escapeAsk() {
+        resolveAsk(ControlAskResult(result: .escaped))
+    }
+
+    /// askResult returns the pending or retained outcome for an exact ask id.
+    public func askResult(for id: String) -> ControlAskResult? {
+        if pendingAsk?.id == id {
+            return ControlAskResult(result: .pending)
+        }
+        guard let windowID, let retained = AskRegistry.shared.result(for: id), retained.windowID == windowID else { return nil }
+        return retained.result
+    }
 }
 
-/// Maps each window to the picker controller rendered in that window.
+/// PickRegistry maps windows to their shared pick and ask controllers.
 @MainActor
 public final class PickRegistry {
     public static let shared = PickRegistry()
@@ -87,20 +134,23 @@ public final class PickRegistry {
     private init() {}
 
     public func register(_ id: WindowInfo.ID, controller: PickController) {
+        controller.windowID = id
         controllers[id] = controller
     }
 
-    /// Remove a window's live controller, cancelling a pending pick first and retaining its terminal
-    /// results so a control client whose next poll lands after window teardown can still read them.
+    /// unregister cancels pending modals and retains their outcomes for polls after window teardown.
     public func unregister(_ id: WindowInfo.ID) {
-        guard let controller = controllers.removeValue(forKey: id) else { return }
+        guard let controller = controllers[id] else { return }
         controller.cancel()
+        controller.cancelAsk()
+        controllers[id] = nil
         retainedResults.append(contentsOf: controller.recentResults.map { (windowID: id, pick: $0) })
-        guard retainedResults.count > Self.retainedResultLimit else { return }
-        // order by when each pick was ANSWERED before trimming: a window closing later arrives with a
-        // whole batch, and appending alone would evict a newer result an earlier-closing window held.
-        retainedResults.sort { $0.pick.sequence < $1.pick.sequence }
-        retainedResults.removeFirst(retainedResults.count - Self.retainedResultLimit)
+        if retainedResults.count > Self.retainedResultLimit {
+            // order by when each pick was ANSWERED before trimming: a window closing later arrives with a
+            // whole batch, and appending alone would evict a newer result an earlier-closing window held.
+            retainedResults.sort { $0.pick.sequence < $1.pick.sequence }
+            retainedResults.removeFirst(retainedResults.count - Self.retainedResultLimit)
+        }
     }
 
     public func controller(for id: WindowInfo.ID?) -> PickController? {

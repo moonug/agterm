@@ -31,6 +31,9 @@ struct DashboardView: View {
     let pillTextColor: Color
     /// False while a control picker is above the dashboard, so its key catcher cannot steal focus.
     let focusAllowed: Bool
+    /// Whether to restore the title-bar hairline the opaque backdrop covers. False in hidden toolbar mode,
+    /// which draws no such line and insets the overlay by nothing, so it would sit on the window's top edge.
+    let showsTopHairline: Bool
     /// A single click on a cell: the wiring flashes the active frame, then enters after a brief delay, so the
     /// click is visibly acknowledged before the grid closes.
     let onClick: (DashboardMember) -> Void
@@ -50,6 +53,15 @@ struct DashboardView: View {
     /// caption text opacity on an UNSELECTED cell, so the highlighted cell's name stands out.
     private static let unselectedCaptionTextOpacity: Double = 0.55
 
+    /// Puts the members' queued panes at the front of a paced launch, in grid order, releasing none: the
+    /// cells still fill one interval apart. Each pane ref resolves to the slot its cell hosts.
+    static func prioritizeSpawns(of members: [DashboardMember], in store: AppStore) {
+        GhosttySurfaceView.prioritizeSpawn(members.compactMap { member in
+            guard let session = store.session(withID: member.session) else { return nil }
+            return (member.surface == .split ? session.splitSurface : session.surface) as? GhosttySurfaceView
+        })
+    }
+
     var body: some View {
         let members = controller.members
         let (cols, rows) = DashboardLayout.grid(count: members.count)
@@ -63,14 +75,17 @@ struct DashboardView: View {
             }
         }
         .padding(Self.gridSpacing)
+        .onChange(of: members, initial: true) { Self.prioritizeSpawns(of: members, in: store) }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // an OPAQUE themed backdrop: the layer beneath (sidebar, add-buttons, deck) must not bleed through
         // the margins, deliberately dropping window translucency/blur. Not a black scrim — over the
         // translucent backing that read as near-black.
         .background(captionBackground)
-        // restores the hairline the opaque backdrop covers — the same 1px themed line `detailColumn` draws
-        // under the title bar.
-        .overlay(alignment: .top) { Rectangle().fill(highlightColor.opacity(0.1)).frame(height: 1) }
+        // restores the hairline the opaque backdrop covers, matching `WindowContentView.titlebarHairline`,
+        // which likewise draws nothing in hidden toolbar mode.
+        .overlay(alignment: .top) {
+            if showsTopHairline { Rectangle().fill(highlightColor.opacity(0.1)).frame(height: 1) }
+        }
         // behind the cells so it never intercepts their click hit targets.
         .background {
             DashboardKeyCatcher(
@@ -128,7 +143,8 @@ struct DashboardView: View {
                               lineWidth: isHighlighted ? Self.highlightLineWidth : 1)
         }
         // the caption rides the cell's BOTTOM frame line: an overlay OUTSIDE the clip, so its lower half
-        // survives. Layered AFTER the ring so the frame line never crosses the name.
+        // survives. Layered after the ring, and the pill paints its own opaque backing — ordering alone
+        // leaves the ring showing through a translucent fill.
         .overlay(alignment: .bottom) {
             caption(for: member, session: session, isHighlighted: isHighlighted)
                 .offset(y: Self.captionBottomOffset)
@@ -137,38 +153,23 @@ struct DashboardView: View {
 
     /// Hosts the member's OWN pane surface as a view-only `TerminalView`. The `.id` carries the hosted slot
     /// (`-dashboard-primary`/`-dashboard-split`), so a cell keyed to one pane never reuses the other's
-    /// representable, plus `surfaceToken` so a REPLACEMENT re-mounts the cell.
+    /// representable, plus the resolved occupant token so a REPLACEMENT re-mounts the cell.
     /// `isActive`/`deckVisible`/`reportsFocusChange` off and `viewOnly` on: the cell auto-focuses nothing,
-    /// is not a drop target, refuses first responder, and never mutates session focus state.
+    /// is not a drop target, refuses first responder, and never mutates session focus state. It remains on
+    /// screen because the grid still paints it.
     @ViewBuilder
     private func memberTerminal(for member: DashboardMember, session: Session) -> some View {
         if member.surface == .split {
             TerminalView(session: session, surfaceKeyPath: \.splitSurface, makeSurface: makeSplitSurface,
-                         isActive: false, deckVisible: false, reportsFocusChange: false, viewOnly: true)
-                .id("\(session.id.uuidString)-dashboard-split-\(surfaceToken(for: member, session: session))")
+                         isActive: false, deckVisible: false, reportsFocusChange: false, viewOnly: true,
+                         onScreen: true)
+                .id("\(session.id.uuidString)-dashboard-split-\(PaneHostIdentity.token(for: member.surface, in: session))")
         } else {
             TerminalView(session: session, surfaceKeyPath: \.surface, makeSurface: makeSurface,
-                         isActive: false, deckVisible: false, reportsFocusChange: false, viewOnly: true)
-                .id("\(session.id.uuidString)-dashboard-primary-\(surfaceToken(for: member, session: session))")
+                         isActive: false, deckVisible: false, reportsFocusChange: false, viewOnly: true,
+                         onScreen: true)
+                .id("\(session.id.uuidString)-dashboard-primary-\(PaneHostIdentity.token(for: member.surface, in: session))")
         }
-    }
-
-    /// A per-instance identity token for the member's resolved slot surface, folded into the cell `.id`; a
-    /// nil slot keeps a stable `"none"` suffix. When a shown session's PRIMARY shell exits,
-    /// `AppStore.closePrimaryPane` PROMOTES the split survivor into `session.surface` (a DIFFERENT instance)
-    /// and nils `splitSurface`. The surviving cell is `.primary` either way — reconcile drops a `.split`
-    /// cell that sits beside one, and `DashboardController.promoteSplitMember` rewrites a lone `.split`
-    /// cell (a grid built from `<id>:right`) into it rather than letting it be pruned;
-    /// `TerminalView.updateNSView` never re-resolves `session[keyPath:]`, so without the surface identity in
-    /// the id SwiftUI keeps hosting the torn-down old primary (a blank cell) while the live survivor stays
-    /// unhosted. `ObjectIdentifier` changes ONLY on a genuine swap, forcing a re-mount whose `makeNSView`
-    /// re-resolves the slot; it is STABLE across ordinary re-renders, so no spurious re-host invalidates the
-    /// Metal drawable and flickers. The slots are `@ObservationIgnored`, so the swap alone does not
-    /// re-render — the reconcile-driven `controller.members` change does.
-    private func surfaceToken(for member: DashboardMember, session: Session) -> String {
-        let surface = member.surface == .split ? session.splitSurface : session.surface
-        guard let surface else { return "none" }
-        return "\(ObjectIdentifier(surface as AnyObject))"
     }
 
     /// A small name chip on the cell's bottom-RIGHT frame line, with a pane marker for a split session's two
@@ -180,19 +181,21 @@ struct DashboardView: View {
             DashboardCaptionPill(text: session.displayName + paneIndicator(for: member, session: session),
                                  indicator: session.agentIndicator, isHighlighted: isHighlighted,
                                  idleFill: pillColor, idleText: pillTextColor,
-                                 unselectedTextOpacity: Self.unselectedCaptionTextOpacity)
+                                 unselectedTextOpacity: Self.unselectedCaptionTextOpacity,
+                                 backing: captionBackground)
         }
         .padding(.horizontal, 6)
         .allowsHitTesting(false)
     }
 
-    /// The caption's pane marker: `▶` for a split (right) cell, `◀` for the primary (left) cell of a SPLIT
-    /// session, nothing for a non-split session. It marks which pane the cell hosts, not that its sibling
-    /// is on the grid — a `<id>:left` request puts a lone `◀` cell up, which still says the session has
-    /// another pane you are not watching.
+    /// The caption's pane marker follows the session axis: right/left arrows or bottom/top arrows, and
+    /// nothing for a non-split session. It marks which pane the cell hosts, not that its sibling is on the
+    /// grid: a `<id>:left` request puts a lone `◀` cell up, which still says the session has another pane
+    /// you are not watching.
     private func paneIndicator(for member: DashboardMember, session: Session) -> String {
-        if member.surface == .split { return " ▶" }
-        return session.hasSplit ? " ◀" : ""
+        if member.surface == .split { return session.splitAxis == .topBottom ? " ▼" : " ▶" }
+        guard session.hasSplit else { return "" }
+        return session.splitAxis == .topBottom ? " ▲" : " ◀"
     }
 
     private func handleKey(_ key: DashboardKey) {
@@ -219,6 +222,9 @@ private struct DashboardCaptionPill: View {
     let idleFill: Color
     let idleText: Color
     let unselectedTextOpacity: Double
+    /// The opaque backing painted under the fill — the cell's own background, so a translucent fill never
+    /// lets the cell frame line show through the capsule.
+    let backing: Color
 
     /// peak opacity of the pulsing wash. Deep on purpose: on a large opaque capsule a shallow value reads as
     /// faint dimming rather than a blink (the small sidebar glyph needs less).
@@ -254,8 +260,14 @@ private struct DashboardCaptionPill: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background {
+                // `backing` under the fill: the idle fill falls back to a translucent wash on themes with no
+                // selection color, and the pill overhangs the cell's frame line, so a bare fill lets the
+                // highlight ring read through the capsule and cross the name.
                 Capsule()
-                    .fill(fill)
+                    .fill(backing)
+                    .overlay {
+                        Capsule().fill(fill)
+                    }
                     .overlay {
                         Capsule().fill(washColor)
                             .opacity(shouldAnimatePulse && pulsed ? Self.washPeakOpacity : 0)

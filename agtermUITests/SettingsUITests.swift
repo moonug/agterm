@@ -55,6 +55,31 @@ final class SettingsUITests: XCTestCase {
                       "turning notifications off should persist notificationsEnabled=false")
     }
 
+    func testStatusResetPickerPersists() throws {
+        let picker = settingsControl(tab: "Agent Status", control: "settings-status-clear")
+
+        picker.click()
+        let onEnter = app.menuItems["On Enter"]
+        XCTAssertTrue(onEnter.waitForExistence(timeout: 5), "the status-reset picker should offer 'On Enter'")
+        onEnter.click()
+        XCTAssertTrue(poll { self.settingsValue("statusReset") == "enter" },
+                      "selecting 'On Enter' should persist statusReset=enter to settings.json")
+
+        picker.click()
+        let disabled = app.menuItems["Disabled"]
+        XCTAssertTrue(disabled.waitForExistence(timeout: 5), "the status-reset picker should offer 'Disabled'")
+        disabled.click()
+        XCTAssertTrue(poll { self.settingsValue("statusReset") == "never" },
+                      "selecting 'Disabled' should persist statusReset=never to settings.json")
+
+        picker.click()
+        let firstKey = app.menuItems["On first key"]
+        XCTAssertTrue(firstKey.waitForExistence(timeout: 5), "the status-reset picker should offer 'On first key'")
+        firstKey.click()
+        XCTAssertTrue(poll { self.settingsObject()?["statusReset"] == nil },
+                      "the default 'On first key' should remove statusReset from settings.json")
+    }
+
     func testDockBouncePickerPersists() throws {
         let picker = settingsControl(tab: "Notifications", control: "settings-dock-bounce")
 
@@ -209,12 +234,69 @@ final class SettingsUITests: XCTestCase {
                       "selecting Normal should persist toolbarMode=normal to settings.json")
     }
 
-    func testRestoreRunningCommandTogglePersists() throws {
-        let toggle = settingsControl(tab: "General", control: "settings-restore-running-command")
-        toggle.click() // turn it on (default off)
+    func testCursorStyleAndBlinkPickersPersist() throws {
+        let picker = settingsControl(tab: "Appearance", control: "settings-cursor-style")
 
-        XCTAssertTrue(poll { self.settingsBool("restoreRunningCommand") == true },
-                      "turning restore-running-commands on should persist restoreRunningCommand=true")
+        picker.click()
+        let bar = app.menuItems["Bar"]
+        XCTAssertTrue(bar.waitForExistence(timeout: 5), "the cursor dropdown should offer a Bar item")
+        bar.click()
+        XCTAssertTrue(poll { self.settingsValue("cursorStyle") == "bar" },
+                      "selecting Bar should persist cursorStyle=bar to settings.json")
+
+        picker.click()
+        let shapeDefault = app.menuItems["Default"]
+        XCTAssertTrue(shapeDefault.waitForExistence(timeout: 5), "the cursor dropdown should offer a Default item")
+        shapeDefault.click()
+        XCTAssertTrue(poll { self.settingsObject()?["cursorStyle"] == nil },
+                      "selecting Default should remove the cursorStyle key from settings.json")
+
+        let blink = settingsControl(tab: "Appearance", control: "settings-cursor-blink")
+        blink.click()
+        let steady = app.menuItems["Steady"]
+        XCTAssertTrue(steady.waitForExistence(timeout: 5), "the blink dropdown should offer a Steady item")
+        steady.click()
+        XCTAssertTrue(poll { self.settingsBool("cursorBlink") == false },
+                      "selecting Steady should persist cursorBlink=false")
+
+        blink.click()
+        let blinkDefault = app.menuItems["Default"]
+        XCTAssertTrue(blinkDefault.waitForExistence(timeout: 5), "the blink dropdown should offer a Default item")
+        blinkDefault.click()
+        XCTAssertTrue(poll { self.settingsObject()?["cursorBlink"] == nil },
+                      "selecting Default should remove the cursorBlink key from settings.json")
+    }
+
+    func testQuickTerminalSizePickerPersists() throws {
+        let picker = settingsControl(tab: "Interface", control: "settings-quick-terminal-size")
+
+        picker.click()
+        let seventy = app.menuItems["70% of screen"]
+        XCTAssertTrue(seventy.waitForExistence(timeout: 5), "the size dropdown should offer a 70% item")
+        seventy.click()
+        XCTAssertTrue(poll { self.settingsDouble("quickTerminalSizePercent") == 70 },
+                      "selecting 70% should persist quickTerminalSizePercent=70 to settings.json")
+
+        picker.click()
+        let byDefault = app.menuItems["Default"]
+        XCTAssertTrue(byDefault.waitForExistence(timeout: 5), "the size dropdown should offer a Default item")
+        byDefault.click()
+        XCTAssertTrue(poll { self.settingsObject()?["quickTerminalSizePercent"] == nil },
+                      "selecting Default should remove the quickTerminalSizePercent key from settings.json")
+    }
+
+    func testRestoreModePickerPersists() throws {
+        let picker = settingsControl(tab: "General", control: "settings-restore-mode")
+        picker.click()
+        let live = app.menuItems["Live sessions"]
+        XCTAssertTrue(live.waitForExistence(timeout: 5), "the restore-mode picker should offer live sessions")
+        live.click()
+
+        XCTAssertTrue(poll { self.settingsValue("restoreMode") == "live" },
+                      "selecting live sessions should persist restoreMode=live")
+        XCTAssertNil(settingsObject()?["restoreRunningCommand"], "the legacy boolean must stay absent")
+        XCTAssertTrue(app.staticTexts["settings-restore-restart-hint"].exists,
+                      "the setting should say that a restart is required")
     }
 
     func testConfirmCloseSessionTogglePersists() throws {
@@ -262,6 +344,20 @@ final class SettingsUITests: XCTestCase {
         toggle.click()
         XCTAssertTrue(poll { self.settingsObject()?["hiddenInterfaceElements"] == nil },
                       "re-showing the last hidden element should remove hiddenInterfaceElements from settings.json")
+    }
+
+    func testCommandWClosesTheSettingsWindowNotTheSession() throws {
+        // #401: close_session owns ⌘W app-wide, so ⌘W over Settings reached the deck behind it.
+        app.typeKey("n", modifierFlags: .command)
+        XCTAssertTrue(poll { self.sessionRowCount() == 2 }, "⌘N should add a second session")
+
+        let control = settingsControl(tab: "General", control: "settings-confirm-close-session")
+
+        app.typeKey("w", modifierFlags: .command)
+
+        XCTAssertTrue(poll({ !control.exists }, timeout: 10), "⌘W should close the Settings window")
+        // both rows still readable is also the window-survival oracle: they render inside it.
+        XCTAssertEqual(sessionRowCount(), 2, "⌘W over Settings must leave the terminal sessions alone")
     }
 
     // MARK: - Helpers
@@ -316,6 +412,10 @@ final class SettingsUITests: XCTestCase {
             XCTAssertEqual(edge, wellLeadingEdges[0], accuracy: 1,
                            "the color wells should stack in one column (\(context))", file: file, line: line)
         }
+    }
+
+    private func sessionRowCount() -> Int {
+        app.staticTexts.matching(identifier: "session-row").count
     }
 
     private func poll(_ condition: () -> Bool, timeout: TimeInterval = 5) -> Bool {

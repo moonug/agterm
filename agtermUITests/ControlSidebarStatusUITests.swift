@@ -373,6 +373,29 @@ final class ControlSidebarStatusUITests: ControlAPITestCase {
                      "a background create must NOT widen the set — that reveal is the foreground path's job")
     }
 
+    func testSidebarWidthSetsEchoesAndReadsBackOnTree() throws {
+        XCTAssertTrue(app.staticTexts["session-row"].firstMatch.waitForExistence(timeout: 10), "seeded session row")
+
+        let set = try sendCommand(#"{"cmd":"sidebar.width","args":{"sidebarWidth":312.5}}"#)
+        XCTAssertEqual(set["ok"] as? Bool, true, "sidebar.width should succeed: \(set)")
+        let setResult = try XCTUnwrap(set["result"] as? [String: Any], "sidebar.width should carry a result")
+        XCTAssertEqual(setResult["sidebarWidth"] as? Double, 312.5, "the echo should report the stored width")
+
+        let tree = try sendCommand(#"{"cmd":"tree"}"#)
+        let result = try XCTUnwrap(tree["result"] as? [String: Any], "tree should carry a result")
+        let t = try XCTUnwrap(result["tree"] as? [String: Any], "result should carry a tree")
+        XCTAssertEqual(t["sidebarWidth"] as? Double, 312.5, "the tree should read back the width the command wrote")
+
+        // an out-of-range request answers ok, so the echo is the only thing that reports the clamp
+        let clamped = try sendCommand(#"{"cmd":"sidebar.width","args":{"sidebarWidth":9000}}"#)
+        XCTAssertEqual(clamped["ok"] as? Bool, true, "an out-of-range width should still succeed: \(clamped)")
+        let clampedResult = try XCTUnwrap(clamped["result"] as? [String: Any], "the clamped call should carry a result")
+        XCTAssertEqual(clampedResult["sidebarWidth"] as? Double, 560, "the echo should report the clamped bound")
+
+        let missing = try sendCommand(#"{"cmd":"sidebar.width"}"#)
+        XCTAssertEqual(missing["ok"] as? Bool, false, "a width-less sidebar.width should be refused: \(missing)")
+    }
+
     func testSidebarExpandCollapse() throws {
         XCTAssertTrue(app.staticTexts["session-row"].firstMatch.waitForExistence(timeout: 10), "seeded session row")
 
@@ -406,6 +429,85 @@ final class ControlSidebarStatusUITests: ControlAPITestCase {
         XCTAssertEqual(expand["ok"] as? Bool, true, "sidebar.expand should succeed: \(expand)")
         XCTAssertTrue(pollSessionRowCount(2, timeout: 10), "expand should restore every workspace's rows")
         XCTAssertTrue(sessionRowValueExists(containing: "hidden"), "the collapsed workspace's session should return")
+    }
+
+    func testWorkspaceGoStepsBetweenWorkspacesAndWraps() throws {
+        XCTAssertTrue(app.staticTexts["session-row"].firstMatch.waitForExistence(timeout: 10), "seeded session row")
+
+        let tree = try sendCommand(#"{"cmd":"tree"}"#)
+        let result = try XCTUnwrap(tree["result"] as? [String: Any], "tree should carry a result")
+        let t = try XCTUnwrap(result["tree"] as? [String: Any], "result should carry a tree")
+        let firstWs = try XCTUnwrap((t["workspaces"] as? [[String: Any]])?.first, "should have a workspace")
+        let firstWsID = try XCTUnwrap(firstWs["id"] as? String, "the workspace should carry an id")
+        let seededID = try XCTUnwrap((firstWs["sessions"] as? [[String: Any]])?.first?["id"] as? String, "seeded session")
+
+        let newWs = try sendCommand(#"{"cmd":"workspace.new","args":{"name":"second"}}"#)
+        let secondWsID = try XCTUnwrap((newWs["result"] as? [String: Any])?["id"] as? String, "workspace.new returns an id")
+        let created = try sendCommand(#"{"cmd":"session.new","args":{"workspace":"\#(secondWsID)"}}"#)
+        let secondSessID = try XCTUnwrap((created["result"] as? [String: Any])?["id"] as? String, "session.new returns an id")
+
+        XCTAssertEqual(try sendCommand(#"{"cmd":"session.select","target":"\#(seededID)"}"#)["ok"] as? Bool, true,
+                       "selecting the seeded session should succeed")
+
+        let next = try sendCommand(#"{"cmd":"workspace.go","args":{"to":"next"}}"#)
+        XCTAssertEqual(next["ok"] as? Bool, true, "workspace.go next should succeed: \(next)")
+        XCTAssertEqual((next["result"] as? [String: Any])?["id"] as? String, secondWsID, "it should land on the second workspace")
+        XCTAssertTrue(pollActiveSession(secondSessID, timeout: 10), "landing selects the target's first session")
+
+        // wrapping is what makes a repeated keystroke a cycle rather than a dead end at the last workspace
+        let wrapped = try sendCommand(#"{"cmd":"workspace.go","args":{"to":"next"}}"#)
+        XCTAssertEqual((wrapped["result"] as? [String: Any])?["id"] as? String, firstWsID, "next at the end wraps to the first")
+        XCTAssertTrue(pollActiveSession(seededID, timeout: 10), "the wrap selects the first workspace's first session")
+
+        let back = try sendCommand(#"{"cmd":"workspace.go","args":{"to":"prev"}}"#)
+        XCTAssertEqual((back["result"] as? [String: Any])?["id"] as? String, secondWsID, "prev at the start wraps to the last")
+
+        let bad = try sendCommand(#"{"cmd":"workspace.go","args":{"to":"sideways"}}"#)
+        XCTAssertEqual(bad["ok"] as? Bool, false, "an unknown direction is rejected")
+        XCTAssertEqual(bad["error"] as? String, "workspace.go requires --to next|prev")
+    }
+
+    // issue #435: collapsing a workspace must not steer navigation — the fold is a display state, so the
+    // step lands on the collapsed workspace exactly as it would on an open one
+    func testWorkspaceGoStepsIntoACollapsedWorkspace() throws {
+        XCTAssertTrue(app.staticTexts["session-row"].firstMatch.waitForExistence(timeout: 10), "seeded session row")
+
+        let tree = try sendCommand(#"{"cmd":"tree"}"#)
+        let result = try XCTUnwrap(tree["result"] as? [String: Any], "tree should carry a result")
+        let t = try XCTUnwrap(result["tree"] as? [String: Any], "result should carry a tree")
+        let firstWs = try XCTUnwrap((t["workspaces"] as? [[String: Any]])?.first, "should have a workspace")
+        let seededID = try XCTUnwrap((firstWs["sessions"] as? [[String: Any]])?.first?["id"] as? String, "seeded session")
+
+        let newWs = try sendCommand(#"{"cmd":"workspace.new","args":{"name":"folded"}}"#)
+        let foldedWsID = try XCTUnwrap((newWs["result"] as? [String: Any])?["id"] as? String, "workspace.new returns an id")
+        let created = try sendCommand(#"{"cmd":"session.new","args":{"workspace":"\#(foldedWsID)"}}"#)
+        let foldedSessID = try XCTUnwrap((created["result"] as? [String: Any])?["id"] as? String, "session.new returns an id")
+
+        XCTAssertEqual(try sendCommand(#"{"cmd":"session.select","target":"\#(seededID)"}"#)["ok"] as? Bool, true,
+                       "selecting the seeded session should succeed")
+        XCTAssertEqual(try sendCommand(#"{"cmd":"workspace.collapse","target":"\#(foldedWsID)"}"#)["ok"] as? Bool, true,
+                       "collapsing the second workspace should succeed")
+
+        let next = try sendCommand(#"{"cmd":"workspace.go","args":{"to":"next"}}"#)
+        XCTAssertEqual((next["result"] as? [String: Any])?["id"] as? String, foldedWsID, "a folded workspace is still stepped into")
+        XCTAssertTrue(pollActiveSession(foldedSessID, timeout: 10), "it selects the folded workspace's first session")
+    }
+
+    /// Polls `tree` until `sessionID` reports `active`. Selection lands through the store and the outline's
+    /// row sync, so an immediate read can race the step.
+    private func pollActiveSession(_ sessionID: String, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let tree = try? sendCommand(#"{"cmd":"tree"}"#),
+               let result = tree["result"] as? [String: Any],
+               let t = result["tree"] as? [String: Any],
+               let workspaces = t["workspaces"] as? [[String: Any]] {
+                let sessions = workspaces.flatMap { ($0["sessions"] as? [[String: Any]]) ?? [] }
+                if sessions.first(where: { $0["id"] as? String == sessionID })?["active"] as? Bool == true { return true }
+            }
+            usleep(200_000)
+        }
+        return false
     }
 
     /// Whether any `session-row` exposes `needle` in its accessibility value (the row's displayed name —
@@ -511,6 +613,32 @@ final class ControlSidebarStatusUITests: ControlAPITestCase {
         XCTAssertNil(node["statusShape"], "a status set without --shape should clear the shape read-back")
     }
 
+    func testSessionStatusChangedAtRefreshesOnEveryNonIdleSetAndClearsOnIdle() throws {
+        let seeded = try activeSessionID()
+
+        let first = try sendCommand(#"{"cmd":"session.status","target":"\#(seeded)","args":{"status":"active"}}"#)
+        XCTAssertEqual(first["ok"] as? Bool, true, "session.status active should succeed: \(first)")
+        var node = try sessionNode(id: seeded)
+        let stamped = try XCTUnwrap(node["statusChangedAt"] as? Double,
+                                    "a non-idle status should stamp the change time: \(node)")
+
+        // the stock hooks re-push `active` on every tool event, so an unchanged status must still move the
+        // stamp — that is what makes "now minus statusChangedAt" the agent's liveness rather than its last
+        // state change.
+        let again = try sendCommand(#"{"cmd":"session.status","target":"\#(seeded)","args":{"status":"active"}}"#)
+        XCTAssertEqual(again["ok"] as? Bool, true, "re-pushing the same status should succeed: \(again)")
+        node = try sessionNode(id: seeded)
+        let refreshed = try XCTUnwrap(node["statusChangedAt"] as? Double,
+                                      "the re-push should keep reporting a stamp: \(node)")
+        XCTAssertGreaterThan(refreshed, stamped, "an unchanged status must still refresh the stamp")
+
+        let cleared = try sendCommand(#"{"cmd":"session.status","target":"\#(seeded)","args":{"status":"idle"}}"#)
+        XCTAssertEqual(cleared["ok"] as? Bool, true, "session.status idle should succeed: \(cleared)")
+        node = try sessionNode(id: seeded)
+        XCTAssertNil(node["status"], "idle should clear the status read-back")
+        XCTAssertNil(node["statusChangedAt"], "idle draws no glyph, so it must report no change time")
+    }
+
     // there is no visibility gate: the icon shows on the selected session too.
     func testAgentStatusIconShowsRegardlessOfSelectionAndAutoResetClears() throws {
         let tree = try sendCommand(#"{"cmd":"tree"}"#)
@@ -548,8 +676,8 @@ final class ControlSidebarStatusUITests: ControlAPITestCase {
                       "visiting a completed --auto-reset session should clear its icon")
     }
 
-    // wired off GhosttySurfaceView.keyDown, so it MUST be a real keystroke: `session.type` calls
-    // ghostty_surface_key directly and bypasses keyDown.
+    // the keyboard path is wired off GhosttySurfaceView.keyDown, so this MUST be a real keystroke;
+    // `session.type` reaches the same clear through injectAsUserInput and is covered in PaneAwareStatusUITests.
     func testTypingClearsBlockedOrCompletedStatus() throws {
         let tree = try sendCommand(#"{"cmd":"tree"}"#)
         let treeResult = try XCTUnwrap(tree["result"] as? [String: Any], "tree should carry a result")

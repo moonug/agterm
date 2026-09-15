@@ -2,22 +2,29 @@ import Foundation
 
 extension ControlDispatcher {
     /// Validates host-free HUD arguments before the host measures the terminal font, writes the rendered
-    /// message file, and takes the session's overlay slot. Only text, color, percent, and position are
-    /// checked here; slot occupancy and sizing need the store and stay app-side.
+    /// message file, and takes the session's overlay slot. Text, color, percent, position, and pane spelling
+    /// are checked here; slot occupancy, pane identity, and sizing need the store and stay app-side.
     func dispatchHudCommand(_ request: ControlRequest) -> ControlResponse {
         if request.cmd == .sessionHudClose {
             return actions.closeHud(request.target, window: request.args?.window)
         }
         // open and update validate identically — an update replaces the whole spec — so only the effect differs
-        let post: (String?, String?, HudSpec) -> ControlResponse
+        let post: (String?, String?, HudSpec, ControlHudPlacement) -> ControlResponse
         switch request.cmd {
         case .sessionHudOpen: post = actions.openHud
         case .sessionHudUpdate: post = actions.updateHud
         default: preconditionFailure("dispatchHudCommand called for \(request.cmd.rawValue)")
         }
+        let pane: OverlayPane?
+        switch parsePane(request.args?.pane, error: "--pane must be left or right",
+                         parse: { OverlayPane(controlName: $0) }) {
+        case .pane(let parsed): pane = parsed
+        case .rejected(let response): return response
+        }
+        let placement = ControlHudPlacement(pane: pane, paneID: request.args?.paneID)
         switch parseHudSpec(request) {
         case .rejected(let response): return response
-        case .spec(let spec): return post(request.target, request.args?.window, spec)
+        case .spec(let spec): return post(request.target, request.args?.window, spec, placement)
         }
     }
 
@@ -51,15 +58,20 @@ extension ControlDispatcher {
         if let color = args?.color, !WatermarkConfig.isValidColorHex(color) {
             return .rejected(ControlResponse(ok: false, error: "invalid color: \(color) (#rrggbb)"))
         }
+        if let textColor = args?.textColor, !WatermarkConfig.isValidColorHex(textColor) {
+            return .rejected(ControlResponse(ok: false, error: "invalid text color: \(textColor) (#rrggbb)"))
+        }
         if let percent = args?.sizePercent, !(1...100).contains(percent) {
             return .rejected(ControlResponse(ok: false,
                                              error: "\(request.cmd.rawValue): --size-percent must be 1...100"))
         }
+        // `parse` takes the `top`/`bottom` aliases beside the nine anchors, and the rejection lists them for
+        // the same reason the spinner's does: naming only the canonical set would refuse values this accepts.
         var position = HudPosition.defaultPosition
         if let raw = args?.position {
-            guard let parsed = HudPosition(rawValue: raw) else {
+            guard let parsed = HudPosition.parse(raw) else {
                 return .rejected(ControlResponse(
-                    ok: false, error: "invalid position: \(raw) (\(HudPosition.validNamesList))"))
+                    ok: false, error: "invalid position: \(raw) (\(HudPosition.acceptedNamesList))"))
             }
             position = parsed
         }
@@ -74,6 +86,7 @@ extension ControlDispatcher {
             spinner = parsed
         }
         return .spec(HudSpec(message: message, detail: args?.detail, spinner: spinner,
-                             backgroundColor: args?.color, sizePercent: args?.sizePercent, position: position))
+                             backgroundColor: args?.color, textColor: args?.textColor,
+                             sizePercent: args?.sizePercent, position: position))
     }
 }

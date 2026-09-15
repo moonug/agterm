@@ -38,10 +38,37 @@ final class ControlHudUITests: ControlAPITestCase {
         XCTAssertEqual(defaulted["position"] as? String, "center",
                        "an omitted position must report its effective value, not be omitted")
 
-        try assertOK(openHud(message: "pinned to the top", position: "top"))
-        let requested = try XCTUnwrap(pollHud(session, message: "pinned to the top"),
+        try assertOK(openHud(message: "pinned to a corner", position: "top-right"))
+        let requested = try XCTUnwrap(pollHud(session, message: "pinned to a corner"),
                                       "a second hud should replace the first")
-        XCTAssertEqual(requested["position"] as? String, "top")
+        XCTAssertEqual(requested["position"] as? String, "top-right")
+
+        // the bare spelling is still accepted end to end, and normalizes to the anchor it names
+        try assertOK(openHud(message: "pinned by the alias", position: "top"))
+        let aliased = try XCTUnwrap(pollHud(session, message: "pinned by the alias"))
+        XCTAssertEqual(aliased["position"] as? String, "top-center",
+                       "an alias must read back as its canonical anchor, not as the spelling that was sent")
+    }
+
+    func testTextColorReadsBackAndAnUpdateRecolorsInPlace() throws {
+        let session = try activeSessionID()
+        try assertOK(openHud(message: "coloring", textColor: "#e0e0e0"))
+        let opened = try XCTUnwrap(pollHud(session, message: "coloring"))
+        XCTAssertEqual(opened["textColor"] as? String, "#e0e0e0")
+
+        try assertOK(sendCommand(request(command: "session.hud.update", target: session,
+                                         args: ["message": "recolored", "textColor": "#7ec07e"])))
+
+        let updated = try XCTUnwrap(pollHud(session, message: "recolored"))
+        XCTAssertEqual(updated["textColor"] as? String, "#7ec07e",
+                       "unlike the background, the text color tracks the latest update")
+    }
+
+    func testTextColorIsOmittedWhenTheCallerSetNone() throws {
+        let session = try activeSessionID()
+        try assertOK(openHud(message: "plain"))
+        let node = try XCTUnwrap(pollHud(session, message: "plain"))
+        XCTAssertNil(node["textColor"], "a panel on the terminal foreground reports no color")
     }
 
     func testHudUpdateRewritesTheReadBackInPlace() throws {
@@ -76,6 +103,34 @@ final class ControlHudUITests: ControlAPITestCase {
         let second = try sendCommand(request(command: "session.hud.close", target: session))
         XCTAssertEqual(second["ok"] as? Bool, false, "closing an absent hud should report it: \(second)")
         XCTAssertEqual(second["error"] as? String, "no hud")
+    }
+
+    func testPaneHudReadsBackItsTargetSurvivesHideAndClosesWithThePane() throws {
+        let session = try activeSessionID()
+        try assertOK(sendCommand(request(command: "session.split", target: session, args: ["mode": "on"])))
+        XCTAssertTrue(pollActiveSessionSplit(true, timeout: 10))
+        try assertOK(openHud(message: "split work", pane: "right"))
+        XCTAssertEqual(try XCTUnwrap(pollHud(session, message: "split work"))["pane"] as? String, "right")
+
+        try assertOK(sendCommand(request(command: "session.focus", target: session, args: ["pane": "left"])))
+        try assertOK(sendCommand(request(command: "session.split", target: session, args: ["mode": "off"])))
+        XCTAssertEqual(try XCTUnwrap(pollHud(session, message: "split work"))["pane"] as? String, "right")
+
+        try assertOK(sendCommand(request(command: "session.split.close", target: session)))
+        XCTAssertTrue(poll(until: hudNode(session) == nil, timeout: 10))
+    }
+
+    func testHudPaneIDOverridesTheRoleAndFollowsItsShellThroughSwap() throws {
+        let session = try activeSessionID()
+        try assertOK(sendCommand(request(command: "session.split", target: session, args: ["mode": "on"])))
+        XCTAssertTrue(pollActiveSessionSplit(true, timeout: 10))
+        let rightToken = try readPaneToken(target: session, pane: "right")
+
+        try assertOK(openHud(message: "right agent", pane: "left", paneID: rightToken))
+        XCTAssertEqual(try XCTUnwrap(pollHud(session, message: "right agent"))["pane"] as? String, "right")
+
+        try assertOK(sendCommand(request(command: "session.swap", target: session)))
+        XCTAssertTrue(poll(until: self.hudNode(session)?["pane"] as? String == "left", timeout: 10))
     }
 
     /// THE defining property, and the only place it can be observed: with a HUD up — and after a click on
@@ -126,12 +181,17 @@ final class ControlHudUITests: ControlAPITestCase {
     // MARK: - Helpers
 
     private func openHud(message: String, detail: String? = nil, spinner: String? = nil,
-                         position: String? = nil, sizePercent: Int? = nil) throws -> [String: Any] {
+                         position: String? = nil, textColor: String? = nil,
+                         sizePercent: Int? = nil, pane: String? = nil,
+                         paneID: String? = nil) throws -> [String: Any] {
         var args: [String: Any] = ["message": message]
         if let detail { args["detail"] = detail }
         if let spinner { args["spinner"] = spinner }
         if let position { args["position"] = position }
+        if let textColor { args["textColor"] = textColor }
         if let sizePercent { args["sizePercent"] = sizePercent }
+        if let pane { args["pane"] = pane }
+        if let paneID { args["paneID"] = paneID }
         return try sendCommand(request(command: "session.hud.open", args: args))
     }
 
@@ -164,6 +224,20 @@ final class ControlHudUITests: ControlAPITestCase {
             RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         } while Date() < deadline
         return nil
+    }
+
+    private func readPaneToken(target: String, pane: String) throws -> String {
+        let tag = "HUD-\(UUID().uuidString.prefix(8))"
+        let needle = "\(tag)-42["
+        let buffer = try pollPaneText(target: target, pane: pane, contains: needle, retype: {
+            _ = try self.sendCommand(self.typeRequest(
+                text: "printf '\(tag)-%s[%s]\\n' \"$((6*7))\" \"$AGTERM_PANE_ID\"\n",
+                target: target, select: false, pane: pane))
+        })
+        let text = try XCTUnwrap(buffer)
+        let regex = try NSRegularExpression(pattern: NSRegularExpression.escapedPattern(for: needle) + "([-0-9A-Fa-f]+)\\]")
+        let match = try XCTUnwrap(regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)))
+        return String(text[try XCTUnwrap(Range(match.range(at: 1), in: text))])
     }
 
     private func request(command: String, target: String? = nil, args: [String: Any]? = nil) -> String {

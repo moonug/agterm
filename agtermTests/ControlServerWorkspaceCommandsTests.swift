@@ -22,6 +22,7 @@ final class ControlServerWorkspaceCommandsTests: XCTestCase {
                 library: library,
                 actions: actions,
                 settingsModel: SettingsModel(library: library, settingsStore: SettingsStore(directory: stateDir)),
+                identity: AppIdentity(version: "9.9.9", commit: "testsha"),
                 socketPath: stateDir.appendingPathComponent("control.sock").path
             )
         }
@@ -55,6 +56,19 @@ final class ControlServerWorkspaceCommandsTests: XCTestCase {
         XCTAssertEqual(response.result?.id, owner.uuidString)
         XCTAssertEqual(store.selectedSessionID, session.id)
         XCTAssertEqual(store.currentWorkspaceID, owner)
+    }
+
+    // both projections must be the SAME injected identity, not two independent bundle reads
+    func testVersionAndTreeReportTheInjectedIdentity() throws {
+        let injected = AppIdentity(version: "9.9.9", commit: "testsha")
+
+        let version = server.appIdentity()
+        XCTAssertTrue(version.ok, version.error ?? "")
+        XCTAssertEqual(version.result?.app, injected)
+
+        let tree = server.controlTree(window: nil)
+        XCTAssertTrue(tree.ok, tree.error ?? "")
+        XCTAssertEqual(tree.result?.tree?.app, injected)
     }
 
     func testSelectingAnEmptyWorkspaceReportsAndTargetsIt() throws {

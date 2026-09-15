@@ -6,57 +6,18 @@ import SwiftUI
 /// Owns the title text (session / window name, gated by the Interface toggles), the row layout, and the
 /// per-session chrome buttons; recent-sessions / attention / dashboard buttons live in their own extensions.
 extension WindowContentView {
-    /// The titlebar title (first line): the active session's display name, suffixed as "session — window" for
-    /// a custom (user-set) window name; auto "window N" names are omitted, and "Agterm" when nothing is
-    /// selected. Non-private: the body's `WindowAccessor` uses it as the OS window title, always the real
-    /// name, regardless of the Interface toggles that gate only the on-screen `titleText`.
-    var windowTitle: String {
-        let session = store.activeSession?.displayName ?? "Agterm"
-        guard let name = customWindowName else { return session }
-        return "\(session) — \(name)"
+    /// The window title at the terminal's leading edge, shared with the zoom titlebar. A child view, so its
+    /// session-name reads register on its own body and an OSC title tick never invalidates this one (#516).
+    var titleLabel: TitlebarLabel {
+        TitlebarLabel(store: store, library: library, windowID: windowID, toolbarMode: toolbarMode,
+                      chromeText: chromeText, showsSessionName: shows(.sessionName),
+                      showsWindowName: shows(.windowName), showsContext: shows(.sessionContext),
+                      showsRemoteHost: shows(.remoteHost))
     }
 
-    /// The titlebar subtitle (second line): the focused pane's `subtitleDetail` — the terminal title for a
-    /// remote (SSH) session whose local cwd is stale, else its cwd. Normal mode only; compact/hidden drop it.
-    private var windowSubtitle: String {
-        toolbarMode == .normal ? (store.activeSession?.subtitleDetail ?? "") : ""
-    }
-
-    /// The window's user-set name, or nil when it has none (an auto "window N" name). Feeds the optional
-    /// window-name part of `titleText`.
-    private var customWindowName: String? {
-        guard let info = library.windows.first(where: { $0.id == windowID }), info.hasCustomName else { return nil }
-        return info.name
-    }
-
-    /// The VISIBLE title-bar label, honoring the Interface toggles: the session name (hidden by `.sessionName`),
-    /// the custom window name (hidden by `.windowName`), or both as "session — window"; empty when both are
-    /// hidden or absent. `windowTitle` still feeds the OS title, so Mission Control / Window stay labelled.
-    private var titleText: String {
-        let sessionPart = shows(.sessionName) ? (store.activeSession?.displayName ?? "Agterm") : nil
-        let windowPart = shows(.windowName) ? customWindowName : nil
-        switch (sessionPart, windowPart) {
-        case let (session?, window?): return "\(session) — \(window)"
-        case let (session?, nil): return session
-        case let (nil, window?): return window
-        case (nil, nil): return ""
-        }
-    }
-
-    /// The window title at the terminal's leading edge: the gated session/window name, plus the cwd subtitle
-    /// on a second line in normal mode only (compact drops it for one short row). Non-private so the zoom
-    /// titlebar reuses it — a zoomed terminal shows the same title as the normal window.
-    var titleLabel: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            if !titleText.isEmpty {
-                Text(titleText).fontWeight(.semibold)
-            }
-            if !windowSubtitle.isEmpty {
-                Text(windowSubtitle)
-                    .font(.caption)
-                    .foregroundStyle(chromeText.opacity(0.6))
-            }
-        }
+    /// Feeds the OS window title to `WindowAccessor` from its own body, for the same reason as `titleLabel`.
+    var windowTitleSync: WindowTitleSync {
+        WindowTitleSync(store: store, library: library, windowID: windowID, captureOnExit: captureOnExit)
     }
 
     /// The window chrome above the terminal: the full custom titlebar row, or in hidden mode an invisible ~3px
@@ -81,8 +42,8 @@ extension WindowContentView {
 
     /// Custom titlebar row replacing the system toolbar: the sidebar toggle pinned to the sidebar's trailing
     /// edge (by the divider), the title at the terminal's start, and the trailing cluster (recent-sessions /
-    /// attention popovers, divider, scratch / split controls, divider, dashboard / quick terminal). Positions
-    /// track `sidebarWidth`; the left inset clears the system traffic lights.
+    /// attention popovers, divider, scratch / split controls, divider, dashboard / quick terminal / custom
+    /// commands). Positions track `sidebarWidth`; the left inset clears the system traffic lights.
     private var titlebarRow: some View {
         HStack(spacing: 0) {
             Color.clear.frame(width: 78).allowsHitTesting(false) // system traffic lights
@@ -126,9 +87,10 @@ extension WindowContentView {
     }
 
     /// The title bar's trailing action cluster, each button gated by its Interface toggle: recent-sessions /
-    /// attention popovers, per-session scratch / split controls, window-overlay dashboard / quick terminal.
-    /// A separator sits ONLY where two groups that each still show 2+ buttons meet, so a group reduced to one
-    /// button flows in unbracketed and an empty group lets its neighbors meet directly.
+    /// attention popovers, per-session scratch / split controls, window-overlay dashboard / quick terminal
+    /// and the custom-commands popover. A separator sits ONLY where two groups that each still show 2+
+    /// buttons meet, so a group reduced to one button flows in unbracketed and an empty group lets its
+    /// neighbors meet directly.
     private var titlebarTrailingActions: some View {
         let showRecent = shows(.recentSessions)
         let showAttention = attentionButtonEnabled // the bell keeps its own separate Notifications setting
@@ -136,9 +98,10 @@ extension WindowContentView {
         let showSplit = shows(.split)
         let showDashboard = shows(.dashboard)
         let showQuick = shows(.quickTerminal)
+        let showCustom = shows(.customCommands)
         let countA = (showRecent ? 1 : 0) + (showAttention ? 1 : 0)
         let countB = (showScratch ? 1 : 0) + (showSplit ? 1 : 0)
-        let countC = (showDashboard ? 1 : 0) + (showQuick ? 1 : 0)
+        let countC = (showDashboard ? 1 : 0) + (showQuick ? 1 : 0) + (showCustom ? 1 : 0)
         // a separator only between two 2+-button groups (the host-free rule, unit-tested in agtermCore).
         let dividers = InterfaceElement.titlebarGroupDividers(countA: countA, countB: countB, countC: countC)
         return HStack(spacing: 14) {
@@ -150,6 +113,7 @@ extension WindowContentView {
             if dividers.afterB { titlebarDivider }
             if showDashboard { dashboardButton.labelStyle(.iconOnly) }
             if showQuick { quickTerminalButton.labelStyle(.iconOnly) }
+            if showCustom { customCommandsButton.labelStyle(.iconOnly) }
         }
         .padding(.trailing, 14)
     }
@@ -174,28 +138,33 @@ extension WindowContentView {
         let isSplit = store.activeSession?.isSplit ?? false
         let hasSplit = store.activeSession?.hasSplit ?? false
         let splitFocused = store.activeSession?.splitFocused ?? false
+        let axis = store.activeSession?.splitAxis ?? .leftRight
+        let shortcutAction: BuiltinAction = axis == .topBottom ? .toggleHorizontalSplit : .toggleSplit
         // filled = pane visible, outline = hidden: no split is an empty two-pane outline, a shown split fills
-        // both, a collapsed one (hasSplit, not shown) fills only the visible half — left for the primary, right
-        // for the split (`splitFocused` is the shown pane when hidden) — naming the pane up and the one parked.
-        // `a11y` mirrors the four states for XCUITest, which can't read the symbol name.
+        // both, and a collapsed one fills the visible leading or trailing half on the current axis.
+        // `splitFocused` identifies that visible pane. `a11y` mirrors all seven states for XCUITest, which
+        // cannot read the symbol name: none, both, both-horizontal, left, right, top, and bottom.
         let symbol: String
         let a11y: String
         if !hasSplit {
             symbol = "rectangle.split.2x1"; a11y = "none"
         } else if isSplit {
-            symbol = "rectangle.split.2x1.fill"; a11y = "both"
+            symbol = axis == .topBottom ? "rectangle.split.1x2.fill" : "rectangle.split.2x1.fill"
+            a11y = axis == .topBottom ? "both-horizontal" : "both"
         } else if splitFocused {
-            symbol = "rectangle.righthalf.filled"; a11y = "right"
+            symbol = axis == .topBottom ? "rectangle.bottomhalf.filled" : "rectangle.righthalf.filled"
+            a11y = axis == .topBottom ? "bottom" : "right"
         } else {
-            symbol = "rectangle.lefthalf.filled"; a11y = "left"
+            symbol = axis == .topBottom ? "rectangle.tophalf.filled" : "rectangle.lefthalf.filled"
+            a11y = axis == .topBottom ? "top" : "left"
         }
         return Button {
-            actions.toggleSplit()
+            actions.toggleCurrentSplit()
         } label: {
             // a Label (icon + title) so the toolbar's "Icon and Text" mode has text; hidden in icon-only mode.
             Label("Split", systemImage: symbol)
         }
-        .help(helpHint(isSplit ? "Hide split" : (hasSplit ? "Show split" : "Split right"), .toggleSplit))
+        .help(helpHint(isSplit ? "Hide split" : (hasSplit ? "Show split" : "Split right"), shortcutAction))
         .disabled(store.activeSession == nil)
         .accessibilityValue(a11y)
         .accessibilityIdentifier("split-toggle")
@@ -224,7 +193,110 @@ extension WindowContentView {
             Label("Quick Terminal", systemImage: "terminal")
         }
         .help(helpHint("Quick Terminal", .quickTerminal))
-        .disabled(pick.pending != nil)
+        .disabled(pick.modalPending)
         .accessibilityIdentifier("quick-terminal-toggle")
+    }
+}
+
+/// The OS window title: the active session's display name, suffixed as "session — window" for a custom
+/// (user-set) window name; auto "window N" names are omitted, and "Agterm" when nothing is selected. Always
+/// the real name, regardless of the Interface toggles that gate only the on-screen `TitlebarLabel`, so
+/// Mission Control and the Window menu stay labelled.
+struct WindowTitleSync: View {
+    let store: AppStore
+    let library: WindowLibrary
+    let windowID: WindowInfo.ID
+    let captureOnExit: AppDelegate.ExitCapture?
+
+    var body: some View {
+        WindowAccessor(titleToken: title, windowID: windowID, library: library, store: store,
+                       captureOnExit: captureOnExit)
+    }
+
+    private var title: String {
+        let session = store.activeSession?.displayName ?? "Agterm"
+        guard let name = library.customWindowName(for: windowID) else { return session }
+        return "\(session) — \(name)"
+    }
+}
+
+/// Both title-bar lines: the session / window name, and in normal mode the session's `context` when one is
+/// set and shown, else the focused pane's `subtitleDetail`. The Interface toggles are resolved into `Parts`
+/// here, so `TitlebarComposition` never sees the settings.
+struct TitlebarLabel: View {
+    let store: AppStore
+    let library: WindowLibrary
+    let windowID: WindowInfo.ID
+    let toolbarMode: ToolbarMode
+    let chromeText: Color
+    let showsSessionName: Bool
+    let showsWindowName: Bool
+    let showsContext: Bool
+    let showsRemoteHost: Bool
+
+    var body: some View {
+        let composition = composition
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: 0) {
+                if !composition.title.isEmpty {
+                    Text(composition.title).fontWeight(.semibold)
+                        .layoutPriority(1)
+                }
+                if let host = composition.host {
+                    HStack(spacing: 4) {
+                        Image(systemName: "cloud")
+                            .fixedSize()
+                            .accessibilityHidden(true)
+                        RemoteHostTextLayout {
+                            Text(verbatim: host)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    .foregroundStyle(chromeText.opacity(0.6))
+                    .padding(.leading, composition.title.isEmpty ? 0 : 6)
+                    .layoutPriority(1)
+                }
+                if !composition.tail.isEmpty {
+                    Text(composition.tail).fontWeight(.semibold)
+                }
+            }
+            if !composition.subtitle.isEmpty {
+                Text(composition.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(chromeText.opacity(0.6))
+            }
+        }
+        // a caller-set context can run to 256 bytes, far past the row; tail truncation drops its end rather
+        // than letting the label push the trailing button cluster off the bar. the host truncates in the
+        // MIDDLE under its own ceiling instead, so an ssh target retains both of its ends.
+        .lineLimit(1)
+        .truncationMode(.tail)
+    }
+
+    private var composition: TitlebarComposition {
+        TitlebarComposition.compose(
+            TitlebarComposition.Parts(
+                sessionName: showsSessionName ? (store.activeSession?.displayName ?? "Agterm") : nil,
+                windowName: showsWindowName ? library.customWindowName(for: windowID) : nil,
+                context: showsContext ? store.activeSession?.context : nil,
+                detail: store.activeSession?.subtitleDetail ?? "",
+                remoteHost: showsRemoteHost ? store.activeSession?.remoteHost : nil
+            ),
+            mode: toolbarMode
+        )
+    }
+}
+
+/// Caps the host without expanding short names or preventing compression beside the sidebar.
+private struct RemoteHostTextLayout: Layout {
+    static let ceiling: CGFloat = 240
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = min(proposal.width ?? Self.ceiling, Self.ceiling)
+        return subviews[0].sizeThatFits(ProposedViewSize(width: width, height: proposal.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews[0].place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
     }
 }

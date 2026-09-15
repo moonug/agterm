@@ -18,6 +18,10 @@ extension GhosttySurfaceView {
     @discardableResult
     func inject(text: String) -> Bool {
         guard let surface else { return false }
+        // automation must not type underneath a live IME composition: it would survive the injected
+        // keystrokes and re-commit on the user's next one, landing their half-typed word after the
+        // injected text. No-op unless THIS pane is composing (see `commitOrDiscardComposition`).
+        commitOrDiscardComposition()
         for segment in KeystrokeSegments.split(text) {
             switch segment {
             case let .text(segment):
@@ -34,6 +38,20 @@ extension GhosttySurfaceView {
         return true
     }
 
+    /// `inject` plus the pane-scoped status clear `keyDown` fires, for `session.type`: the input a blocked
+    /// agent was waiting for has arrived, so the glyph must not outlive it. The text classifies as a submit
+    /// when it carries a newline and plain typing otherwise, never as the Escape/Ctrl-C interrupt that clears
+    /// an ACTIVE glyph, like the AX insert. It deliberately
+    /// does NOT fire `onUserInput`, unlike dictation: that stamps the user as present and holds off auto-follow,
+    /// which a script typing into a background pane must not do. Empty text queues no keystrokes yet still
+    /// returns true, so it clears nothing.
+    @discardableResult
+    func injectAsUserInput(text: String) -> Bool {
+        guard inject(text: text) else { return false }
+        if !text.isEmpty { onUserInputClearsStatus?(InterruptKeystroke.classify(text: text)) }
+        return true
+    }
+
     /// Inserts `text` as a bracketed paste — the drag-drop path. Unlike `inject(text:)`, this routes through
     /// `ghostty_surface_text`, whose bracketed-paste wrapping makes the program treat the whole payload as
     /// literal text, so a dropped multi-line selection lands at the cursor without auto-submitting — like ⌘V,
@@ -42,6 +60,10 @@ extension GhosttySurfaceView {
     /// copied synchronously; a no-op when the surface is not created yet.
     func insertPasted(text: String) {
         guard let surface, !text.isEmpty else { return }
+        // same reason as `inject`: a drop (or an AX control-character insert) landing under a live
+        // composition leaves it to re-commit on the next keystroke. Committing first is what AppKit does
+        // when a field gives up a composition. No-op unless THIS pane is composing.
+        commitOrDiscardComposition()
         text.withCString { ghostty_surface_text(surface, $0, UInt(text.utf8.count)) }
     }
 
@@ -86,6 +108,57 @@ extension GhosttySurfaceView {
             rows.removeLast()
         }
         return rows.suffix(n).joined(separator: "\n")
+    }
+
+    /// This surface's zero-based cursor COLUMN (`surface.cursor`), nil when the surface is not created or
+    /// the geometry cannot be trusted. Row is deliberately absent: see the type comment on `ControlCursor`.
+    ///
+    /// libghostty exports no cursor accessor, so the column is solved for. `ghostty_surface_ime_point`
+    /// reports the cursor cell's horizontal MIDPOINT as
+    /// `(column * cellWidth + paddingLeft + cellWidth / 2) / contentScale`, and the padding term is the
+    /// unknown — `ghostty_surface_size` carries no padding, agterm's default comes from
+    /// `Resources/ghostty-defaults.conf`, and a user `ghostty.conf` may override it untracked (the same
+    /// hazard `Hud.swift` documents for its own column math). Reading the viewport's top-left cell MEASURES
+    /// it instead: `ghostty_text_s.tl_px_x` is `(column * cellWidth + paddingLeft) / contentScale` for the
+    /// selected cell, so at column zero it is exactly the padding term in the same units, and subtracting
+    /// leaves `column + 0.5` cells. That holds under asymmetric padding and every padding-balance mode
+    /// because neither side is derived.
+    ///
+    /// The libghostty calls each take the renderer lock separately, so geometry changing between them —
+    /// a font-size change or a resize — would mix two coordinate systems. The grid is re-read afterwards and
+    /// a change abandons the reading. Padding is not re-checked because it cannot move under a live surface:
+    /// libghostty derives it at first layout only, which is why `window-padding-*` needs a new pane. This is
+    /// still an instantaneous sample, not a lock over the three calls.
+    func readCursorColumn() -> Int? {
+        guard let surface else { return nil }
+        var sel = ghostty_selection_s()
+        let origin = ghostty_point_s(tag: GHOSTTY_POINT_VIEWPORT, coord: GHOSTTY_POINT_COORD_EXACT, x: 0, y: 0)
+        sel.top_left = origin
+        sel.bottom_right = origin
+        sel.rectangle = false
+        var probe = ghostty_text_s()
+        guard ghostty_surface_read_text(surface, sel, &probe) else { return nil }
+        let columnZeroX = probe.tl_px_x
+        ghostty_surface_free_text(surface, &probe)
+        // libghostty reports -1 for a cell it could not place; the viewport's own top-left should always
+        // resolve, so treat it as a failed calibration rather than clamping to a padding of zero.
+        guard columnZeroX >= 0 else { return nil }
+
+        let size = ghostty_surface_size(surface)
+        guard size.cell_width_px > 0, size.cell_height_px > 0, size.columns > 0 else { return nil }
+
+        var x = 0.0, y = 0.0, w = 0.0, h = 0.0
+        ghostty_surface_ime_point(surface, &x, &y, &w, &h)
+        let after = ghostty_surface_size(surface)
+        guard after.cell_width_px == size.cell_width_px, after.cell_height_px == size.cell_height_px,
+              after.columns == size.columns else { return nil }
+        // `h` is one cell height over the content scale libghostty retains, the divisor behind `x` and `tl_px_x`
+        // too. agterm hands it equal X/Y scales, so `h` recovers the logical cell width without a window.
+        guard h > 0, h.isFinite else { return nil }
+        let cellWidth = h * Double(size.cell_width_px) / Double(size.cell_height_px)
+        let column = Int(((x - columnZeroX) / cellWidth).rounded(.down))
+        guard column >= 0, column < Int(size.columns) else { return nil }
+        return column
     }
 
     /// This surface's foreground process pid (`ghostty_surface_foreground_pid`), nil when the surface is not

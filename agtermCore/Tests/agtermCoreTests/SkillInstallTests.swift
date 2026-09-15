@@ -23,7 +23,7 @@ struct SkillInstallTests {
         let reference = try String(contentsOf: skillDirectory.appendingPathComponent("reference.md"), encoding: .utf8)
         let examples = try String(contentsOf: skillDirectory.appendingPathComponent("examples.md"), encoding: .utf8)
 
-        #expect(skill.contains("Command summary (74 commands)"))
+        #expect(skill.contains("## Command summary"))
         #expect(skill.contains("`keymap list`"))
         #expect(reference.contains("`agtermctl keymap list`"))
         #expect(examples.contains("agtermctl keymap list"))
@@ -63,7 +63,8 @@ struct SkillInstallTests {
         #expect(codexPlugin["name"] as? String == SkillInstall.skillName)
 
         let skill = repository.appendingPathComponent("\(pluginRoot)/\(skillLeaf)")
-        for file in ["SKILL.md", "reference.md", "examples.md", "troubleshooting.md", "scripts/show-image.sh"] {
+        for file in ["SKILL.md", "reference.md", "examples.md", "cookbook.md", "troubleshooting.md",
+                     "scripts/show-image.sh"] {
             #expect(FileManager.default.fileExists(atPath: skill.appendingPathComponent(file).path),
                     "missing \(file) in \(pluginRoot)/\(skillLeaf)")
         }

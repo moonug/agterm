@@ -88,6 +88,41 @@ struct CommandRestoreTests {
         #expect(!CommandRestore.isIdleShell(argv: []))
     }
 
+    @Test func paneForegroundNamesTheForegroundShellAndStripsTheLoginDash() {
+        #expect(CommandRestore.paneForeground(argv: ["-zsh"]) == .foregroundShell("zsh"))
+        #expect(CommandRestore.paneForeground(argv: ["-/bin/zsh"]) == .foregroundShell("zsh"))
+        #expect(CommandRestore.paneForeground(argv: ["/bin/zsh"]) == .foregroundShell("zsh"))
+        #expect(CommandRestore.paneForeground(argv: ["zsh", "-i", "-l"]) == .foregroundShell("zsh"))
+        #expect(CommandRestore.paneForeground(argv: ["fish"]) == .foregroundShell("fish"))
+        #expect(CommandRestore.paneForeground(argv: ["-nu"], extra: "nu") == .foregroundShell("nu"))
+        #expect(CommandRestore.paneForeground(argv: []) == nil)
+    }
+
+    @Test func paneForegroundCannotSeeAShellBusyInsideItself() {
+        // pins the contract, not a defect: `read`, `vared` and a shell loop all run IN the shell, so argv is still
+        // the shell's and a pane blocked on input classifies exactly as one at a prompt. Callers are told
+        // foregroundShell is never permission to type; if this ever stops matching, that promise moved.
+        #expect(CommandRestore.paneForeground(argv: ["-zsh"]) == .foregroundShell("zsh"))
+        #expect(CommandRestore.paneForeground(argv: ["-bash"]) == .foregroundShell("bash"))
+    }
+
+    @Test func paneForegroundReportsProgramsIncludingUnrecognizedShells() {
+        #expect(CommandRestore.paneForeground(argv: ["htop"]) == .program(["htop"]))
+        #expect(CommandRestore.paneForeground(argv: ["-sleep", "5"]) == .program(["sleep", "5"]))
+        #expect(CommandRestore.paneForeground(argv: ["/bin/sh", "/usr/local/bin/cld"])
+            == .program(["/bin/sh", "/usr/local/bin/cld"]))
+        #expect(CommandRestore.paneForeground(argv: ["bash", "-c", "echo hi"]) == .program(["bash", "-c", "echo hi"]))
+        // a shell in neither knownShells nor $SHELL is not recognized, so it reports as any program does.
+        #expect(CommandRestore.paneForeground(argv: ["nu"]) == .program(["nu"]))
+    }
+
+    @Test func paneForegroundProjectsOneCasePerTreeField() {
+        #expect(CommandRestore.paneForeground(argv: ["-zsh"])?.command == nil)
+        #expect(CommandRestore.paneForeground(argv: ["-zsh"])?.shellName == "zsh")
+        #expect(CommandRestore.paneForeground(argv: ["htop"])?.command == ["htop"])
+        #expect(CommandRestore.paneForeground(argv: ["htop"])?.shellName == nil)
+    }
+
     @Test func shouldRestoreSkipsDenylistByBasename() {
         let denylist: Set<String> = ["vim", "tmux", "hx"]
         #expect(CommandRestore.shouldRestore(argv: ["ssh", "gate"], denylist: denylist))
@@ -101,6 +136,57 @@ struct CommandRestoreTests {
         #expect(CommandRestore.shouldRestore(argv: ["vim", "x"], denylist: []))
         #expect(!CommandRestore.shouldRestore(argv: [], denylist: denylist))
         #expect(!CommandRestore.shouldRestore(argv: [""], denylist: denylist))
+    }
+
+    @Test func shouldRestoreRefusesControlCharacters() {
+        // #454: the rendered line is typed, so a control byte reaches the line editor as an editing
+        // command — 0x15 kills the line and runs whatever follows it.
+        #expect(!CommandRestore.shouldRestore(argv: ["sed", "s/\u{1B}//"], denylist: []))
+        #expect(!CommandRestore.shouldRestore(argv: ["awk", "-F", "\u{09}", "{print $2}"], denylist: []))
+        #expect(!CommandRestore.shouldRestore(argv: ["grep", "a\u{15}b"], denylist: []))
+        #expect(!CommandRestore.shouldRestore(argv: ["grep", "a\u{0A}rm -rf x"], denylist: []))
+        #expect(!CommandRestore.shouldRestore(argv: ["less", "note\u{7F}.txt"], denylist: []))
+        // argv[0] carries the byte, so the basename check alone would let it through.
+        #expect(!CommandRestore.shouldRestore(argv: ["od\u{1B}d"], denylist: []))
+        // the boundary: 0x20 and printable high scalars are ordinary argument bytes.
+        #expect(CommandRestore.shouldRestore(argv: ["echo", "a b"], denylist: []))
+        #expect(CommandRestore.shouldRestore(argv: ["echo", "naïve — ✓"], denylist: []))
+    }
+
+    @Test func shouldRestoreRefusesLossilyDecodedArguments() {
+        // the argument bytes must be RAW, not a Swift literal: "\u{FFFD}" encodes as valid UTF-8, which
+        // would pin the genuine-U+FFFD case while proving nothing about lossy decoding.
+        var raw = withUnsafeBytes(of: Int32(2)) { Data($0) }
+        raw.append(Data("/usr/bin/grep".utf8)); raw.append(0)
+        raw.append(Data("grep".utf8)); raw.append(0)
+        raw.append(Data([0x63, 0x61, 0x66, 0xE9])); raw.append(0) // "caf" + a lone Latin-1 é
+        let argv = CommandRestore.parseProcArgs(raw)
+        #expect(argv == ["grep", "caf\u{FFFD}"])
+        #expect(!CommandRestore.shouldRestore(argv: argv ?? [], denylist: []))
+        // a genuine U+FFFD is refused with it, indistinguishable once decoded.
+        #expect(!CommandRestore.shouldRestore(argv: ["grep", "caf\u{FFFD}"], denylist: []))
+        #expect(!CommandRestore.shouldRestore(argv: ["\u{FFFD}bin", "x"], denylist: []))
+    }
+
+    @Test func lossyArgvStillPreemptsStaleInitialCommand() {
+        // the refusal is at render, not capture, so hadForeground stays true and a --command session
+        // comes back a plain shell rather than re-running its creation command.
+        let inputs = CommandRestore.RestoreInputs(wasRestored: true, restoreEnabled: true, hadForeground: true,
+                                                  foregroundInput: nil, initialCommand: "ssh prod",
+                                                  restoreOverride: nil)
+        let plan = CommandRestore.restorePlan(inputs)
+        #expect(plan.command == nil)
+        #expect(plan.initialInput == nil)
+    }
+
+    @Test func restoreInputRefusesOverrideCarryingControlCharacters() {
+        // the dispatcher rejects these on write, but a pin loaded from a snapshot never passed that check.
+        #expect(CommandRestore.restoreInput(restoreEnabled: true, restoreOverride: "tail -f\u{1B}x",
+                                            capturedInput: "'top'\n") == nil)
+        #expect(CommandRestore.restoreInput(restoreEnabled: true, restoreOverride: "a\u{0A}rm -rf x",
+                                            capturedInput: nil) == nil)
+        #expect(CommandRestore.restoreInput(restoreEnabled: true, restoreOverride: "cd x && claude",
+                                            capturedInput: nil) == "cd x && claude\n")
     }
 
     @Test func parseDenylistReadsBasenamesIgnoringCommentsAndBlanks() {
@@ -190,6 +276,59 @@ struct CommandRestoreTests {
         let plan = CommandRestore.restorePlan(.init(wasRestored: true, restoreEnabled: true, hadForeground: false,
                                                     foregroundInput: nil, initialCommand: nil, restoreOverride: nil))
         #expect(plan == CommandRestore.RestorePlan(command: nil, initialInput: nil))
+    }
+
+    @Test func waitAfterCommandRequiresAnEffectiveExecCommand() {
+        let holding = CommandRestore.restorePlan(.init(
+            wasRestored: true, restoreEnabled: true, hadForeground: false,
+            foregroundInput: nil, initialCommand: "ssh host", restoreOverride: nil, requestedWait: true
+        ))
+        #expect(holding.waitAfterCommand)
+
+        let notRequested = CommandRestore.restorePlan(.init(
+            wasRestored: true, restoreEnabled: true, hadForeground: false,
+            foregroundInput: nil, initialCommand: "ssh host", restoreOverride: nil, requestedWait: false
+        ))
+        #expect(!notRequested.waitAfterCommand)
+
+        let captured = CommandRestore.restorePlan(.init(
+            wasRestored: true, restoreEnabled: true, hadForeground: true,
+            foregroundInput: "top\n", initialCommand: "ssh host", restoreOverride: nil, requestedWait: true
+        ))
+        #expect(captured.command == nil)
+        #expect(!captured.waitAfterCommand)
+
+        let overridden = CommandRestore.restorePlan(.init(
+            wasRestored: true, restoreEnabled: true, hadForeground: false,
+            foregroundInput: nil, initialCommand: "ssh host", restoreOverride: "claude", requestedWait: true
+        ))
+        #expect(overridden.command == nil)
+        #expect(!overridden.waitAfterCommand)
+    }
+
+    @MainActor @Test func splitCreationCommandUsesExecPathUnlessOverrideWins() {
+        let session = Session(initialCwd: "/tmp")
+        session.wasRestored = true
+        session.splitInitialCommand = "ssh split-host"
+        session.splitCommandWait = true
+
+        let exec = CommandRestore.restorePlan(.init(
+            wasRestored: session.wasRestored, restoreEnabled: true, hadForeground: false,
+            foregroundInput: nil, initialCommand: session.splitInitialCommand,
+            restoreOverride: nil, requestedWait: session.splitCommandWait
+        ))
+        #expect(exec.command == "ssh split-host")
+        #expect(exec.initialInput == nil)
+        #expect(exec.waitAfterCommand)
+
+        let overridden = CommandRestore.restorePlan(.init(
+            wasRestored: session.wasRestored, restoreEnabled: true, hadForeground: false,
+            foregroundInput: nil, initialCommand: session.splitInitialCommand,
+            restoreOverride: "claude --resume split", requestedWait: session.splitCommandWait
+        ))
+        #expect(overridden.command == nil)
+        #expect(overridden.initialInput == "claude --resume split\n")
+        #expect(!overridden.waitAfterCommand)
     }
 
     // MARK: - restoreInput (the pinned-override precedence)

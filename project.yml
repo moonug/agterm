@@ -48,8 +48,10 @@ targets:
         excludes:
           - "Info.plist"
           - "agterm.entitlements"
+          - "agterm-debug.entitlements"
           - "Resources/ghostty"
           - "Resources/terminfo"
+          - "Resources/zmx"
           - "Resources/agent-status"
           - "Resources/hud"
           # committed SOURCE for agterm's own bundled theme(s); setup.sh stages it
@@ -87,7 +89,8 @@ targets:
       - path: agterm/Resources/hud
         type: folder
         buildPhase: resources
-      # Agent skill package (SKILL.md + reference.md + examples.md + troubleshooting.md + scripts).
+      # Agent skill package (SKILL.md + reference.md + examples.md + cookbook.md + troubleshooting.md
+      # + scripts).
       # It lives at plugins/agterm/skills/agterm so the SAME directory is also the skill source for
       # the Claude Code and Codex plugin manifests — one copy, three consumers. Folder reference so
       # the whole dir copies verbatim to Contents/Resources/agterm; the installer copies it from
@@ -122,12 +125,11 @@ targets:
         # set AGTERM_STATE_DIR to avoid touching the real app-support state.)
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: com.umputun.agterm.debug
+          # Debug alone needs the three hardened-runtime exceptions; see the header of the file.
+          CODE_SIGN_ENTITLEMENTS: agterm/agterm-debug.entitlements
     postBuildScripts:
-      # build the agtermctl CLI and bundle it at Contents/MacOS/agtermctl so the
-      # in-app "Install Command Line Tool" can symlink it into PATH. Runs before
-      # Xcode's automatic code-sign, and signs the helper ad-hoc (matching the
-      # app) so the app's signature seals an already-signed nested binary.
-      - name: Bundle agtermctl CLI
+      # Build the Swift helpers here; setup.sh stages the pinned zmx binary and license.
+      - name: Bundle helper executables
         basedOnDependencyAnalysis: false
         script: |
           set -euo pipefail
@@ -139,22 +141,42 @@ targets:
           rm -rf "$CODESIGNING_FOLDER_PATH/Contents/Resources/AppIcon.icon"
           core="$SRCROOT/agtermCore"
           swift build --package-path "$core" -c release --product agtermctl
+          swift build --package-path "$core" -c release --product agterm-session-host
           src="$(swift build --package-path "$core" -c release --product agtermctl --show-bin-path)/agtermctl"
-          dest="$CODESIGNING_FOLDER_PATH/Contents/MacOS/agtermctl"
-          mkdir -p "$(dirname "$dest")"
-          cp -f "$src" "$dest"
-          # ad-hoc sign the helper + re-seal the app (Debug/normal builds). Developer ID signing for
+          host_src="$(dirname "$src")/agterm-session-host"
+          cli_dest="$CODESIGNING_FOLDER_PATH/Contents/MacOS/agtermctl"
+          host_dest="$CODESIGNING_FOLDER_PATH/Contents/MacOS/agterm-session-host"
+          zmx_src="$SRCROOT/agterm/Resources/zmx/zmx"
+          zmx_dest="$CODESIGNING_FOLDER_PATH/Contents/MacOS/zmx"
+          license_src="$SRCROOT/agterm/Resources/zmx/LICENSE"
+          license_dest="$CODESIGNING_FOLDER_PATH/Contents/Resources/zmx/LICENSE"
+          [ -x "$zmx_src" ] || { echo "staged zmx not found at $zmx_src" >&2; exit 1; }
+          [ -f "$license_src" ] || { echo "zmx license not found at $license_src" >&2; exit 1; }
+          mkdir -p "$(dirname "$cli_dest")" "$(dirname "$license_dest")"
+          cp -f "$src" "$cli_dest"
+          cp -f "$host_src" "$host_dest"
+          cp -f "$zmx_src" "$zmx_dest"
+          cp -f "$license_src" "$license_dest"
+          # ad-hoc sign the helpers + re-seal the app (Debug/normal builds). Developer ID signing for
           # releases is done authoritatively by scripts/release.sh AFTER xcodebuild returns (so it
           # can't be clobbered by Xcode's own final code-sign, which also adds the required timestamp).
-          codesign --force --options runtime --sign - "$dest"
+          codesign --force --options runtime --sign - "$cli_dest"
+          codesign --force --options runtime --sign - "$host_dest"
+          codesign --force --options runtime --sign - "$zmx_dest"
           # re-seal the whole app: this phase can run AFTER Xcode's own code-sign on incremental
-          # builds, so adding the helper would otherwise break the seal. --deep re-signs every nested
-          # Mach-O too (the Debug agterm.debug.dylib, the helper).
-          codesign --force --deep --options runtime --entitlements "$SRCROOT/agterm/agterm.entitlements" --sign - "$CODESIGNING_FOLDER_PATH"
+          # builds, so adding the helper would otherwise break the seal. --deep because a clean
+          # build can reach here before Xcode has signed agterm.debug.dylib. Entitlements come in a
+          # SECOND pass instead: --deep applies them to every nested binary, and helpers carry no app
+          # TCC entitlements.
+          codesign --force --deep --options runtime --sign - "$CODESIGNING_FOLDER_PATH"
+          # CODE_SIGN_ENTITLEMENTS, not a literal path: Debug and Release use different files.
+          codesign --force --options runtime --entitlements "$SRCROOT/$CODE_SIGN_ENTITLEMENTS" --sign - "$CODESIGNING_FOLDER_PATH"
     dependencies:
       - framework: GhosttyKit.xcframework
         embed: false
       - package: agtermCore
+      - package: agtermCore
+        product: AgtermResponsibility
       - sdk: AppKit.framework
       # libghostty calls Text Input Source Services (TISCopyCurrentKeyboard…)
       # which live in Carbon; required to link the prebuilt xcframework.
@@ -174,6 +196,7 @@ targets:
       - agtermUITests
     dependencies:
       - target: agterm
+      - package: agtermCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.umputun.agtermUITests
@@ -217,6 +240,8 @@ schemes:
       config: Debug
     test:
       config: Debug
+      # recording blocks ~25s per method before setUp; screenshots costs 0.13s and still captures failures
+      preferredScreenCaptureFormat: screenshots
       targets:
         - agtermUITests
     archive:

@@ -7,7 +7,7 @@ cask "agterm" do
 
   url "https://github.com/umputun/agterm/releases/download/v#{version}/agterm-#{version}.dmg"
   name "agterm"
-  desc "Native macOS terminal on libghostty with a workspace/session sidebar"
+  desc "Terminal on libghostty with a workspace/session sidebar"
   homepage "https://github.com/umputun/agterm"
 
   depends_on macos: :sonoma
@@ -21,10 +21,9 @@ cask "agterm" do
   # and stapled, but that only removes the unidentified-developer block and the online
   # check - Gatekeeper still shows the first-launch confirm whenever the quarantine attr
   # is present, and brew re-stamps it on every fresh bundle.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/agterm.app"],
-                   sudo: false
+  postflight_steps do
+    run "/usr/bin/xattr",
+        args: ["-dr", "com.apple.quarantine", "{{appdir}}/agterm.app"]
   end
 
   zap trash: [

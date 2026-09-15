@@ -193,12 +193,12 @@ struct AppSettingsTests {
         #expect(AppSettings(notificationsEnabled: false).ghosttyConfigLines() == ["mouse-scroll-multiplier = 3", "right-click-action = paste"])
     }
 
-    @Test func restoreRunningCommandRoundTripsAndIsNotAConfigLine() throws {
-        let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(AppSettings(restoreRunningCommand: true)))
-        #expect(decoded.restoreRunningCommand == true)
-        let legacy = try JSONDecoder().decode(AppSettings.self, from: Data(#"{"theme":"Nord"}"#.utf8))
-        #expect(legacy.restoreRunningCommand == nil)
-        #expect(AppSettings(restoreRunningCommand: true).ghosttyConfigLines() == ["mouse-scroll-multiplier = 3", "right-click-action = paste"])
+    @Test func restoreModeRoundTripsAndIsNotAConfigLine() throws {
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(AppSettings(restoreMode: .live)))
+        #expect(decoded.restoreMode == .live)
+        #expect(decoded.effectiveRestoreMode == .live)
+        #expect(AppSettings(restoreMode: .live).ghosttyConfigLines()
+            == ["mouse-scroll-multiplier = 3", "right-click-action = paste"])
     }
 
     @Test func autoHideSidebarInactiveWindowsRoundTripsAndIsNotAConfigLine() throws {
@@ -385,6 +385,32 @@ struct AppSettingsTests {
         #expect(!json.contains("interfaceFontSize"))
     }
 
+    @Test func quickTerminalSizePercentRoundTripsAndDefaultsNil() throws {
+        #expect(AppSettings().quickTerminalSizePercent == nil)
+        let json = String(decoding: try JSONEncoder().encode(AppSettings()), as: UTF8.self)
+        #expect(!json.contains("quickTerminalSizePercent"))
+        let original = AppSettings(quickTerminalSizePercent: 70)
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(original))
+        #expect(decoded.quickTerminalSizePercent == 70)
+        #expect(original.ghosttyConfigLines() == ["mouse-scroll-multiplier = 3", "right-click-action = paste"])
+    }
+
+    @Test func quickTerminalSizePercentResolvesOffGridValuesToTheDefault() {
+        #expect(AppSettings(quickTerminalSizePercent: 70).effectiveQuickTerminalSizePercent == 70)
+        // hand-edited or written by a version offering more choices: applied as neither 75% nor a snapped
+        // neighbour, so the picker and the panel cannot disagree about the size in use.
+        #expect(AppSettings(quickTerminalSizePercent: 75).effectiveQuickTerminalSizePercent == nil)
+        #expect(AppSettings(quickTerminalSizePercent: 400).effectiveQuickTerminalSizePercent == nil)
+        #expect(AppSettings(quickTerminalSizePercent: 0).effectiveQuickTerminalSizePercent == nil)
+        #expect(AppSettings().effectiveQuickTerminalSizePercent == nil)
+    }
+
+    @Test func everyOfferedQuickTerminalChoiceSurvivesResolution() {
+        for percent in QuickTerminalMetrics.sizePercentChoices {
+            #expect(AppSettings(quickTerminalSizePercent: percent).effectiveQuickTerminalSizePercent == percent)
+        }
+    }
+
     @Test func sidebarAndInterfaceFontSizesAreIndependent() throws {
         let sidebarOnly = try JSONDecoder().decode(AppSettings.self, from: Data(#"{ "sidebarFontSize": 17 }"#.utf8))
         #expect(sidebarOnly.effectiveSidebarFontSize == 17)
@@ -479,6 +505,49 @@ struct AppSettingsTests {
         #expect(legacy.rightClickPaste == nil)
     }
 
+    @Test func cursorStyleIsAGhosttyKeyEmittedOnlyWhenPicked() throws {
+        // "From config" emits nothing, so a hand-written ghostty.conf `cursor-style` still decides.
+        #expect(AppSettings().cursorStyle == nil)
+        #expect(AppSettings().effectiveCursorStyle == nil)
+        #expect(!AppSettings().ghosttyConfigLines().contains { $0.hasPrefix("cursor-style") })
+        // ghostty's own wire vocabulary, so the set and the emitted spelling are pinned as literals here
+        // rather than derived from the enum a typo would carry into both sides of the comparison.
+        #expect(AppSettings.CursorStyle.allCases.map(\.rawValue) == ["block", "bar", "underline"])
+        #expect(AppSettings(cursorStyle: "block").ghosttyConfigLines().contains("cursor-style = block"))
+        #expect(AppSettings(cursorStyle: "bar").ghosttyConfigLines().contains("cursor-style = bar"))
+        #expect(AppSettings(cursorStyle: "underline").ghosttyConfigLines().contains("cursor-style = underline"))
+        for style in AppSettings.CursorStyle.allCases {
+            let settings = AppSettings(cursorStyle: style.rawValue)
+            #expect(settings.effectiveCursorStyle == style)
+            #expect(settings.ghosttyConfigLines().contains("cursor-style = \(style.rawValue)"))
+            let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+            #expect(decoded == settings)
+        }
+        // block_hollow is a valid ghostty shape the picker deliberately does not offer, so it resolves
+        // like any unoffered value: back to the config chain, never emitted from settings.
+        for raw in ["block_hollow", "spinner"] {
+            #expect(AppSettings(cursorStyle: raw).effectiveCursorStyle == nil)
+            #expect(!AppSettings(cursorStyle: raw).ghosttyConfigLines().contains { $0.hasPrefix("cursor-style") })
+        }
+        let legacy = try JSONDecoder().decode(AppSettings.self, from: Data(#"{ "fontSize": 16 }"#.utf8))
+        #expect(legacy.cursorStyle == nil)
+        #expect(legacy.effectiveCursorStyle == nil)
+    }
+
+    @Test func cursorBlinkCarriesGhosttysThreeStates() throws {
+        // nil is not "off": ghostty blinks AND keeps honoring DEC mode 12, which either explicit key kills.
+        #expect(AppSettings().cursorBlink == nil)
+        #expect(!AppSettings().ghosttyConfigLines().contains { $0.hasPrefix("cursor-style-blink") })
+        #expect(AppSettings(cursorBlink: true).ghosttyConfigLines().contains("cursor-style-blink = true"))
+        #expect(AppSettings(cursorBlink: false).ghosttyConfigLines().contains("cursor-style-blink = false"))
+        for value: Bool? in [nil, true, false] {
+            let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(AppSettings(cursorBlink: value)))
+            #expect(decoded.cursorBlink == value)
+        }
+        let legacy = try JSONDecoder().decode(AppSettings.self, from: Data(#"{ "fontSize": 16 }"#.utf8))
+        #expect(legacy.cursorBlink == nil)
+    }
+
     @Test func newSessionDirectoryRoundTripsAndIsNotAConfigLine() throws {
         let original = AppSettings(newSessionDirectory: "custom", newSessionCustomDirectory: "/tmp/work")
         let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(original))
@@ -555,12 +624,13 @@ struct AppSettingsTests {
         #expect(original.ghosttyConfigLines() == ["mouse-scroll-multiplier = 3", "right-click-action = paste"])
     }
 
-    @Test func hiddenInterfaceElementsDefaultsNilAndShowsEverything() {
+    @Test func hiddenInterfaceElementsDefaultsNilAndShowsEverythingNotHiddenByDefault() {
         let settings = AppSettings()
         #expect(settings.hiddenInterfaceElements == nil)
-        #expect(settings.resolvedHiddenInterfaceElements.isEmpty)
+        #expect(settings.shownInterfaceElements == nil)
+        #expect(settings.resolvedHiddenInterfaceElements == [.customCommands])
         for element in InterfaceElement.allCases {
-            #expect(!settings.isInterfaceElementHidden(element))
+            #expect(settings.isInterfaceElementHidden(element) == element.hiddenByDefault)
         }
     }
 
@@ -574,6 +644,15 @@ struct AppSettingsTests {
         #expect(original.ghosttyConfigLines() == ["mouse-scroll-multiplier = 3", "right-click-action = paste"])
     }
 
+    @Test func remoteHostIsADistinctTitleBarInterfaceElement() {
+        #expect(InterfaceElement.remoteHost.section == .titleBar)
+        #expect(InterfaceElement.remoteHost.displayName == "Remote host")
+        let hidden = AppSettings(hiddenInterfaceElements: ["remoteHost"])
+        #expect(hidden.isInterfaceElementHidden(.remoteHost))
+        #expect(!hidden.isInterfaceElementHidden(.sessionName))
+        #expect(!AppSettings(hiddenInterfaceElements: ["sessionName"]).isInterfaceElementHidden(.remoteHost))
+    }
+
     @Test func workspaceAddSessionIsADistinctSidebarInterfaceElement() {
         // the workspace-row hover "+", a separate toggle from the footer newSession button.
         #expect(InterfaceElement.workspaceAddSession.section == .sidebar)
@@ -581,6 +660,17 @@ struct AppSettingsTests {
         let hidden = AppSettings(hiddenInterfaceElements: ["workspaceAddSession"])
         #expect(hidden.isInterfaceElementHidden(.workspaceAddSession))
         #expect(!hidden.isInterfaceElementHidden(.newSession))
+    }
+
+    @Test func sessionContextIsATitleBarInterfaceElementGatingOnlyItself() {
+        #expect(InterfaceElement.sessionContext.section == .titleBar)
+        #expect(InterfaceElement.sessionContext.displayName == "Session context")
+        let hidden = AppSettings(hiddenInterfaceElements: ["sessionContext"])
+        #expect(hidden.isInterfaceElementHidden(.sessionContext))
+        #expect(!hidden.isInterfaceElementHidden(.sessionName))
+        #expect(!hidden.isInterfaceElementHidden(.windowName))
+        let names = AppSettings(hiddenInterfaceElements: ["sessionName", "windowName"])
+        #expect(!names.isInterfaceElementHidden(.sessionContext))
     }
 
     @Test func focusFilterIsASidebarInterfaceElement() {
@@ -592,6 +682,35 @@ struct AppSettingsTests {
         #expect(!hidden.isInterfaceElementHidden(.flaggedView))
     }
 
+    @Test func customCommandsIsAHiddenByDefaultTitleBarInterfaceElement() throws {
+        #expect(InterfaceElement.customCommands.section == .titleBar)
+        #expect(InterfaceElement.customCommands.displayName == "Custom commands")
+        #expect(InterfaceElement.allCases.filter(\.hiddenByDefault) == [.customCommands])
+        let shown = AppSettings(shownInterfaceElements: ["customCommands"])
+        #expect(!shown.isInterfaceElementHidden(.customCommands))
+        #expect(!shown.isInterfaceElementHidden(.dashboard))
+        #expect(shown.resolvedHiddenInterfaceElements.isEmpty)
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(shown))
+        #expect(decoded == shown)
+        // the shown list alone governs a hidden-by-default element; an unknown name there is dropped too.
+        let hidden = AppSettings(hiddenInterfaceElements: ["customCommands", "dashboard"], shownInterfaceElements: ["teleporter"])
+        #expect(hidden.isInterfaceElementHidden(.customCommands))
+        #expect(hidden.isInterfaceElementHidden(.dashboard))
+        #expect(hidden.resolvedHiddenInterfaceElements == [.customCommands, .dashboard])
+    }
+
+    @Test func statusResetDefaultsToFirstKeyAndResolvesKnownRawValues() throws {
+        #expect(AppSettings().statusReset == nil)
+        #expect(AppSettings().effectiveStatusReset == .firstKey)
+        #expect(AppSettings(statusReset: "enter").effectiveStatusReset == .enter)
+        #expect(AppSettings(statusReset: "never").effectiveStatusReset == .never)
+        #expect(AppSettings(statusReset: "teleporter").effectiveStatusReset == .firstKey)
+        let original = AppSettings(statusReset: "enter")
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(original))
+        #expect(decoded == original)
+        #expect(original.ghosttyConfigLines() == ["mouse-scroll-multiplier = 3", "right-click-action = paste"])
+    }
+
     @Test func unknownInterfaceElementDecodesTolerantly() throws {
         // forward-compat rule: an unknown name is dropped from the resolved set and must not fail the
         // whole decode.
@@ -599,7 +718,7 @@ struct AppSettingsTests {
             AppSettings.self,
             from: Data(#"{ "hiddenInterfaceElements": ["scratch", "teleporter"], "fontSize": 16 }"#.utf8))
         #expect(decoded.fontSize == 16)
-        #expect(decoded.resolvedHiddenInterfaceElements == [.scratch])
+        #expect(decoded.resolvedHiddenInterfaceElements == [.scratch, .customCommands])
         #expect(decoded.isInterfaceElementHidden(.scratch))
     }
 
@@ -620,6 +739,8 @@ struct AppSettingsTests {
         (2, 0, 2, false, true),  // empty B: a full A and a full C meet directly
         (2, 1, 2, false, false), // lone B between two full groups: no bridge, no dividers
         (2, 2, 1, true, false),  // lone C: divider only between the two full A/B groups
+        (1, 2, 3, false, true),  // full three-button C: the same single divider as the two-button default
+        (2, 1, 3, false, false), // lone B before a full three-button C: still no bridge
         (0, 2, 2, false, true),  // empty A: divider only between B and C
         (0, 0, 2, false, false), // only C present: no dividers at the leading edge
         (2, 2, 0, true, false),  // empty C: divider only between A and B

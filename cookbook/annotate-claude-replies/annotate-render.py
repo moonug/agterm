@@ -17,6 +17,9 @@ import sys
 from pathlib import Path
 
 HEADER = re.compile(r"^##\s+(?P<file>.+?):(?P<start>\d+)(?:-(?P<end>\d+))?\s+\((?P<kind>[^)]*)\)\s*$")
+# A file-level note (`A` in revdiff) carries no line part: `## <file> (file-level)`. It lands on
+# the whole reply set, so it renders without a quoted source line or a section attribution.
+FILE_HEADER = re.compile(r"^##\s+(?P<file>.+?)\s+\(file-level\)\s*$")
 
 
 def parse(raw: str) -> list[dict]:
@@ -29,6 +32,16 @@ def parse(raw: str) -> list[dict]:
                 "file": Path(match.group("file")).name,
                 "start": int(match.group("start")),
                 "end": int(match.group("end") or match.group("start")),
+                "body": [],
+            }
+            notes.append(current)
+            continue
+        fmatch = FILE_HEADER.match(line)
+        if fmatch:
+            current = {
+                "file": Path(fmatch.group("file")).name,
+                "start": None,
+                "end": None,
                 "body": [],
             }
             notes.append(current)
@@ -61,6 +74,12 @@ def render(notes: list[dict], sources: dict[str, list[str]], sections: list[dict
         "",
     ]
     for index, note in enumerate(notes, start=1):
+        if note["start"] is None:
+            out.append(f"## Note {index} — on the whole reply set")
+            out.append("")
+            out.append(note["body"])
+            out.append("")
+            continue
         start, end = note["start"], note["end"]
         span = f"line {start}" if start == end else f"lines {start}-{end}"
         where = section_for(start, sections)

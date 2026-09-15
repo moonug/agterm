@@ -21,9 +21,9 @@ extension WindowContentView {
     /// (only the current session). Opening a popover is interactive-only, so it is control-API keep-in-sync
     /// exempt, like the bell opening the attention palette.
     var recentSessionsButton: some View {
-        let enabled = !recentSessions.isEmpty && pick.pending == nil
+        let enabled = !recentSessions.isEmpty && !pick.modalPending
         return Button {
-            guard pick.pending == nil else { return }
+            guard !pick.modalPending else { return }
             recentSessionsShown.toggle()
         } label: {
             Label("Recent sessions", systemImage: "clock.arrow.circlepath")
@@ -80,15 +80,16 @@ extension WindowContentView {
                 statusColorHex: nil,
                 statusShape: nil,
                 foreground: chromeText,
-                hoverColor: recentSelectionColor,
+                hoverColor: popoverHoverColor,
                 accessibilityID: "recent-session-row"
             ) { selectRecent(id) }
         }
     }
 
-    /// The hover-highlight color for a popover row: the terminal theme's selection background (the color the
-    /// selected sidebar row uses), or a subtle wash of the foreground when the theme sets no selection color.
-    private var recentSelectionColor: Color {
+    /// The hover-highlight color for a title-bar popover row: the terminal theme's selection background (the
+    /// color the selected sidebar row uses), or a subtle wash of the foreground when the theme sets no
+    /// selection color. Shared with the custom-commands popover.
+    var popoverHoverColor: Color {
         if let sel = GhosttyApp.shared.terminalSelectionBackgroundColor {
             return Color(nsColor: sel).opacity(0.5)
         }
@@ -98,7 +99,7 @@ extension WindowContentView {
     /// Commit a popover row click: note activity (so auto-follow can't pull the selection back), select the
     /// session, focus it, and close the popover — the mouse twin of the Ctrl-Tab release commit.
     private func selectRecent(_ id: UUID) {
-        guard pick.pending == nil else { return }
+        guard !pick.modalPending else { return }
         store.noteUserActivity()
         store.selectSession(id)
         actions.focusActiveSession()
@@ -117,9 +118,9 @@ extension WindowContentView {
         let sessions = store.attentionSessions
         let blocked = sessions.contains { $0.agentIndicator.status == .blocked }
         let empty = sessions.isEmpty
-        let enabled = !empty && pick.pending == nil
+        let enabled = !empty && !pick.modalPending
         return Button {
-            guard pick.pending == nil else { return }
+            guard !pick.modalPending else { return }
             attentionPopoverShown.toggle()
         } label: {
             Label("Attention", systemImage: blocked ? "bell.fill" : "bell")
@@ -158,7 +159,7 @@ extension WindowContentView {
                     statusColorHex: session.agentIndicator.color,
                     statusShape: session.agentIndicator.shape,
                     foreground: chromeText,
-                    hoverColor: recentSelectionColor,
+                    hoverColor: popoverHoverColor,
                     accessibilityID: "attention-session-row"
                 ) { selectAttention(session.id) }
             }
@@ -172,7 +173,7 @@ extension WindowContentView {
     /// Commit an attention popover row click: select the session and reveal its blocked pane (the pane that
     /// set the status), then close the popover — the mouse twin of the ⌃⇧I palette's select-and-reveal.
     private func selectAttention(_ id: UUID) {
-        guard pick.pending == nil else { return }
+        guard !pick.modalPending else { return }
         store.noteUserActivity()
         let indicator = store.selectSession(id)
         actions.revealActiveBlockedPane(captured: indicator)

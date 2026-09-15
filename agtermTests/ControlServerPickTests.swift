@@ -14,7 +14,6 @@ final class ControlServerPickTests: XCTestCase {
     private var registeredPickIDs: Set<WindowInfo.ID> = []
     private var registeredWindows: [WindowInfo.ID: NSWindow] = [:]
     private var registeredZoomIDs: Set<WindowInfo.ID> = []
-    private var registeredQuickIDs: Set<WindowInfo.ID> = []
     private var registeredDashboardIDs: Set<WindowInfo.ID> = []
 
     override func setUp() async throws {
@@ -32,6 +31,7 @@ final class ControlServerPickTests: XCTestCase {
                 library: library,
                 actions: actions,
                 settingsModel: settings,
+                identity: AppIdentity(version: "9.9.9", commit: "testsha"),
                 socketPath: stateDir.appendingPathComponent("control.sock").path
             )
         }
@@ -45,9 +45,6 @@ final class ControlServerPickTests: XCTestCase {
             for id in registeredZoomIDs {
                 TerminalZoomRegistry.shared.unregister(id)
             }
-            for id in registeredQuickIDs {
-                QuickTerminalRegistry.shared.unregister(id)
-            }
             for id in registeredDashboardIDs {
                 DashboardControllerRegistry.shared.unregister(id)
             }
@@ -57,7 +54,6 @@ final class ControlServerPickTests: XCTestCase {
             }
             registeredPickIDs.removeAll()
             registeredZoomIDs.removeAll()
-            registeredQuickIDs.removeAll()
             registeredDashboardIDs.removeAll()
             registeredWindows.removeAll()
             server = nil
@@ -99,6 +95,20 @@ final class ControlServerPickTests: XCTestCase {
             ControlResponse(ok: false, error: "pick already pending")
         )
         XCTAssertEqual(controller.pending, first)
+    }
+
+    func testOpenRefusedByPendingAskNamesTheAsk() throws {
+        let windowID = try XCTUnwrap(library.activeWindowID)
+        let controller = registerPick(windowID)
+        let ask = PendingAsk(id: "ask", title: "Continue?", buttons: [ControlAskButton(id: "yes", label: "Yes")])
+        XCTAssertTrue(controller.openAsk(ask))
+
+        XCTAssertEqual(
+            server.openPick(makePick("second"), window: nil, follow: false),
+            ControlResponse(ok: false, error: "ask already pending")
+        )
+        XCTAssertEqual(controller.pendingAsk, ask)
+        XCTAssertNil(controller.pending)
     }
 
     func testOpenOnFrontmostWindowClosesBuiltInPaletteAndReturnsID() throws {
@@ -222,9 +232,6 @@ final class ControlServerPickTests: XCTestCase {
         let pick = registerPick(windowID)
         XCTAssertTrue(pick.open(makePick("modal-owner")))
 
-        let quick = QuickTerminalController()
-        QuickTerminalRegistry.shared.register(windowID, controller: quick)
-        registeredQuickIDs.insert(windowID)
         let zoom = TerminalZoomController()
         TerminalZoomRegistry.shared.register(windowID, controller: zoom)
         registeredZoomIDs.insert(windowID)

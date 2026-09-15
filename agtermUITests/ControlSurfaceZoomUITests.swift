@@ -15,6 +15,7 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
         let resize = try sendCommand(#"{"cmd":"session.resize","args":{"ratio":0.33}}"#)
         XCTAssertEqual(resize["ok"] as? Bool, true, "split resize should succeed: \(resize)")
         XCTAssertTrue(pollSplitRatio(0.33, timeout: 10), "the split ratio should persist before zoom")
+        let leftColumns = try paneColumns(id: originalSessionID, pane: "left", tag: "before-zoom")
 
         let leftSurface = try activeSurfaceID(kind: "left")
         let zoom = try sendCommand(#"{"cmd":"surface.zoom","target":"\#(leftSurface)","args":{"mode":"show"}}"#)
@@ -37,6 +38,8 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
         zoomExit.click()
         XCTAssertTrue(zoomExit.waitForNonExistence(timeout: 10), "clicking the zoom-out button should exit zoom")
         XCTAssertTrue(pollSplitRatio(0.33, timeout: 10), "zoom round-trip must not change the split ratio")
+        XCTAssertEqual(try paneColumns(id: originalSessionID, pane: "left", tag: "after-zoom"), leftColumns,
+                       "zoom round-trip must not resize the left pane")
     }
 
     // promotion keeps the zoom target's semantic identity (`surface:<session>:left`), so the zoom host
@@ -108,23 +111,27 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
         XCTAssertEqual(rehide["ok"] as? Bool, true, "explicit-target hide should be idempotent: \(rehide)")
     }
 
-    func testQuickZoomEmitsAndAcceptsQuickTargetId() throws {
+    /// #441 detached the quick terminal into one per-app panel, so a bare zoom resolves inside the WINDOW
+    /// and can no longer pick it; `quick` stays reachable as an explicit target. `TerminalZoomTests` pins
+    /// the same split host-free.
+    func testQuickIsZoomableOnlyAsAnExplicitTarget() throws {
+        let leftSurface = try activeSurfaceID(kind: "left")
         XCTAssertEqual(try sendCommand(#"{"cmd":"quick","args":{"mode":"show"}}"#)["ok"] as? Bool, true,
                        "quick show should succeed")
 
         let zoom = try sendCommand(#"{"cmd":"surface.zoom","args":{"mode":"show"}}"#)
         XCTAssertEqual(zoom["ok"] as? Bool, true, "surface zoom show should succeed: \(zoom)")
-        XCTAssertEqual((zoom["result"] as? [String: Any])?["id"] as? String, "quick",
-                       "zooming with the quick terminal visible should target it: \(zoom)")
+        XCTAssertEqual((zoom["result"] as? [String: Any])?["id"] as? String, leftSurface,
+                       "a bare zoom must resolve within the window, never the detached quick panel: \(zoom)")
+        XCTAssertEqual(try sendCommand(#"{"cmd":"surface.zoom","args":{"mode":"hide"}}"#)["ok"] as? Bool, true,
+                       "zoom hide should succeed")
 
-        let hide = try sendCommand(#"{"cmd":"surface.zoom","target":"quick","args":{"mode":"hide"}}"#)
+        let hide = try sendCommand(#"{"cmd":"surface.zoom","target":"quick","args":{"mode":"show"}}"#)
         XCTAssertEqual(hide["ok"] as? Bool, true,
-                       "the id surface.zoom emitted must be accepted back as a target: \(hide)")
+                       "quick must still be accepted as an explicit zoom target: \(hide)")
 
         // `quick hide` must stay unconditional for scripts — a zoomed quick terminal exits its zoom
         // first, never an error.
-        XCTAssertEqual(try sendCommand(#"{"cmd":"surface.zoom","args":{"mode":"show"}}"#)["ok"] as? Bool, true,
-                       "re-zooming the quick terminal should succeed")
         let quickHide = try sendCommand(#"{"cmd":"quick","args":{"mode":"hide"}}"#)
         XCTAssertEqual(quickHide["ok"] as? Bool, true,
                        "quick hide must succeed while the quick terminal is zoomed: \(quickHide)")

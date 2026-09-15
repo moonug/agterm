@@ -72,7 +72,8 @@ extension WorkspaceSidebar.Coordinator {
             // so the fill would be noise.
             let showSplitIcon = session?.hasSplit == true
             let flagged = store.sidebarMode == .tree && session?.flagged == true
-            cell.imageView?.image = iconForSession(split: showSplitIcon, flagged: flagged)
+            cell.imageView?.image = iconForSession(split: showSplitIcon, axis: session?.splitAxis ?? .leftRight,
+                                                   flagged: flagged, remote: session?.remoteHost != nil)
             cell.imageView?.setAccessibilityIdentifier("session-icon")
         }
         // text/icon colors track the terminal theme; a selected row uses the selection foreground.
@@ -94,12 +95,21 @@ extension WorkspaceSidebar.Coordinator {
 
     /// The leading session-row icon: split-rectangle when split, else plain terminal, each swapped to its
     /// filled variant when `flagged` — tree mode only, the flat flagged view passes `flagged: false`.
-    private func iconForSession(split: Bool, flagged: Bool) -> NSImage? {
-        switch (split, flagged) {
-        case (true, true): return flaggedSplitSessionIcon
-        case (true, false): return splitSessionIcon
-        case (false, true): return flaggedSessionIcon
-        case (false, false): return sessionIcon
+    ///
+    /// A remote row takes its own glyph and keeps the split bit, not the flagged fill: a HIDDEN split is
+    /// state nothing else reveals, while the fill is tree-mode decoration the flat flagged view already
+    /// passes `flagged: false` for. It marks that split by WEIGHT, as the focused-workspace icon does,
+    /// because `.fill` is what every other row icon spends on FLAGGED, so a filled cloud would read as a
+    /// flag. The axis is not distinguished — no cloud symbol carries both arrangements.
+    private func iconForSession(split: Bool, axis: SplitAxis, flagged: Bool, remote: Bool) -> NSImage? {
+        if remote { return split ? remoteSplitSessionIcon : remoteSessionIcon }
+        switch (split, axis, flagged) {
+        case (true, .topBottom, true): return flaggedHorizontalSplitSessionIcon
+        case (true, .topBottom, false): return horizontalSplitSessionIcon
+        case (true, .leftRight, true): return flaggedSplitSessionIcon
+        case (true, .leftRight, false): return splitSessionIcon
+        case (false, _, true): return flaggedSessionIcon
+        case (false, _, false): return sessionIcon
         }
     }
 

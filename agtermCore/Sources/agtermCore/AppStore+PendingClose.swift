@@ -49,8 +49,36 @@ struct PendingWorkspaceClose {
     let focusMember: Bool
 }
 
+/// One soft-closed session still inside its undo window, paired with the workspace it came from. Its
+/// panes are hidden from `workspaces` but still own their daemons, so a runtime inventory that omitted
+/// them would report a live claim as an orphan.
+struct PendingCloseMember {
+    let session: Session
+    let workspaceID: UUID
+    let workspaceName: String
+}
+
 extension AppStore {
     public static let pendingCloseGraceInterval: TimeInterval = 3
+
+    /// Every session hidden by an undoable close, oldest first. Reads the existing records rather than
+    /// tracking its own list, so it cannot drift from what an undo would restore.
+    func pendingCloseMembers() -> [PendingCloseMember] {
+        pendingCloseOrder.compactMap { pendingCloseRecords[$0] }.flatMap { record -> [PendingCloseMember] in
+            switch record {
+            case .sessions(let close):
+                return close.sessions.map {
+                    PendingCloseMember(session: $0.session, workspaceID: $0.workspaceID,
+                                       workspaceName: $0.workspaceName)
+                }
+            case .workspace(let close):
+                return close.workspace.sessions.map {
+                    PendingCloseMember(session: $0, workspaceID: close.workspace.id,
+                                       workspaceName: close.workspace.name)
+                }
+            }
+        }
+    }
 
     /// Hide a session from the visible tree but keep its surfaces alive for a short undo window.
     /// If the grace expires, `finalizePendingClose` performs the same teardown as `closeSession`.
@@ -59,8 +87,11 @@ extension AppStore {
         guard let location = location(ofSession: sessionID) else { return false }
         let workspace = workspaces[location.workspaceIndex]
         let wasActive = selectedSessionID == sessionID
-        let session = workspaces[location.workspaceIndex].sessions.remove(at: location.sessionIndex)
+        let session = workspace.sessions[location.sessionIndex]
+        session.cancelPendingAsk()
+        workspaces[location.workspaceIndex].sessions.remove(at: location.sessionIndex)
         emitSessionClosed(session, workspace: workspace.id)
+        dropLaunchPanes([session])
         // undo reinserts THIS object, so an override armed at bootstrap and never consumed would survive the
         // round trip and fire when the restored surface is built. drop it; the persisted pin is untouched
         // and still fires on the next launch.
@@ -128,8 +159,10 @@ extension AppStore {
             guard workspaces.indices.contains(close.workspaceIndex),
                   workspaces[close.workspaceIndex].sessions.indices.contains(close.sessionIndex),
                   workspaces[close.workspaceIndex].sessions[close.sessionIndex].id == close.session.id else { continue }
+            close.session.cancelPendingAsk()
             _ = workspaces[close.workspaceIndex].sessions.remove(at: close.sessionIndex)
         }
+        dropLaunchPanes(closes.map(\.session))
         for close in closes {
             recordRecentClosedSession(close.session, workspaceID: close.workspaceID, workspaceName: close.workspaceName,
                                       workspaceIndex: close.workspaceIndex, sessionIndex: close.sessionIndex,
@@ -169,7 +202,11 @@ extension AppStore {
     @discardableResult
     public func softRemoveWorkspace(_ workspaceID: UUID, grace: TimeInterval = AppStore.pendingCloseGraceInterval) -> Bool {
         guard canRemoveWorkspace, let index = workspaces.firstIndex(where: { $0.id == workspaceID }) else { return false }
+        for session in workspaces[index].sessions {
+            session.cancelPendingAsk()
+        }
         let visibleWorkspace = workspaces.remove(at: index)
+        dropLaunchPanes(visibleWorkspace.sessions)
         forgetFreshWorkspace(workspaceID)
         for session in visibleWorkspace.sessions { emitSessionClosed(session, workspace: visibleWorkspace.id) }
         if visibleWorkspace.sessions.isEmpty { scheduleTreeChanged() }
@@ -234,9 +271,9 @@ extension AppStore {
         pendingCloseOrder.removeAll { $0 == id }
         switch record {
         case .sessions(let close):
-            for session in close.sessions { hardFinalizePendingSession(session.session) }
+            hardFinalizePendingSessions(close.sessions.map(\.session))
         case .workspace(let close):
-            hardFinalizePendingWorkspace(close.workspace)
+            hardFinalizePendingSessions(close.workspace.sessions)
         }
         if pendingCloseSummary?.id == id { promotePendingCloseSummary() }
         save()
@@ -304,6 +341,17 @@ extension AppStore {
         }
         pendingCloseOrder.removeAll { pendingCloseRecords[$0] == nil }
         return (folded, focusMember)
+    }
+
+    /// Whether a pending close is holding workspace `id`: the workspace itself, or a session recorded as
+    /// having lived in it, whose undo would put that workspace back.
+    func pendingHoldsWorkspace(_ id: UUID) -> Bool {
+        pendingCloseRecords.values.contains { record in
+            switch record {
+            case .sessions(let close): return close.sessions.contains { $0.workspaceID == id }
+            case .workspace(let close): return close.workspace.id == id
+            }
+        }
     }
 
     /// Session ids a pending close still holds. They are absent from the tree, but their live objects are
@@ -411,20 +459,17 @@ extension AppStore {
         recordRecency()
     }
 
-    private func hardFinalizePendingSession(_ session: Session) {
-        session.surface?.teardown()
-        session.splitSurface?.teardown()
-        session.overlaySurface?.teardown()
-        session.teardownPaneOverlays()
-        session.scratchSurface?.teardown()
-        session.discardHudBody() // a HUD whose surface never realized has no teardown to delete its body file
-        WatermarkStorage.removeRenderedText(sessionID: session.id)
-        removeFromRecency(session.id)
-    }
-
-    private func hardFinalizePendingWorkspace(_ workspace: Workspace) {
-        for session in workspace.sessions {
-            hardFinalizePendingSession(session)
+    private func hardFinalizePendingSessions(_ sessions: [Session]) {
+        finalizePaneIdentities(sessions)
+        for session in sessions {
+            session.surface?.teardown()
+            session.splitSurface?.teardown()
+            session.overlaySurface?.teardown()
+            session.teardownPaneOverlays()
+            session.scratchSurface?.teardown()
+            session.discardHudBody() // a HUD whose surface never realized has no teardown to delete its body file
+            WatermarkStorage.removeRenderedText(sessionID: session.id)
+            removeFromRecency(session.id)
         }
     }
 

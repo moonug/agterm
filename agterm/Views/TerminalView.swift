@@ -34,16 +34,22 @@ struct TerminalView: NSViewRepresentable {
     /// so it never grabs first responder from the dashboard's key-catcher. `.allowsHitTesting(false)` alone
     /// doesn't stop AppKit routing a click to the NSView, so the surface itself refuses hits + first responder.
     var viewOnly = false
+    /// Whether this host paints on screen when that differs from `deckVisible` — wider for dashboard cells
+    /// and HUDs (visible while non-interactive) and for panes under the quick terminal, whose `holdsKey`
+    /// term is focus ownership, not visibility. nil follows `deckVisible` (the zoom host, where they agree).
+    var onScreen: Bool?
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context _: Context) -> GhosttySurfaceView {
         let view = (session[keyPath: surfaceKeyPath] as? GhosttySurfaceView) ?? makeSurface(session)
         session[keyPath: surfaceKeyPath] = view
+        view.focusSession = session
         // before the view attaches: gate the overlay/scratch auto-focus to the active slot so a background
         // session's overlay can't grab first responder during its initial createSurface.
-        view.deckActive = isActive
+        view.deckActive = isActive && !view.askBlocksFocus
         view.deckVisible = deckVisible
+        view.deckOnScreen = onScreen ?? deckVisible
         view.suppressFocusChange = !reportsFocusChange
         view.viewOnly = viewOnly
         return view
@@ -52,15 +58,17 @@ struct TerminalView: NSViewRepresentable {
     func updateNSView(_ nsView: GhosttySurfaceView, context: Context) {
         // keep the auto-focus gate in sync with selection, set BEFORE createSurface (which fires the overlay
         // auto-focus) so a background slot never starts the focus-grab retry.
-        nsView.deckActive = isActive
+        nsView.focusSession = session
+        nsView.deckActive = isActive && !nsView.askBlocksFocus
         nsView.deckVisible = deckVisible
+        nsView.deckOnScreen = onScreen ?? deckVisible
         nsView.suppressFocusChange = !reportsFocusChange
         nsView.viewOnly = viewOnly
         // makeNSView may have run before the view had a sized window; createSurface is idempotent (guards
         // surface == nil and a non-zero backing size). synchronous on purpose: a deferred next-tick create
         // races the layout and gives the surface a stale size.
         nsView.createSurface()
-        guard isActive else {
+        guard nsView.deckActive else {
             // hidden deck pane: drop the focus latch so it re-grabs when next active, and never hold first
             // responder while hidden — the active pane needs it, and a background pane that still looks
             // "focused" wrongly suppresses its own OSC 9 desktop notification.
@@ -80,6 +88,10 @@ struct TerminalView: NSViewRepresentable {
     /// is first responder, so editing a sidebar rename survives a re-render. `mouseDown` covers the rest.
     private func focusIfNeeded(_ nsView: GhosttySurfaceView, coordinator: Coordinator) {
         guard let window = nsView.window else { return }
+        // a closing session's entry can update once more after the store tore its surface down, still
+        // carrying `isActive`; grabbing there leaves the keyboard on a dead pane instead of the reselected one.
+        guard !nsView.isDestroyed else { return }
+        guard !nsView.askBlocksFocus else { return }
         if window.firstResponder === nsView { return }
         // don't steal focus from an active text field editor (a sidebar rename); its editor is an NSText.
         if window.firstResponder is NSText { return }

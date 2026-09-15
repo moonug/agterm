@@ -19,9 +19,7 @@ struct ContentView: View {
     /// `left`/`right` the pane-scoped one covering that split pane.
     let makeOverlaySurface: (Session, AppStore, OverlayPane?) -> GhosttySurfaceView
     let makeScratchSurface: (Session, AppStore) -> GhosttySurfaceView
-    /// The `AGTERM_*` environment a window's quick terminal exposes (ENABLED + WINDOW_ID + SOCKET), per
-    /// window id. Threaded down so `WindowContentView` binds its quick terminal's `envProvider` with its own id.
-    let quickTerminalEnv: (WindowInfo.ID) -> [String: String]
+    let captureOnExit: AppDelegate.ExitCapture?
     let actions: AppActions
     let palette: PaletteController
     let sessionSwitcher: SessionSwitcher
@@ -66,7 +64,7 @@ struct ContentView: View {
                     makeSplitSurface: { makeSplitSurface($0, store) },
                     makeOverlaySurface: { makeOverlaySurface($0, store, $1) },
                     makeScratchSurface: { makeScratchSurface($0, store) },
-                    quickTerminalEnv: quickTerminalEnv,
+                    captureOnExit: captureOnExit,
                     actions: actions,
                     palette: palette,
                     sessionSwitcher: sessionSwitcher

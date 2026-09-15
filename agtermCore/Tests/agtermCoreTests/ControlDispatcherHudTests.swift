@@ -134,14 +134,70 @@ struct ControlDispatcherHudTests {
         let actions = MockControlActions()
         let dispatcher = ControlDispatcher(actions: actions)
 
-        // `top-left` is a valid session.background position, so the shared field must be re-validated here
         let response = await dispatcher.dispatch(ControlRequest(
             cmd: .sessionHudOpen,
-            args: ControlArgs(message: "working", position: "top-left")
+            args: ControlArgs(message: "working", position: "top-middle")
         ))
 
-        #expect(response == ControlResponse(ok: false, error: "invalid position: top-left (top|center|bottom)"))
+        #expect(response == ControlResponse(
+            ok: false, error: "invalid position: top-middle (\(HudPosition.acceptedNamesList))"))
         #expect(actions.calls.isEmpty)
+    }
+
+    /// The rejection has to name the aliases, or it refuses a value the dispatcher takes.
+    @Test func theRejectedPositionMessageListsTheAliasesBesideTheAnchors() async {
+        let dispatcher = ControlDispatcher(actions: MockControlActions())
+
+        let response = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionHudOpen, args: ControlArgs(message: "working", position: "nope")))
+
+        let error = try? #require(response?.error)
+        #expect(error?.contains("top-right") == true)
+        #expect(error?.hasSuffix("|top|bottom)") == true)
+    }
+
+    @Test func acceptsEveryAnchorAndBothAliases() async throws {
+        for raw in ["top-left", "center-right", "bottom-right", "top", "bottom"] {
+            let actions = MockControlActions()
+            let dispatcher = ControlDispatcher(actions: actions)
+
+            let response = await dispatcher.dispatch(ControlRequest(
+                cmd: .sessionHudOpen, args: ControlArgs(message: "working", position: raw)))
+
+            #expect(response?.error == nil)
+            let call = try #require(actions.calls.first)
+            guard case let .hudOpen(_, _, spec, _) = call else { Issue.record("not a hud open"); return }
+            #expect(spec.position == HudPosition.parse(raw))
+        }
+    }
+
+    @Test func rejectsMalformedTextColorWithoutCallingHost() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionHudOpen,
+            args: ControlArgs(message: "working", textColor: "#gg0000")
+        ))
+
+        #expect(response == ControlResponse(ok: false, error: "invalid text color: #gg0000 (#rrggbb)"))
+        #expect(actions.calls.isEmpty)
+    }
+
+    /// An update carries the open's background forward but NOT its text color, the header being what paints
+    /// the text and the surface config what paints the backing.
+    @Test func updateCarriesItsOwnTextColorThrough() async throws {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        _ = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionHudUpdate,
+            args: ControlArgs(message: "done", textColor: "#7ec07e", position: "bottom-right")))
+
+        let call = try #require(actions.calls.first)
+        guard case let .hudUpdate(_, _, spec, _) = call else { Issue.record("not a hud update"); return }
+        #expect(spec.textColor == "#7ec07e")
+        #expect(spec.position == .bottomRight)
     }
 
     @Test func rejectsUnknownSpinnerStyleWithoutCallingHost() async {
@@ -168,7 +224,7 @@ struct ControlDispatcherHudTests {
                                                      args: ControlArgs(message: "working",
                                                                        spinner: style.rawValue)))
 
-        guard case let .hudOpen(_, _, spec) = try #require(actions.calls.first) else {
+        guard case let .hudOpen(_, _, spec, _) = try #require(actions.calls.first) else {
             Issue.record("expected session.hud.open host call")
             return
         }
@@ -185,7 +241,7 @@ struct ControlDispatcherHudTests {
                                                      args: ControlArgs(message: "working",
                                                                        spinner: HudSpinner.noneName)))
 
-        guard case let .hudOpen(_, _, spec) = try #require(actions.calls.first) else {
+        guard case let .hudOpen(_, _, spec, _) = try #require(actions.calls.first) else {
             Issue.record("expected session.hud.open host call")
             return
         }
@@ -209,7 +265,8 @@ struct ControlDispatcherHudTests {
         let call = try #require(actions.calls.first)
         #expect(call == .hudOpen(target: "session-id", window: "window-id",
                                  HudSpec(message: "gathering options", detail: "scanning 400 files", spinner: .bar,
-                                         backgroundColor: "#112233", sizePercent: 40, position: .top)))
+                                         backgroundColor: "#112233", sizePercent: 40, position: .topCenter),
+                                 ControlHudPlacement()))
     }
 
     @Test func updateRoutesParsedSpecAndReturnsHostResponse() async throws {
@@ -227,7 +284,39 @@ struct ControlDispatcherHudTests {
         #expect(response == expected)
         let call = try #require(actions.calls.first)
         #expect(call == .hudUpdate(target: "session-id", window: nil,
-                                   HudSpec(message: "still working", detail: "312 of 400", position: .bottom)))
+                                   HudSpec(message: "still working", detail: "312 of 400", position: .bottomCenter),
+                                   ControlHudPlacement()))
+    }
+
+    @Test func paneAndPaneIDRouteToOpenAndUpdate() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        _ = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionHudOpen, args: ControlArgs(message: "working", pane: "split", paneID: "stable-token")
+        ))
+        _ = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionHudUpdate, args: ControlArgs(message: "done", pane: "top", paneID: "next-token")
+        ))
+
+        #expect(actions.calls == [
+            .hudOpen(target: nil, window: nil, HudSpec(message: "working"),
+                     ControlHudPlacement(pane: .right, paneID: "stable-token")),
+            .hudUpdate(target: nil, window: nil, HudSpec(message: "done"),
+                       ControlHudPlacement(pane: .left, paneID: "next-token")),
+        ])
+    }
+
+    @Test func invalidPaneIsRejectedBeforeTheHost() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionHudOpen, args: ControlArgs(message: "working", pane: "scratch")
+        ))
+
+        #expect(response == ControlResponse(ok: false, error: "--pane must be left or right"))
+        #expect(actions.calls.isEmpty)
     }
 
     @Test func omittedPositionSpinnerAndOverridesTakeTheirDefaults() async throws {
@@ -237,7 +326,7 @@ struct ControlDispatcherHudTests {
         _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionHudOpen, args: ControlArgs(message: "working")))
 
         let call = try #require(actions.calls.first)
-        guard case let .hudOpen(_, _, spec) = call else {
+        guard case let .hudOpen(_, _, spec, placement) = call else {
             Issue.record("expected session.hud.open host call")
             return
         }
@@ -246,6 +335,7 @@ struct ControlDispatcherHudTests {
         #expect(spec.detail == nil)
         #expect(spec.backgroundColor == nil)
         #expect(spec.sizePercent == nil)
+        #expect(placement == ControlHudPlacement())
     }
 
     @Test(arguments: HudPosition.allCases)
@@ -259,7 +349,7 @@ struct ControlDispatcherHudTests {
         ))
 
         let call = try #require(actions.calls.first)
-        guard case let .hudOpen(_, _, spec) = call else {
+        guard case let .hudOpen(_, _, spec, _) = call else {
             Issue.record("expected session.hud.open host call")
             return
         }

@@ -21,6 +21,20 @@ struct PickTests {
         #expect(controller.result(for: pick.id) == outcome)
     }
 
+    @Test func pendingModalErrorNamesTheCurrentOwner() {
+        let controller = PickController()
+        #expect(controller.pendingModalError == nil)
+        #expect(controller.open(makePick(id: "pick")))
+        #expect(controller.pendingModalError == "pick pending")
+        controller.cancel()
+        #expect(controller.pendingModalError == nil)
+        #expect(controller.openAsk(PendingAsk(id: "ask", title: "Continue?",
+                                             buttons: [ControlAskButton(id: "yes", label: "Yes")])))
+        #expect(controller.pendingModalError == "ask pending")
+        controller.cancelAsk()
+        #expect(controller.pendingModalError == nil)
+    }
+
     @Test func cancelRetainsCancelledResult() {
         let controller = PickController()
         let pick = makePick(id: "pick-cancel")
@@ -41,6 +55,63 @@ struct PickTests {
         #expect(!controller.open(second))
         #expect(controller.pending == first)
         #expect(controller.result(for: "second") == nil)
+    }
+
+    @Test(arguments: [ControlAskOutcome.answered, .escaped, .cancelled])
+    func guiAskResolutionIsRetainedByTheSharedRegistry(outcome: ControlAskOutcome) {
+        let windowID = UUID()
+        let controller = PickController()
+        PickRegistry.shared.register(windowID, controller: controller)
+        defer { PickRegistry.shared.unregister(windowID) }
+        let ask = PendingAsk(id: UUID().uuidString, title: "Continue?", buttons: [ControlAskButton(id: "yes", label: "Yes")], style: .gui)
+        #expect(controller.openAsk(ask))
+        #expect(AskRegistry.shared.register(id: ask.id, owner: .window(windowID)))
+        #expect(!controller.open(makePick(id: "pick")))
+        let result = outcome == .answered ? ControlAskResult(result: .answered, id: "yes", label: "Yes", index: 0)
+            : ControlAskResult(result: outcome)
+        controller.resolveAsk(result)
+        controller.cancelAsk()
+        #expect(controller.askResult(for: ask.id) == result)
+        PickRegistry.shared.unregister(windowID)
+        #expect(AskRegistry.shared.result(for: ask.id)?.result == result)
+        #expect(AskRegistry.shared.result(for: ask.id)?.windowID == windowID)
+    }
+
+    @Test func windowUnregisterCancelsGUIAskAndRetainsIt() {
+        let windowID = UUID()
+        let controller = PickController()
+        PickRegistry.shared.register(windowID, controller: controller)
+        let ask = PendingAsk(id: UUID().uuidString, title: "Continue?", buttons: [], style: .gui)
+        #expect(controller.openAsk(ask))
+        #expect(AskRegistry.shared.register(id: ask.id, owner: .window(windowID)))
+        PickRegistry.shared.unregister(windowID)
+        #expect(controller.pendingAsk == nil)
+        #expect(AskRegistry.shared.result(for: ask.id)?.result == ControlAskResult(result: .cancelled))
+    }
+
+    @Test func askAndPickCachesTurnOverIndependently() {
+        let windowID = UUID()
+        let controller = PickController()
+        PickRegistry.shared.register(windowID, controller: controller)
+        defer { PickRegistry.shared.unregister(windowID) }
+        #expect(controller.open(makePick(id: "first-pick")))
+        controller.cancel()
+        var ids: [String] = []
+        for _ in 0...AskRegistry.retainedResultLimit {
+            let ask = PendingAsk(id: UUID().uuidString, title: "Continue?", buttons: [], style: .gui)
+            ids.append(ask.id)
+            #expect(controller.openAsk(ask))
+            #expect(AskRegistry.shared.register(id: ask.id, owner: .window(windowID)))
+            controller.cancelAsk()
+        }
+        #expect(controller.result(for: "first-pick")?.result == .cancelled)
+        #expect(AskRegistry.shared.result(for: ids[0]) == nil)
+        for index in 0...PickController.retainedResultLimit {
+            #expect(controller.open(makePick(id: "pick-\(index)")))
+            controller.cancel()
+        }
+        #expect(controller.result(for: "first-pick") == nil)
+        #expect(AskRegistry.shared.result(for: ids[1])?.result.result == .cancelled)
     }
 
     @Test func pendingPickCarriesQueryAndDefaultsItToNil() {

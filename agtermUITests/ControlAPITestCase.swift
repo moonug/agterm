@@ -42,13 +42,12 @@ class ControlAPITestCase: XCTestCase {
         // the sandbox grant (the per-test AGTERM_STATE_DIR subdir is ~135 bytes; /tmp gives EPERM).
         socketPath = (NSTemporaryDirectory() as NSString)
             .appendingPathComponent("agtermc-\(UUID().uuidString.prefix(8)).sock")
-        app = XCUIApplication()
-        app.launchEnvironment["AGTERM_STATE_DIR"] = stateDir.path
-        app.launchEnvironment["AGTERM_CONTROL_SOCKET"] = socketPath
+        app = makeApp()
         // pin the title-bar double-click action so the header gesture tests are hermetic regardless of
         // the host's Desktop & Dock setting; launch args can't carry it — FB11763863.
         app.launchEnvironment["AGTERM_UITEST_DOUBLECLICK_ACTION"] =
             name.contains("testDoubleClickHeaderHonorsNoneSetting") ? "None" : "Maximize"
+        if enablesZmxForUITest { app.launchEnvironment["AGTERM_UITEST_ENABLE_ZMX"] = "1" }
         try seedSettingsIfNeeded()
         app.launchForUITest()
         // the seeded session row proves the window (and thus the control server's scene .task) is up.
@@ -62,11 +61,28 @@ class ControlAPITestCase: XCTestCase {
         if let markerDir { try? FileManager.default.removeItem(at: markerDir) }
     }
 
+    /// Defaults every launch of this case seeds through `NSArgumentDomain`, which the app reads ahead of
+    /// its own plist. The XCUITest runner is app-sandboxed, so a `UserDefaults(suiteName:)` write from the
+    /// test process lands in the runner's container and never reaches the app.
+    var seededDefaults: [String: String] = [:]
+
+    /// A fresh `XCUIApplication` pointed at this case's isolated state dir, socket and seeded defaults.
+    private func makeApp() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchEnvironment["AGTERM_STATE_DIR"] = stateDir.path
+        app.launchEnvironment["AGTERM_CONTROL_SOCKET"] = socketPath
+        app.launchArguments += seededDefaults.flatMap { ["-\($0.key)", $0.value] }
+        return app
+    }
+
     /// Settings to write into the isolated state dir's `settings.json` before launch. Nil (the default)
     /// launches with stock defaults. Override to start the app with a non-default setting — the control
     /// channel has no `settings.*` command, so pre-seeding the file is the only way to exercise one
     /// without driving the Settings window.
     var seededSettings: [String: Any]? { nil }
+
+    /// Opt one focused persistence test into the real bundled zmx path. Every other UI test bypasses it.
+    var enablesZmxForUITest: Bool { false }
 
     /// Write `seededSettings` into the state dir before launch, so `SettingsModel.init` picks it up.
     private func seedSettingsIfNeeded() throws {
@@ -155,9 +171,7 @@ class ControlAPITestCase: XCTestCase {
         app.terminate()
         try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         try Data(snapshot.utf8).write(to: stateDir.windowSnapshotFile())
-        app = XCUIApplication()
-        app.launchEnvironment["AGTERM_STATE_DIR"] = stateDir.path
-        app.launchEnvironment["AGTERM_CONTROL_SOCKET"] = socketPath
+        app = makeApp()
         app.launchForUITest()
         XCTAssertTrue(app.staticTexts["session-row"].waitForExistence(timeout: 30), "restored session should exist")
     }
@@ -182,9 +196,7 @@ class ControlAPITestCase: XCTestCase {
         let configDir = stateDir.appendingPathComponent("config", isDirectory: true)
         try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
         try Data(contents.utf8).write(to: configDir.appendingPathComponent(fileName))
-        app = XCUIApplication()
-        app.launchEnvironment["AGTERM_STATE_DIR"] = stateDir.path
-        app.launchEnvironment["AGTERM_CONTROL_SOCKET"] = socketPath
+        app = makeApp()
         app.launchForUITest()
         XCTAssertTrue(app.staticTexts["session-row"].waitForExistence(timeout: 30), "seeded session should exist")
     }
@@ -199,9 +211,7 @@ class ControlAPITestCase: XCTestCase {
         app.terminate()
         try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         try Data(json.utf8).write(to: stateDir.appendingPathComponent("settings.json"))
-        app = XCUIApplication()
-        app.launchEnvironment["AGTERM_STATE_DIR"] = stateDir.path
-        app.launchEnvironment["AGTERM_CONTROL_SOCKET"] = socketPath
+        app = makeApp()
         app.launchForUITest()
         XCTAssertTrue(app.staticTexts["session-row"].waitForExistence(timeout: 30), "seeded session should exist")
     }
@@ -364,6 +374,19 @@ class ControlAPITestCase: XCTestCase {
         }
     }
 
+    /// A pane's terminal width in columns, read from its own shell. `splitRatio` alone cannot tell a moved
+    /// divider from a still one: the model is written by a drag, `session.resize` and the first-layout seed,
+    /// never from a layout pass, so a normalize leaves the stored value untouched. The pty is resized by the
+    /// layout, so its width is the live geometry. `tag` names the moment, keeping each read's marker distinct.
+    func paneColumns(id: String, pane: String, tag: String) throws -> Int {
+        let file = markerDir.appendingPathComponent("\(tag)-\(pane)-stty")
+        let value = try XCTUnwrap(typeUntilMarker("stty size > '\(file.path)'\n", target: id, file: file,
+                                                  select: false, pane: pane),
+                                  "the \(pane) pane should report its pty size (\(tag))")
+        let columns = value.split(separator: " ").last.map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        return Int(columns ?? "") ?? -1
+    }
+
     /// Polls the hermetic snapshot file until the (single seeded workspace's) first session's `splitRatio`
     /// equals `expected` — the persisted side effect of `session.resize`.
     func pollSplitRatio(_ expected: Double, timeout: TimeInterval) -> Bool {
@@ -444,6 +467,79 @@ class ControlAPITestCase: XCTestCase {
     }
 
     // MARK: - Socket client
+
+    var askDialog: XCUIElement {
+        app.descendants(matching: .any).matching(identifier: "ask-dialog").firstMatch
+    }
+
+    func askButton(_ id: String) -> XCUIElement {
+        app.buttons.matching(identifier: "ask-button-\(id)").firstMatch
+    }
+
+    func clickAskButton(_ id: String) {
+        XCTAssertTrue(askButton(id).waitForExistence(timeout: 5))
+        let matches = app.buttons.matching(identifier: "ask-button-\(id)")
+        (matches.allElementsBoundByIndex.first { $0.isHittable } ?? matches.firstMatch).click()
+    }
+
+    func sendControlCommand(_ command: String, target: String? = nil,
+                            args: [String: Any]? = nil) throws -> [String: Any] {
+        var request: [String: Any] = ["cmd": command]
+        if let target { request["target"] = target }
+        if let args { request["args"] = args }
+        let data = try JSONSerialization.data(withJSONObject: request)
+        return try sendCommand(String(decoding: data, as: UTF8.self))
+    }
+
+    func openAsk(_ buttons: [[String: Any]], title: String = "Choose an action",
+                 target: String? = nil, options: [String: Any] = [:]) throws -> String {
+        var args = options
+        args["buttons"] = buttons
+        args["title"] = title
+        let response = try sendControlCommand("ask.open", target: target, args: args)
+        XCTAssertEqual(response["ok"] as? Bool, true, "\(response)")
+        return try XCTUnwrap((response["result"] as? [String: Any])?["id"] as? String)
+    }
+
+    func askResult(_ id: String, window: String? = nil) throws -> [String: Any] {
+        let response = try sendControlCommand("ask.result", target: id, args: window.map { ["window": $0] })
+        XCTAssertEqual(response["ok"] as? Bool, true, "\(response)")
+        return try XCTUnwrap((response["result"] as? [String: Any])?["ask"] as? [String: Any])
+    }
+
+    func openAskCLI(_ arguments: [String]) throws -> String {
+        let process = Process()
+        process.executableURL = Bundle.main.bundleURL.deletingLastPathComponent()
+            .appendingPathComponent("agterm.app/Contents/MacOS/agtermctl")
+        process.arguments = ["ask", "Choose an action", "--no-block", "--socket", socketPath] + arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, String(decoding: data, as: UTF8.self))
+        let result = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        return try XCTUnwrap(result["id"] as? String)
+    }
+
+    func awaitAskResult(_ id: String, window: String? = nil, timeout: TimeInterval = 10) throws -> [String: Any] {
+        let deadline = Date().addingTimeInterval(timeout)
+        var result = try askResult(id, window: window)
+        while result["result"] as? String == "pending", Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            result = try askResult(id, window: window)
+        }
+        XCTAssertNotEqual(result["result"] as? String, "pending")
+        return result
+    }
+
+    func treeAskPending(window: String? = nil) throws -> String? {
+        let response = try sendControlCommand("tree", args: window.map { ["window": $0] })
+        XCTAssertEqual(response["ok"] as? Bool, true, "\(response)")
+        let tree = try XCTUnwrap((response["result"] as? [String: Any])?["tree"] as? [String: Any])
+        return tree["askPending"] as? String
+    }
 
     /// Connect to the app's control socket, send `line` (newline-terminated), read the single response
     /// line, and parse it as JSON. Retries the connect briefly since the server's scene `.task` may bind a

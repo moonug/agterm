@@ -30,17 +30,18 @@ struct WindowContentView: View {
     /// nil builds the session-wide overlay surface, `left`/`right` the pane-scoped one reading that pane's slot.
     let makeOverlaySurface: (Session, OverlayPane?) -> GhosttySurfaceView
     let makeScratchSurface: (Session) -> GhosttySurfaceView
-    let quickTerminalEnv: (WindowInfo.ID) -> [String: String]
+    let captureOnExit: AppDelegate.ExitCapture?
     let actions: AppActions
     let palette: PaletteController
     let sessionSwitcher: SessionSwitcher
     /// Mirrors `WindowAppearance`'s other opaque-forcing condition; SwiftUI keeps it current by itself.
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    /// One quick terminal per window, registered in `QuickTerminalRegistry` on appear so the
-    /// frontmost-window call sites reach it; its `cwdProvider` binds to this window's active session.
-    @State var quickTerminal = QuickTerminalController()
-    /// Window-level zoom: rehosts the visible terminal surface above the sidebar, titlebar, quick terminal
-    /// frame, palettes and switcher until toggled off.
+    /// The app's one quick terminal, which lives in its own detached panel rather than in any window. Read
+    /// here so the deck's gates still follow its visibility — a panel with key steals it from every window,
+    /// not just this one. `agtermApp` owns its providers.
+    var quickTerminal: QuickTerminalController { .shared }
+    /// Window-level zoom: rehosts the visible terminal surface above the sidebar, titlebar,
+    /// palettes and switcher until toggled off.
     @State var terminalZoom = TerminalZoomController()
     /// View-only grid of reparented member surfaces, registered in `DashboardControllerRegistry` on appear so
     /// the socket drives it; `+Dashboard` owns the overlay branch, deck yield, font override and lifecycle.
@@ -86,6 +87,9 @@ struct WindowContentView: View {
     /// Whether the attention popover (the mouse equivalent of the ⌃⇧I attention palette) is shown, anchored
     /// on the title-bar bell. Non-private so the `+RecentSessions` extension's bell/rows can toggle it.
     @State var attentionPopoverShown = false
+    /// Whether the custom-commands popover (the mouse form of the ⌃⇧O palette) is shown, anchored on its
+    /// title-bar button. Non-private so the `+CustomCommands` extension's button/rows can toggle it.
+    @State var customCommandsShown = false
     /// Sidebar width and visibility live on the per-window `AppStore`, persisted in `Snapshot` and shared
     /// with the toolbar button, View menu, palette and the `sidebar` control command.
     /// Height of the custom titlebar row: title + cwd normal, one short line compact, zero hidden (an
@@ -130,6 +134,10 @@ struct WindowContentView: View {
                 .padding(.top, titlebarHeight)
                 .zIndex(20)
         }
+        .overlayPreferenceValue(AskAnchorPreferenceKey.self) { anchors in
+            askDialogOverlay(anchors).zIndex(20)
+                .allowsHitTesting(pick.pendingAsk != nil)
+        }
         // with the title bar hidden (.hiddenTitleBar), pull our header to the very top so the traffic
         // lights overlay it as one row; no system title bar is left to clip the content.
         .ignoresSafeArea(.container, edges: .top)
@@ -146,11 +154,12 @@ struct WindowContentView: View {
                 dividerDragging = false
             }
         }
-        // on quick-terminal hide refocus the active session, unless this window's zoom owns focus: zoom-enter
-        // hides it, and `actions` targets the FRONTMOST window, so a background hide must not move focus.
+        // on quick-terminal hide refocus the active session, unless this window's zoom owns focus. The panel
+        // is app-level so every open window sees the change; `actions` targets the FRONTMOST window, so the
+        // frontmost check keeps a background window from moving focus on its behalf.
         .onChange(of: quickTerminal.isVisible) { _, visible in
-            if !visible, terminalZoom.target == .quick { terminalZoom.clear() }
-            if !visible, terminalZoom.target == nil { actions.focusActiveSession() }
+            guard !visible, isFrontmost, terminalZoom.target == nil else { return }
+            actions.focusActiveSession()
         }
         .onChange(of: terminalZoom.target) { old, new in
             handleZoomTargetChange(old: old, new: new)
@@ -175,6 +184,7 @@ struct WindowContentView: View {
         // reshuffle the selection under it and an action-palette run hit the wrong session.
         .onChange(of: palette.mode == nil) { _, closed in
             if closed {
+                actions.resignDismissedFieldEditor(for: windowID)
                 store.resumeAutoFollow()
                 actions.focusActiveSession()
             } else {
@@ -183,15 +193,20 @@ struct WindowContentView: View {
         }
         // a native picker owns keyboard focus like a palette: pair auto-follow suppression per window, then
         // return first responder to this window's terminal after every resolution path.
-        .onChange(of: pick.pending?.id) { old, new in
-            if old == nil, new != nil, !pickSuppressesAutoFollow {
-                // a socket-driven picker may arrive with either title-bar popover already open; dismiss
-                // both so no second interactive surface remains above the modal picker.
+        .onChange(of: pick.modalPending) { old, new in
+            if !old, new, !pickSuppressesAutoFollow {
+                // a socket-driven picker may arrive with a title-bar popover already open; dismiss them
+                // all so no second interactive surface remains above the modal picker. The quick-terminal
+                // panel is now exactly that surface and the worst of them: it floats above every window and
+                // holds key, so the picker would open under it with neither the screen nor the keyboard.
+                // `canShow` stops the reverse order; this is the same class from the other direction.
+                QuickTerminalController.shared.hide()
                 recentSessionsShown = false
                 attentionPopoverShown = false
+                customCommandsShown = false
                 store.suppressAutoFollow()
                 pickSuppressesAutoFollow = true
-            } else if old != nil, new == nil, pickSuppressesAutoFollow {
+            } else if old, !new, pickSuppressesAutoFollow {
                 store.resumeAutoFollow()
                 pickSuppressesAutoFollow = false
                 if pickFocusRestoration.pickerResolved(isFrontmost: isFrontmost) {
@@ -214,28 +229,17 @@ struct WindowContentView: View {
             if let state = fullscreenState(from: note) { windowFullscreen = state }
         })
         // blend the title bar with the terminal; report frontmost/close to the library; surface the window
-        // un-minimized on launch. the title token re-runs the blend in updateNSView on a session switch.
-        .background(WindowAccessor(titleToken: windowTitle, windowID: windowID, library: library, store: store))
+        // un-minimized on launch. a child view: it reads the OS title in its own body, never in this one.
+        .background(windowTitleSync)
         .onAppear {
-            quickTerminal.cwdProvider = { [store] in
-                store.activeSession?.effectiveCwd ?? FileManager.default.homeDirectoryForCurrentUser.path
-            }
-            // the quick terminal's shell sees this window's AGTERM_* env (scratch: ENABLED + WINDOW_ID + SOCKET).
-            quickTerminal.envProvider = { [quickTerminalEnv, windowID] in quickTerminalEnv(windowID) }
-            // typing counts as activity, so an idle auto-follow fire can't change this window's selected
-            // session behind the overlay while the user types (mirrors the overlay/scratch).
-            quickTerminal.onUserInput = { [store] in store.noteUserActivity() }
-            quickTerminal.focusAllowed = { [pick] in pick.pending == nil }
-            QuickTerminalRegistry.shared.register(windowID, controller: quickTerminal)
-            terminalZoom.targetResolver = { [store, quickTerminal] in
-                TerminalZoomController.resolveTarget(store: store, quickTerminalVisible: quickTerminal.isVisible)
+            terminalZoom.targetResolver = { [store] in
+                TerminalZoomController.resolveTarget(store: store)
             }
             TerminalZoomRegistry.shared.register(windowID, controller: terminalZoom)
             registerDashboard()
             PickRegistry.shared.register(windowID, controller: pick)
         }
         .onDisappear {
-            QuickTerminalRegistry.shared.unregister(windowID)
             TerminalZoomRegistry.shared.unregister(windowID)
             tearDownDashboard()
             if pickSuppressesAutoFollow {
@@ -243,6 +247,7 @@ struct WindowContentView: View {
                 pickSuppressesAutoFollow = false
             }
             PickRegistry.shared.unregister(windowID)
+            store.workspaces.flatMap(\.sessions).forEach { $0.cancelPendingAsk() }
         }
     }
 
@@ -263,6 +268,18 @@ struct WindowContentView: View {
             // the reload is skipped when the file is unchanged, so a no-op editor session keeps its font zoom.
             actions.ghosttyEditOverlaySession = nil
             actions.reloadGhosttyConfigIfEdited()
+        }
+    }
+
+    /// The separator between the custom titlebar row and the content below it, themed (`chromeText` at low
+    /// opacity) so it stays visible on light themes. Both columns draw it so the line runs full width.
+    /// Hidden mode draws nothing: `titlebarHeight` is 0 there, so with no row above it the line would sit
+    /// on the window's top edge separating nothing, which reads as a rendering artifact (#368).
+    @ViewBuilder private var titlebarHairline: some View {
+        if toolbarMode != .hidden {
+            Rectangle()
+                .fill(chromeText.opacity(0.1))
+                .frame(height: 1)
         }
     }
 
@@ -296,8 +313,8 @@ struct WindowContentView: View {
             .opacity(terminalZoom.target == nil ? 1 : 0)
             .allowsHitTesting(terminalZoom.target == nil)
             .onChange(of: isFrontmost) { _, frontmost in
-                if frontmost, pick.pending != nil { palette.close() }
-                if frontmost, pickFocusRestoration.windowBecameFrontmost(pickPending: pick.pending != nil) {
+                if frontmost, pick.modalPending { palette.close() }
+                if frontmost, pickFocusRestoration.windowBecameFrontmost(pickPending: pick.modalPending) {
                     restoreFocusAfterPick()
                 }
             }
@@ -305,10 +322,7 @@ struct WindowContentView: View {
 
     private var sidebarColumn: some View {
         VStack(spacing: 0) {
-            // matches the detail pane's hairline so the line runs full width under the title bar.
-            Rectangle()
-                .fill(chromeText.opacity(0.1))
-                .frame(height: 1)
+            titlebarHairline
             WorkspaceSidebar(store: store, actions: actions)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         }
@@ -358,7 +372,7 @@ struct WindowContentView: View {
                         DragGesture(minimumDistance: 1, coordinateSpace: .global)
                             .onChanged { value in
                                 dividerDragging = true
-                                store.sidebarWidth = min(AppStore.sidebarWidthMax, max(AppStore.sidebarWidthMin, Double(value.location.x)))
+                                store.sidebarWidth = AppStore.clampSidebarWidth(Double(value.location.x))
                                 // past the clamp the divider stops following the pointer, which ends up over
                                 // live terminal with no hover event left to repaint ↔.
                                 setDividerCursor()
@@ -388,11 +402,7 @@ struct WindowContentView: View {
 
     @ViewBuilder private var detailColumn: some View {
         VStack(spacing: 0) {
-            // hairline between the title bar and the terminal; in the detail pane so it starts at the
-            // sidebar's right edge, themed (chromeText, low opacity) so it stays visible on light themes.
-            Rectangle()
-                .fill(chromeText.opacity(0.1))
-                .frame(height: 1)
+            titlebarHairline
             detailPane
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 // the overlay renders in-deck inside `sessionDetail` (`overlayPanel`), not at this level.
@@ -470,7 +480,9 @@ struct WindowContentView: View {
     }
 
     /// The terminal background color from the ghostty config, with a dark fallback if libghostty has none.
-    private static func resolvedTerminalColor() -> Color {
+    /// Not private: the quick-terminal panel paints the same backing, its surface drawing transparent under
+    /// `background-opacity = 0` exactly as a window's does.
+    static func resolvedTerminalColor() -> Color {
         Color(nsColor: GhosttyApp.shared.terminalBackgroundColor
             ?? NSColor(srgbRed: 0.157, green: 0.173, blue: 0.204, alpha: 1))
     }
@@ -518,56 +530,19 @@ struct WindowContentView: View {
         return "\(base) (\(glyph))"
     }
 
-    /// The window-level overlays (quick terminal, palettes, Ctrl-Tab switcher) as one ZStack sibling INSIDE
+    /// The window-level overlays (palettes, Ctrl-Tab switcher) as one ZStack sibling INSIDE
     /// the body's root ZStack, not body-level `.overlay`s, so it can be inset below the titlebar and ordered
     /// BELOW `customTitlebar`. Every child is conditional, so an empty layer is not hit-testable and the
-    /// terminal below stays interactive. Order here = z-order (switcher over palette over quick terminal).
+    /// terminal below stays interactive. Order here = z-order (switcher over palette). The quick terminal is
+    /// NOT here — it is a detached panel, above every window rather than inside one.
     private var windowOverlayLayer: some View {
         ZStack {
-            quickTerminalOverlay
             commandPaletteOverlay
             sessionSwitcherOverlay
             // opening the dashboard closes the three above, so ordering only settles the empty case.
             dashboardOverlay
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    /// The scratch terminal centered at 90% of the window, framed by a hairline border and shadow so it reads
-    /// as a distinct floating window over the content — libghostty renders only the terminal, so the frame is
-    /// drawn here. The margin is a tap-catcher that dismisses on click and carries the same backdrop mute as
-    /// a floating overlay. A dark scrim was rejected here and stays rejected: this layer is inset below the
-    /// AppKit title bar, so anything painted over the body raises its opacity against unchanged chrome. The
-    /// mute wash is neutral at full window opacity and `muteWashOpacity` scales it down under translucency,
-    /// which shrinks the seam without closing it. The controller owns the surface, so hiding keeps the shell
-    /// alive.
-    @ViewBuilder private var quickTerminalOverlay: some View {
-        if quickTerminal.isVisible {
-            GeometryReader { geo in
-                ZStack {
-                    // the tap-catcher carries the `quick-terminal` accessibility id: a SwiftUI view is in
-                    // the a11y tree (the Metal-backed `QuickTerminalPane` is not), so tests query this one.
-                    // it spans the sidebar too, unlike the overlay's pane-scoped backdrop.
-                    (store.activeSession.map { washColor(for: $0) } ?? terminalColor).opacity(muteWashOpacity)
-                        .contentShape(Rectangle())
-                        .onTapGesture { quickTerminal.hide() }
-                        .accessibilityElement()
-                        .accessibilityIdentifier("quick-terminal")
-                    QuickTerminalPane(controller: quickTerminal)
-                        .frame(width: geo.size.width * 0.9, height: geo.size.height * 0.9)
-                        // solid backing so the quick terminal stays opaque even when the main window
-                        // is translucent (its ghostty surface draws transparent under background-opacity=0).
-                        .background(terminalColor)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
-                        )
-                        .shadow(radius: 24)
-                }
-                .frame(width: geo.size.width, height: geo.size.height)
-            }
-        }
     }
 
     /// True only for the frontmost window: the palette and switcher are app-global singles on the frontmost
@@ -595,7 +570,7 @@ struct WindowContentView: View {
     /// Mounted only while a palette is open in the frontmost window; its content (search field + result
     /// list) is rebuilt from `palette.mode`.
     @ViewBuilder private var commandPaletteOverlay: some View {
-        if isFrontmost, pick.pending == nil, palette.mode != nil {
+        if isFrontmost, !pick.modalPending, palette.mode != nil {
             CommandPalette(controller: palette, actions: actions, terminalAreaInset: terminalAreaInset)
         }
     }
@@ -630,6 +605,66 @@ struct WindowContentView: View {
             )
             .id(pending.id)
         }
+    }
+
+    private func askDialogOverlay(_ anchors: AskAnchorPreferences) -> some View {
+        GeometryReader { proxy in
+            if let ask = pick.pendingAsk {
+                let valid = askAnchorIsValid(ask.anchor)
+                ZStack {
+                    Color.clear.contentShape(Rectangle()).onTapGesture {}
+                    if let frame = askAnchorFrame(ask.anchor, anchors: anchors, proxy: proxy), valid {
+                        AskDialogView(ask: ask, anchorFrame: frame, font: askFont,
+                                      foreground: chromeText, background: terminalColor, focusAllowed: isFrontmost,
+                                      onAnswer: { index in
+                                          guard pick.pendingAsk?.id == ask.id else { return }
+                                          let button = ask.buttons[index]
+                                          pick.resolveAsk(ControlAskResult(result: .answered, id: button.id,
+                                                                           label: button.label, index: index))
+                                      },
+                                      onDismiss: {
+                                          guard pick.pendingAsk?.id == ask.id else { return }
+                                          actions.escapePendingAsk(for: windowID)
+                                      })
+                    }
+                }
+                .id(ask.id)
+                .onChange(of: valid, initial: true) { _, valid in
+                    if !valid, pick.pendingAsk?.id == ask.id { pick.cancelAsk() }
+                }
+            }
+        }
+    }
+
+    var askFont: NSFont {
+        let size = actions.settingsModel?.settings.fontSize ?? GhosttyApp.shared.baseFontSize
+        if let family = actions.settingsModel?.settings.fontFamily, let font = NSFont(name: family, size: size) {
+            return font
+        }
+        return NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+    }
+
+    private func askAnchorIsValid(_ anchor: AskAnchor?) -> Bool {
+        guard let anchor else { return true }
+        guard store.selectedSessionID == anchor.sessionID,
+              let session = store.session(withID: anchor.sessionID) else { return false }
+        guard let identity = anchor.paneIdentity else { return anchor.pane == nil }
+        guard let pane = session.paneRole(forIdentity: identity) else { return false }
+        return session.rendersPane(pane)
+    }
+
+    private func askAnchorFrame(_ anchor: AskAnchor?, anchors: AskAnchorPreferences, proxy: GeometryProxy) -> CGRect? {
+        guard let anchor else {
+            return CGRect(x: terminalAreaInset, y: titlebarHeight, width: max(0, proxy.size.width - terminalAreaInset),
+                          height: max(0, proxy.size.height - titlebarHeight))
+        }
+        guard anchors.sessionID == anchor.sessionID else { return nil }
+        if let identity = anchor.paneIdentity {
+            guard let session = store.session(withID: anchor.sessionID),
+                  let pane = session.paneRole(forIdentity: identity), let bounds = anchors.panes[pane] else { return nil }
+            return proxy[bounds]
+        }
+        return anchors.container.map { proxy[$0] }
     }
 
     /// The Ctrl-Tab session switcher overlay, mounted only while cycling in the frontmost window.

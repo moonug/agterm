@@ -7,6 +7,61 @@ import Testing
 /// `WindowLibrary` is `@MainActor`, so the suite is too.
 @MainActor
 final class WindowLibraryTests {
+    @Test(arguments: [false, true])
+    func droppingAWindowCancelsAllItsSessionAsks(remove: Bool) throws {
+        let library = WindowLibrary(directory: directory)
+        let remainingID = try #require(library.activeWindowID)
+        let remainingSession = try #require(library.activeStore?.activeSession)
+        let closing = library.newWindow(name: "closing")
+        let store = try #require(library.store(for: closing.id))
+        let workspace = store.addWorkspace(name: "second workspace")
+        _ = store.addSession(toWorkspace: workspace.id, cwd: "/tmp")
+        let sessions = store.workspaces.flatMap(\.sessions) + [remainingSession]
+        let registry = AskRegistry.shared
+        let asks = sessions.map { session in
+            let ask = PendingAsk(id: UUID().uuidString, title: "Continue?", buttons: [ControlAskButton(id: "yes", label: "Yes")])
+            let windowID = session === remainingSession ? remainingID : closing.id
+            #expect(session.openAsk(ask))
+            #expect(registry.register(id: ask.id, owner: .session(session.id, window: windowID)))
+            return ask
+        }
+        defer { for (session, ask) in zip(sessions, asks) { session.cancelAsk(id: ask.id) } }
+
+        if remove { library.removeWindow(closing.id) } else { library.closeWindow(closing.id) }
+
+        #expect(library.store(for: closing.id) == nil)
+        for (session, ask) in zip(sessions.dropLast(), asks.dropLast()) {
+            #expect(session.askPending == nil)
+            #expect(registry.owner(for: ask.id) == nil)
+            #expect(registry.result(for: ask.id)?.result == ControlAskResult(result: .cancelled))
+            #expect(registry.result(for: ask.id)?.windowID == closing.id)
+        }
+        #expect(remainingSession.askPending == asks.last)
+        #expect(library.store(for: remainingID) != nil)
+    }
+
+    @Test(arguments: [false, true])
+    func windowRemovalNoOpsKeepTheSessionAsk(terminating: Bool) throws {
+        let library = WindowLibrary(directory: directory)
+        let windowID = try #require(library.activeWindowID)
+        let session = try #require(library.activeStore?.activeSession)
+        let ask = PendingAsk(id: UUID().uuidString, title: "Continue?", buttons: [ControlAskButton(id: "yes", label: "Yes")])
+        #expect(session.openAsk(ask))
+        #expect(AskRegistry.shared.register(id: ask.id, owner: .session(session.id, window: windowID)))
+        defer { session.cancelAsk(id: ask.id) }
+
+        if terminating {
+            library.isTerminating = true
+            library.closeWindow(windowID)
+        } else {
+            library.removeWindow(windowID)
+        }
+
+        #expect(library.store(for: windowID)?.session(withID: session.id) === session)
+        #expect(session.askPending == ask)
+        #expect(AskRegistry.shared.owner(for: ask.id) == .session(session.id, window: windowID))
+    }
+
     private let directory: URL
 
     init() throws {
@@ -54,6 +109,14 @@ final class WindowLibraryTests {
         #expect(library.windowName(for: work.id) == "work")
         #expect(library.windowName(for: nil) == "")
         #expect(library.windowName(for: UUID()) == "")
+    }
+
+    @Test func customWindowNameSkipsAutoNamesAndUnknownIDs() {
+        let library = WindowLibrary(directory: directory)
+        #expect(library.customWindowName(for: library.windows[0].id) == nil)
+        let work = library.newWindow(name: "work")
+        #expect(library.customWindowName(for: work.id) == "work")
+        #expect(library.customWindowName(for: UUID()) == nil)
     }
 
     @Test func allOpenSessionsFlattensEverySessionAcrossWindows() {
@@ -124,6 +187,200 @@ final class WindowLibraryTests {
         #expect(restoredWorkspace.name == "project")
         #expect(restoredWorkspace.sessions.map(\.id) == [session.id])
         #expect(store.selectedSessionID == session.id)
+    }
+
+    @Test func reopeningIntoAnotherWindowRestoresWhereTheSessionIsStillPendingItsClose() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let workspace = source.addWorkspace(name: "project")
+        let session = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/project", name: "api"))
+        let destination = try! #require(library.store(for: library.newWindow().id))
+
+        #expect(source.softCloseSession(session.id))
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(library.reopenRecentClosed(recent.id, into: destination))
+
+        #expect(destination.session(withID: session.id) == nil)
+        let restored = try! #require(source.session(withID: session.id))
+        #expect(restored === session)
+        #expect(library.allOpenSessions().filter { $0.id == session.id }.count == 1)
+        #expect(library.store(forSession: session.id) === source)
+    }
+
+    /// A workspace entry whose members are spread over two windows, the shape an older build could save:
+    /// A holds x, B holds y, z survives only in the snapshot. `shell` gives A the entry's own workspace id
+    /// so the merge takes its existing-shell arm rather than rebuilding.
+    private struct SplitWorkspaceSeed {
+        let a: UUID, b: UUID
+        let item: RecentClosedItem
+        let x: UUID, y: UUID, z: UUID
+    }
+
+    private func seedSplitWorkspace(shell: Bool) throws -> SplitWorkspaceSeed {
+        let windowA = UUID(), windowB = UUID(), workspaceID = UUID()
+        let x = SessionSnapshot(id: UUID(), customName: "x", cwd: "/x")
+        let y = SessionSnapshot(id: UUID(), customName: "y", cwd: "/y")
+        let z = SessionSnapshot(id: UUID(), customName: "z", cwd: "/z")
+        try writeWindowFile(windowA, Snapshot(workspaces: [
+            WorkspaceSnapshot(id: shell ? workspaceID : UUID(), name: "A", sessions: [x]),
+        ]))
+        try writeWindowFile(windowB, Snapshot(workspaces: [
+            WorkspaceSnapshot(id: UUID(), name: "B", sessions: [y]),
+        ]))
+        try writeIndex(WindowsIndex(frontmost: windowA, windows: [
+            WindowEntry(id: windowA, name: "a", isOpen: true),
+            WindowEntry(id: windowB, name: "b", isOpen: true),
+        ]))
+        let item = RecentClosedItem(
+            kind: .workspace, title: "original", subtitle: nil,
+            workspace: RecentClosedWorkspace(
+                snapshot: WorkspaceSnapshot(id: workspaceID, name: "original", sessions: [x, y, z]),
+                selectedSessionID: z.id))
+        RecentClosedStore(directory: directory).record(item)
+        return SplitWorkspaceSeed(a: windowA, b: windowB, item: item, x: x.id, y: y.id, z: z.id)
+    }
+
+    @Test(arguments: [false, true], [false, true])
+    func reopeningASplitWorkspaceRebuildsOnlyTheMemberNobodyHolds(shell: Bool, externalPending: Bool) throws {
+        let seed = try seedSplitWorkspace(shell: shell)
+        let library = WindowLibrary(directory: directory)
+        let a = try! #require(library.store(for: seed.a))
+        let b = try! #require(library.store(for: seed.b))
+        let originalX = try! #require(a.session(withID: seed.x))
+        let originalY = try! #require(b.session(withID: seed.y))
+        if externalPending { #expect(b.softCloseSession(seed.y, grace: 60)) }
+
+        #expect(library.reopenRecentClosedReportingWindow(seed.item.id, into: a) == seed.a)
+
+        #expect(a.session(withID: seed.x) === originalX)
+        #expect(a.session(withID: seed.y) == nil, "y belongs to the other window")
+        #expect(a.session(withID: seed.z) != nil, "z exists only in the snapshot and must come back")
+        #expect(library.recentClosedItems.contains { $0.id == seed.item.id } == false)
+        if externalPending { #expect(b.undoPendingClose()) }
+        #expect(b.session(withID: seed.y) === originalY)
+        for id in [seed.x, seed.y, seed.z] {
+            #expect(library.allOpenSessions().filter { $0.id == id }.count == 1, "\(id) must exist once")
+        }
+    }
+
+    @Test func reopeningAWorkspacePendingItsCloseRestoresTheOriginalObjects() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let sourceWindow = try! #require(library.windowID(for: source))
+        let workspace = source.addWorkspace(name: "project")
+        let session = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/project", name: "api"))
+        let destination = try! #require(library.store(for: library.newWindow().id))
+
+        #expect(source.softRemoveWorkspace(workspace.id, grace: 60))
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(recent.kind == .workspace)
+        #expect(library.reopenRecentClosedReportingWindow(recent.id, into: destination) == sourceWindow)
+
+        #expect(destination.workspaces.contains { $0.id == workspace.id } == false)
+        #expect(source.session(withID: session.id) === session)
+        #expect(source.pendingHoldsWorkspace(workspace.id) == false, "the pending close is consumed")
+        #expect(library.allOpenSessions().filter { $0.id == session.id }.count == 1)
+    }
+
+    @Test func reopeningAnEmptyWorkspacePendingItsCloseStillFindsItsOwner() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let sourceWindow = try! #require(library.windowID(for: source))
+        let workspace = source.addWorkspace(name: "empty")
+        let destination = try! #require(library.store(for: library.newWindow().id))
+
+        #expect(source.softRemoveWorkspace(workspace.id, grace: 60))
+        let recent = try! #require(library.recentClosedItems.first)
+        // an empty entry has no session ids, so only the workspace lookup can locate the owner.
+        #expect(library.reopenRecentClosedReportingWindow(recent.id, into: destination) == sourceWindow)
+        #expect(source.workspaces.contains { $0.id == workspace.id })
+        #expect(destination.workspaces.contains { $0.id == workspace.id } == false)
+    }
+
+    // older versions could persist the same session in two windows.
+    @Test func reopeningASessionPersistedInTwoWindowsDoesNotRebuildTheClosedCopy() throws {
+        let sessionID = UUID(uuidString: "2E126225-06D9-4593-A3E5-E3D69BB195C6")!
+        let workspaceID = UUID(uuidString: "0C33DDDD-0000-0000-0000-000000000033")!
+        let windowA = UUID(uuidString: "0A11AAAA-0000-0000-0000-000000000011")!
+        let windowB = UUID(uuidString: "0B22BBBB-0000-0000-0000-000000000022")!
+        let shared = SessionSnapshot(id: sessionID, customName: "api", cwd: "/project")
+        try writeWindowFile(windowA, Snapshot(workspaces: [
+            WorkspaceSnapshot(id: workspaceID, name: "project", sessions: [shared]),
+        ]))
+        try writeWindowFile(windowB, Snapshot(workspaces: [
+            WorkspaceSnapshot(id: UUID(), name: "elsewhere", sessions: [shared]),
+        ]))
+        try writeIndex(WindowsIndex(frontmost: windowA, windows: [
+            WindowEntry(id: windowA, name: "a", isOpen: true),
+            WindowEntry(id: windowB, name: "b", isOpen: true),
+        ]))
+
+        let library = WindowLibrary(directory: directory)
+        #expect(library.allOpenSessions().filter { $0.id == sessionID }.count == 2)
+        let storeA = try! #require(library.store(for: windowA))
+        let storeB = try! #require(library.store(for: windowB))
+
+        storeA.closeSession(sessionID)
+        #expect(library.allOpenSessions().filter { $0.id == sessionID }.count == 1)
+
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(library.reopenRecentClosedReportingWindow(recent.id) == windowB)
+        #expect(library.allOpenSessions().filter { $0.id == sessionID }.count == 1)
+        #expect(storeA.session(withID: sessionID) == nil)
+        #expect(storeB.session(withID: sessionID) != nil)
+    }
+
+    @Test func reopeningFollowsTheWorkspaceOwnerRatherThanTheRequestedWindow() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let sourceWindow = try! #require(library.windowID(for: source))
+        let workspace = source.addWorkspace(name: "project")
+        let x = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/x", name: "x"))
+        _ = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/y", name: "y"))
+        let destination = try! #require(library.store(for: library.newWindow().id))
+
+        source.closeSession(x.id)
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(library.reopenRecentClosedReportingWindow(recent.id, into: destination) == sourceWindow)
+
+        #expect(destination.workspaces.contains { $0.id == workspace.id } == false)
+        #expect(source.session(withID: x.id) != nil)
+        #expect(library.allOpenSessions().filter { $0.id == x.id }.count == 1)
+    }
+
+    @Test func reopeningAWorkspaceNobodyHoldsStillGoesToTheRequestedWindow() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let workspace = source.addWorkspace(name: "project")
+        let x = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/x", name: "x"))
+        let y = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/y", name: "y"))
+        let destination = try! #require(library.store(for: library.newWindow().id))
+        let destinationWindow = try! #require(library.windowID(for: destination))
+
+        source.removeWorkspace(workspace.id)
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(recent.kind == .workspace)
+        #expect(library.reopenRecentClosedReportingWindow(recent.id, into: destination) == destinationWindow)
+
+        let restored = try! #require(destination.workspaces.first { $0.id == workspace.id })
+        #expect(restored.sessions.map(\.id) == [x.id, y.id])
+        #expect(library.recentClosedItems.isEmpty)
+    }
+
+    @Test func reopeningIntoAnotherWindowRestoresWhereTheSessionIsStillLive() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let workspace = source.addWorkspace(name: "project")
+        let session = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/project", name: "api"))
+        let destination = try! #require(library.store(for: library.newWindow().id))
+
+        source.closeSession(session.id)
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(source.restoreRecentClosed(recent))
+        #expect(library.reopenRecentClosed(recent.id, into: destination))
+
+        #expect(destination.session(withID: session.id) == nil)
+        #expect(library.allOpenSessions().filter { $0.id == session.id }.count == 1)
     }
 
     @Test func reopeningStaleRecentSessionSelectsExistingSessionInsteadOfDuplicatingID() {
@@ -645,6 +902,224 @@ final class WindowLibraryTests {
         #expect(reloaded.pendingRestoreCommand == nil)
         // the persisted override survives the reload, so `tree` still reports it and the next launch fires.
         #expect(reloaded.restoreCommand == "claude --resume abc")
+    }
+
+    @Test func allClosedExitPinsFrontmostSoRelaunchReopensTheExitWindow() throws {
+        // closing the LAST open window persists an index with no open entries, so the next launch takes
+        // reopen's never-windowless fallback — without the pin it opens windows.first (the OLDEST library
+        // entry), silently dropping the exit window's captured-command replay whenever the two differ.
+        let oldest = UUID(uuidString: "0A11AAAA-0000-0000-0000-000000000011")!
+        let exitWindow = UUID(uuidString: "7B33CCCC-0000-0000-0000-000000000013")!
+        let sessionID = UUID()
+        let workspaceID = UUID()
+        try writeWindowFile(oldest, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "old", sessions: [])]))
+        try writeWindowFile(exitWindow, Snapshot(workspaces: [WorkspaceSnapshot(
+            id: workspaceID, name: "work",
+            sessions: [SessionSnapshot(id: sessionID, customName: nil, cwd: "/a")])]))
+        try writeIndex(WindowsIndex(frontmost: exitWindow, windows: [
+            WindowEntry(id: oldest, name: "old", isOpen: false),
+            WindowEntry(id: exitWindow, name: "work", isOpen: true),
+        ]))
+
+        let library = WindowLibrary(directory: directory)
+        library.closeWindow(exitWindow)
+        #expect(library.frontmostWindowID == exitWindow)
+        // stand in for the app target's `willClose`, which captures the live argv on the app-exit close;
+        // agtermCore has no surfaces to read one from.
+        try writeWindowFile(exitWindow, Snapshot(workspaces: [WorkspaceSnapshot(
+            id: workspaceID, name: "work",
+            sessions: [SessionSnapshot(id: sessionID, customName: nil, cwd: "/a",
+                                       foregroundCommand: ["tee", "/tmp/m"])])]))
+
+        let relaunched = WindowLibrary(directory: directory)
+        #expect(relaunched.openIDs() == [exitWindow])
+        let session = relaunched.store(for: exitWindow)?.session(withID: sessionID)
+        #expect(session?.pendingForegroundCommand == ["tee", "/tmp/m"])
+    }
+
+    @Test func allClosedExitPinsFrontmostEvenWhenRemoveWindowClearedIt() throws {
+        // the case the unconditional pin adds over reassigning only when the closing window WAS frontmost:
+        // removeWindow nils frontmostWindowID (:491), and an inactive app gets no didBecomeKey to repair it,
+        // so the exit close finds nil and the next launch would fall back to windows.first.
+        let oldest = UUID(uuidString: "0A11AAAA-0000-0000-0000-000000000021")!
+        let deleted = UUID(uuidString: "3C22BBBB-0000-0000-0000-000000000022")!
+        let exitWindow = UUID(uuidString: "7B33CCCC-0000-0000-0000-000000000023")!
+        for (id, name) in [(oldest, "old"), (deleted, "gone"), (exitWindow, "work")] {
+            try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: name, sessions: [])]))
+        }
+        try writeIndex(WindowsIndex(frontmost: deleted, windows: [
+            WindowEntry(id: oldest, name: "old", isOpen: false),
+            WindowEntry(id: deleted, name: "gone", isOpen: true),
+            WindowEntry(id: exitWindow, name: "work", isOpen: true),
+        ]))
+
+        let library = WindowLibrary(directory: directory)
+        library.removeWindow(deleted)
+        #expect(library.frontmostWindowID == nil)
+
+        library.closeWindow(exitWindow)
+        #expect(library.frontmostWindowID == exitWindow)
+        #expect(WindowLibrary(directory: directory).openIDs() == [exitWindow])
+    }
+
+    @Test func launchRestoreArmsTheCaptureInMemoryButStripsItFromDisk() throws {
+        // the surface factory consumes the capture in memory only, so without stripping the file here the
+        // argv outlives its one replay and a crash before the next structural save runs it a SECOND time on
+        // the following launch. The armed copy lives in the transient slots, and the persisted fields go
+        // nil, so no save landing before the surfaces spawn can write it back.
+        let id = UUID()
+        let sessionID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a", isSplit: true,
+                                      foregroundCommand: ["tee", "/tmp/m"],
+                                      splitForegroundCommand: ["tail", "-f", "/var/log/x"])
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [session])]))
+        try writeIndex(WindowsIndex(frontmost: id, windows: [WindowEntry(id: id, name: "work", isOpen: true)]))
+
+        let library = WindowLibrary(directory: directory)
+        let armed = try #require(library.store(for: id)?.session(withID: sessionID))
+        #expect(armed.pendingForegroundCommand == ["tee", "/tmp/m"])
+        #expect(armed.pendingSplitForegroundCommand == ["tail", "-f", "/var/log/x"])
+        #expect(armed.foregroundCommand == nil)
+        #expect(armed.splitForegroundCommand == nil)
+        // a save between arming and consumption must not resurrect the argv on disk
+        try #require(library.store(for: id)).save()
+
+        let persisted = PersistenceStore(directory: directory.appendingPathComponent("windows"),
+                                         fileName: "\(id.uuidString).json").load()
+        #expect(persisted.workspaces[0].sessions[0].foregroundCommand == nil)
+        #expect(persisted.workspaces[0].sessions[0].splitForegroundCommand == nil)
+        // the rest of the snapshot must survive the rewrite
+        #expect(persisted.workspaces[0].sessions[0].cwd == "/a")
+        #expect(persisted.workspaces[0].name == "work")
+    }
+
+    @Test func aFailedStripDisarmsBothPanesInsteadOfLeavingAReplayItCouldNotRecord() throws {
+        // the other half of the launch branch: when the rewrite fails the capture must not fire at all,
+        // because nothing would record that it had and it would run again on every later launch. Both
+        // panes, since disarming only the main one leaves the split replaying forever.
+        let id = UUID()
+        let sessionID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a", isSplit: true,
+                                      foregroundCommand: ["tee", "/tmp/m"],
+                                      splitForegroundCommand: ["tail", "-f", "/var/log/x"],
+                                      restoreCommand: "claude --resume abc")
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [session])]))
+        try writeIndex(WindowsIndex(frontmost: id, windows: [WindowEntry(id: id, name: "work", isOpen: true)]))
+
+        let windowsDir = directory.appendingPathComponent("windows")
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: windowsDir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: windowsDir.path) }
+
+        let library = WindowLibrary(directory: directory)
+        let armed = try #require(library.store(for: id)?.session(withID: sessionID))
+        #expect(armed.pendingForegroundCommand == nil)
+        #expect(armed.pendingSplitForegroundCommand == nil)
+        // the sticky override is not one-shot, so a failed strip must leave it armed
+        #expect(armed.pendingRestoreCommand == "claude --resume abc")
+    }
+
+    @Test func launchRestoreLeavesAStickyOverrideOnDiskWhileStrippingTheCapture() throws {
+        // the strip is one-shot captures only: session.restore is sticky and must survive to fire again.
+        let id = UUID()
+        let sessionID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a",
+                                      foregroundCommand: ["tee", "/tmp/m"],
+                                      restoreCommand: "claude --resume abc")
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [session])]))
+        try writeIndex(WindowsIndex(frontmost: id, windows: [WindowEntry(id: id, name: "work", isOpen: true)]))
+
+        let library = WindowLibrary(directory: directory)
+        #expect(library.store(for: id)?.session(withID: sessionID)?.pendingRestoreCommand == "claude --resume abc")
+
+        let persisted = PersistenceStore(directory: directory.appendingPathComponent("windows"),
+                                         fileName: "\(id.uuidString).json").load()
+        #expect(persisted.workspaces[0].sessions[0].foregroundCommand == nil)
+        #expect(persisted.workspaces[0].sessions[0].restoreCommand == "claude --resume abc")
+    }
+
+    @Test func midProcessReloadScrubsCapturedCommandsFromDisk() throws {
+        // the launch-only gate drops a captured foreground command from the LIVE sessions, but the
+        // snapshot on disk still carries it — without a write-back, a force-quit after the reopen
+        // replays the stale command on the next launch, after the user last saw a plain shell.
+        let anchor = UUID()
+        let id = UUID()
+        let sessionID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a",
+                                      foregroundCommand: ["tee", "/tmp/m"],
+                                      splitForegroundCommand: ["tail", "-f", "/var/log/x"])
+        try writeWindowFile(anchor, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "open", sessions: [])]))
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [session])]))
+        // the anchor stays open so the bootstrap fallback doesn't open the target window itself —
+        // loading the target below is then a genuine mid-run reopen, not a launch restore.
+        try writeIndex(WindowsIndex(frontmost: anchor, windows: [
+            WindowEntry(id: anchor, name: "open", isOpen: true),
+            WindowEntry(id: id, name: "work", isOpen: false),
+        ]))
+
+        let library = WindowLibrary(directory: directory)
+        let reloaded = try #require(library.loadStore(for: id)?.session(withID: sessionID))
+        #expect(reloaded.foregroundCommand == nil)
+
+        let persisted = PersistenceStore(directory: directory.appendingPathComponent("windows"),
+                                         fileName: "\(id.uuidString).json").load()
+        #expect(persisted.workspaces[0].sessions[0].foregroundCommand == nil)
+        #expect(persisted.workspaces[0].sessions[0].splitForegroundCommand == nil)
+    }
+
+    @Test func midProcessReloadScrubsASplitOnlyCaptureFromDisk() throws {
+        // the write-back gate is an OR over both fields; a snapshot whose only capture is the split pane
+        // must still trigger the rewrite, or a "simplified" gate checking just foregroundCommand would
+        // leave the split's stale argv on disk.
+        let anchor = UUID()
+        let id = UUID()
+        let sessionID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a", isSplit: true,
+                                      splitForegroundCommand: ["tail", "-f", "/var/log/x"])
+        try writeWindowFile(anchor, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "open", sessions: [])]))
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [session])]))
+        try writeIndex(WindowsIndex(frontmost: anchor, windows: [
+            WindowEntry(id: anchor, name: "open", isOpen: true),
+            WindowEntry(id: id, name: "work", isOpen: false),
+        ]))
+
+        let library = WindowLibrary(directory: directory)
+        _ = try #require(library.loadStore(for: id))
+
+        let persisted = PersistenceStore(directory: directory.appendingPathComponent("windows"),
+                                         fileName: "\(id.uuidString).json").load()
+        #expect(persisted.workspaces[0].sessions[0].splitForegroundCommand == nil)
+    }
+
+    @Test func orphanRecoveryDropsCapturedCommandsButArmsTheStickyOverride() throws {
+        // recovery cannot tell a deliberately-closed window's surviving file from one open at the index
+        // loss, so the one-shot capture must not replay there — while the sticky `session.restore`
+        // override (pinned to fire every restart) still arms.
+        let id = UUID()
+        let sessionID = UUID()
+        let splitOnlyID = UUID()
+        let session = SessionSnapshot(id: sessionID, customName: nil, cwd: "/a",
+                                      foregroundCommand: ["ssh", "prod"],
+                                      restoreCommand: "claude --resume abc")
+        // a session whose ONLY capture is the split pane exercises the other half of the strip condition.
+        let splitOnly = SessionSnapshot(id: splitOnlyID, customName: nil, cwd: "/b", isSplit: true,
+                                        splitForegroundCommand: ["tail", "-f", "/var/log/x"])
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work",
+                                                                        sessions: [session, splitOnly])]))
+        // no index at all -> bootstrap falls through to recoverOrphanedWindows
+
+        let library = WindowLibrary(directory: directory)
+        let recovered = try #require(library.store(for: id)?.session(withID: sessionID))
+        // the ARMED slot is what recovery has to disarm: the persisted field is nil after any launch
+        // restore, so asserting on it would pass whether or not the strip ran.
+        #expect(recovered.pendingForegroundCommand == nil)
+        #expect(recovered.pendingRestoreCommand == "claude --resume abc")
+        let recoveredSplitOnly = try #require(library.store(for: id)?.session(withID: splitOnlyID))
+        #expect(recoveredSplitOnly.pendingSplitForegroundCommand == nil)
+
+        let persisted = PersistenceStore(directory: directory.appendingPathComponent("windows"),
+                                         fileName: "\(id.uuidString).json").load()
+        #expect(persisted.workspaces[0].sessions[0].foregroundCommand == nil)
+        #expect(persisted.workspaces[0].sessions[1].splitForegroundCommand == nil)
     }
 
     @Test func loadStoreUnknownIdReturnsNil() {
@@ -1240,5 +1715,53 @@ final class WindowLibraryTests {
         let reloadedSession = try #require(reloadedStore.session(withID: session.id))
         #expect(reloadedSession.initialCwd == "/changed")
         _ = ws
+    }
+    /// `restore.capture` answers `ok` with a pane count, which is a claim that the argv is on disk, so the
+    /// library has to REPORT a failed flush rather than swallow it. An unwritable windows directory is the
+    /// same lever the stale-file test above uses.
+    @Test func saveAllOpenCheckedReportsAFailedWrite() throws {
+        let id = UUID()
+        try writeWindowFile(id, Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [])]))
+        try writeIndex(WindowsIndex(frontmost: id, windows: [WindowEntry(id: id, name: "work", isOpen: true)]))
+        let library = WindowLibrary(directory: directory)
+        #expect(library.saveAllOpenChecked())
+
+        let windowsDir = directory.appendingPathComponent("windows")
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: windowsDir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: windowsDir.path) }
+        #expect(!library.saveAllOpenChecked())
+    }
+
+    // MARK: - launch pane drops
+
+    private final class DropLog {
+        var identities: [UUID] = []
+    }
+
+    @Test func closingAWindowDropsEveryPaneItHeld() throws {
+        let log = DropLog()
+        let library = WindowLibrary(directory: directory, paneFinalizer: nil, launchPaneDrop: { log.identities += $0 })
+        let work = library.newWindow(name: "work")
+        let store = try #require(library.store(for: work.id))
+        let session = try #require(store.addSession(toWorkspace: store.workspaces[0].id, cwd: "/tmp"))
+        let expected = Set(PaneIdentityInventory.identities(in: store.workspaces.flatMap(\.sessions)))
+
+        library.closeWindow(work.id)
+
+        #expect(Set(log.identities) == expected)
+        #expect(log.identities.contains(session.paneIdentity))
+    }
+
+    @Test func removingAWindowDropsEveryPaneItHeld() throws {
+        let log = DropLog()
+        let library = WindowLibrary(directory: directory, paneFinalizer: nil, launchPaneDrop: { log.identities += $0 })
+        let work = library.newWindow(name: "work")
+        let store = try #require(library.store(for: work.id))
+        let expected = Set(PaneIdentityInventory.identities(in: store.workspaces.flatMap(\.sessions)))
+
+        library.removeWindow(work.id)
+
+        #expect(Set(log.identities) == expected)
+        #expect(!expected.isEmpty)
     }
 }

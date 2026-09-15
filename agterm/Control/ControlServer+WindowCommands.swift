@@ -105,10 +105,12 @@ extension ControlServer {
     /// errors. Control-native — no GUI surface, the native title bar already drags-to-resize.
     func windowResize(_ target: String?, width: Int, height: Int) -> ControlResponse {
         return resolver.resolveWindowID(target) { id in
-            guard WindowRegistry.shared.resize(id, width: width, height: height) else {
+            guard let size = WindowRegistry.shared.resize(id, width: width, height: height) else {
                 return ControlResponse(ok: false, error: "window not open — window.select it first")
             }
-            return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
+            return ControlResponse(ok: true, result: ControlResult(id: id.uuidString,
+                                                                  width: Int(size.width.rounded()),
+                                                                  height: Int(size.height.rounded())))
         }
     }
 
@@ -138,7 +140,7 @@ extension ControlServer {
     }
 
     /// Toggle native macOS full screen on the resolved window; a closed one errors. The control half of
-    /// View ▸ Toggle Full Screen / the green traffic-light button.
+    /// ⌃⌘F, AppKit's own View ▸ Enter/Exit Full Screen item, and the green traffic-light button.
     func windowFullscreen(_ target: String?) -> ControlResponse {
         return resolver.resolveWindowID(target) { id in
             guard WindowRegistry.shared.fullscreen(id) else {

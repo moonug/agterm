@@ -31,12 +31,14 @@ struct AgentHooksInstallTests {
         #expect(evts["PostToolUse"]?.count == 1)
         #expect(evts["Stop"]?.count == 1)
         #expect(evts["Notification"]?.count == 1)
-        #expect(command(evts["UserPromptSubmit"]![0])?.hasSuffix("agent-status.sh' active --blink") == true)
+        // the entries invoke the Claude adapter, which guards on ownership and forwards to the wrapper
+        let adapter = AgentHooksInstall.claudeWrapperPath(scriptDir: scriptDir)
+        #expect(command(evts["UserPromptSubmit"]![0]) == "'\(adapter)' active --blink")
         // PostToolUse re-asserts active after every tool, clearing a lingering blocked on resume
-        #expect(command(evts["PostToolUse"]![0])?.hasSuffix("agent-status.sh' active --blink") == true)
+        #expect(command(evts["PostToolUse"]![0]) == "'\(adapter)' active --blink")
         // only the Stop hook passes --auto-reset (clear-on-visit); active/blocked stay keep-state
-        #expect(command(evts["Stop"]![0])?.hasSuffix("agent-status.sh' completed --auto-reset") == true)
-        #expect(command(evts["Notification"]![0])?.hasSuffix("agent-status.sh' blocked") == true)
+        #expect(command(evts["Stop"]![0]) == "'\(adapter)' completed --auto-reset")
+        #expect(command(evts["Notification"]![0]) == "'\(adapter)' blocked")
         #expect(command(evts["UserPromptSubmit"]![0])?.contains("--auto-reset") == false)
         #expect(command(evts["Notification"]![0])?.contains("--auto-reset") == false)
         #expect(evts["Notification"]![0]["matcher"] as? String == "permission_prompt")
@@ -75,7 +77,7 @@ struct AgentHooksInstallTests {
         #expect(evts["UserPromptSubmit"]?.count == 2)
         let commands = evts["UserPromptSubmit"]!.compactMap { command($0) }
         #expect(commands.contains("/usr/bin/other-hook.sh"))
-        #expect(commands.contains { $0.hasSuffix("agent-status.sh' active --blink") })
+        #expect(commands.contains { $0.hasSuffix("claude-status.sh' active --blink") })
         #expect(evts["PostToolUse"]?.count == 1)
         #expect(evts["Stop"]?.count == 1)
         #expect(evts["Notification"]?.count == 1)
@@ -92,6 +94,134 @@ struct AgentHooksInstallTests {
         #expect(commands.contains("/usr/bin/other.sh"))
     }
 
+    // settings.json exactly as an install BEFORE the Claude adapter left it: four entries invoking the
+    // generic wrapper directly.
+    private func legacySettings(extraUserHook: String? = nil) -> String {
+        let wrapper = AgentHooksInstall.wrapperPath(scriptDir: scriptDir)
+        var userHook = ""
+        if let extraUserHook {
+            userHook = """
+            ,
+                  {"hooks": [{"type": "command", "command": "\(extraUserHook)"}]}
+            """
+        }
+        return """
+        {
+          "hooks": {
+            "UserPromptSubmit": [
+              {"hooks": [{"type": "command", "command": "'\(wrapper)' active --blink"}]}\(userHook)
+            ],
+            "PostToolUse": [
+              {"hooks": [{"type": "command", "command": "'\(wrapper)' active --blink"}]}
+            ],
+            "Stop": [
+              {"hooks": [{"type": "command", "command": "'\(wrapper)' completed --auto-reset"}]}
+            ],
+            "Notification": [
+              {"matcher": "permission_prompt", "hooks": [{"type": "command", "command": "'\(wrapper)' blocked"}]}
+            ]
+          }
+        }
+        """
+    }
+
+    @Test func mergeMigratesEarlierInstallOntoTheAdapter() throws {
+        // the guard has to reach an EXISTING install: without the migration the merge would skip all four
+        // events as already-installed and leave them pointing at the unguarded wrapper forever
+        let result = try AgentHooksInstall.mergeClaudeSettings(existing: legacySettings(), scriptDir: scriptDir)
+        #expect(result.changed)
+        let evts = events(result.json)
+        let adapter = AgentHooksInstall.claudeWrapperPath(scriptDir: scriptDir)
+        #expect(evts["UserPromptSubmit"]?.count == 1)
+        #expect(evts["PostToolUse"]?.count == 1)
+        #expect(evts["Stop"]?.count == 1)
+        #expect(evts["Notification"]?.count == 1)
+        #expect(command(evts["UserPromptSubmit"]![0]) == "'\(adapter)' active --blink")
+        #expect(command(evts["PostToolUse"]![0]) == "'\(adapter)' active --blink")
+        #expect(command(evts["Stop"]![0]) == "'\(adapter)' completed --auto-reset")
+        #expect(command(evts["Notification"]![0]) == "'\(adapter)' blocked")
+        // rewritten in place: the matcher and the entry's other keys are untouched
+        #expect(evts["Notification"]![0]["matcher"] as? String == "permission_prompt")
+        #expect((evts["Stop"]![0]["hooks"] as? [[String: Any]])?.first?["type"] as? String == "command")
+        // migrated, not appended alongside a fresh set
+        #expect(!result.json.contains(AgentHooksInstall.wrapperPath(scriptDir: scriptDir) + "'"))
+    }
+
+    @Test func mergeMigratesPreBlinkPromptEntry() throws {
+        // installs between 17c8a914 and a9e678d9 wrote `active` for UserPromptSubmit — source builds only,
+        // no tag carries the bare form. A byte-exact match against only the current `active --blink` left
+        // that entry on the unguarded wrapper while entryUsesWrapper reported the event installed, so
+        // nothing ever said the hook was unguarded. The historical form migrates like the current one:
+        // onto the adapter AND the current state.
+        let wrapper = AgentHooksInstall.wrapperPath(scriptDir: scriptDir)
+        let existing = """
+        {
+          "hooks": {
+            "UserPromptSubmit": [
+              {"hooks": [{"type": "command", "command": "'\(wrapper)' active"}]}
+            ]
+          }
+        }
+        """
+        let result = try AgentHooksInstall.mergeClaudeSettings(existing: existing, scriptDir: scriptDir)
+        #expect(result.changed)
+        let evts = events(result.json)
+        let adapter = AgentHooksInstall.claudeWrapperPath(scriptDir: scriptDir)
+        #expect(evts["UserPromptSubmit"]?.count == 1)
+        #expect(command(evts["UserPromptSubmit"]![0]) == "'\(adapter)' active --blink")
+    }
+
+    @Test func mergeMigrationIsIdempotent() throws {
+        let first = try AgentHooksInstall.mergeClaudeSettings(existing: legacySettings(), scriptDir: scriptDir)
+        let second = try AgentHooksInstall.mergeClaudeSettings(existing: first.json, scriptDir: scriptDir)
+        #expect(!second.changed)
+        #expect(second.json == first.json)
+    }
+
+    @Test func mergeMigrationLeavesCustomizedEntryAlone() throws {
+        // one hand-edited entry (an appended flag) plus one entry still in generated form: byte-exactness is
+        // the whole safety property, so the edited one must come back identical
+        let wrapper = AgentHooksInstall.wrapperPath(scriptDir: scriptDir)
+        let customized = "'\(wrapper)' active --blink --pane right"
+        let existing = """
+        {
+          "hooks": {
+            "UserPromptSubmit": [
+              {"hooks": [{"type": "command", "command": "\(customized)"}]}
+            ],
+            "Stop": [
+              {"hooks": [{"type": "command", "command": "'\(wrapper)' completed --auto-reset"}]}
+            ]
+          }
+        }
+        """
+        let result = try AgentHooksInstall.mergeClaudeSettings(existing: existing, scriptDir: scriptDir)
+        #expect(result.changed)
+        let evts = events(result.json)
+        let adapter = AgentHooksInstall.claudeWrapperPath(scriptDir: scriptDir)
+        // the customized entry survives byte-identical AND still counts as installed, so no stock entry is
+        // added beside it: two entries would both fire and post the row twice
+        #expect(evts["UserPromptSubmit"]?.count == 1)
+        #expect(evts["UserPromptSubmit"]!.compactMap { command($0) } == [customized])
+        // the entry that WAS in generated form migrated in place rather than gaining a duplicate
+        #expect(evts["Stop"]?.count == 1)
+        #expect(command(evts["Stop"]![0]) == "'\(adapter)' completed --auto-reset")
+    }
+
+    @Test func mergeMigrationLeavesUserHookNamingTheWrapperAlone() throws {
+        // a user's own hook that merely mentions the wrapper path is not something the installer wrote
+        let wrapper = AgentHooksInstall.wrapperPath(scriptDir: scriptDir)
+        let userHook = "my-notifier.sh && '\(wrapper)' active --blink"
+        let result = try AgentHooksInstall.mergeClaudeSettings(existing: legacySettings(extraUserHook: userHook),
+                                                               scriptDir: scriptDir)
+        #expect(result.changed)
+        let prompts = events(result.json)["UserPromptSubmit"]!.compactMap { command($0) }
+        #expect(prompts.contains(userHook))
+        // only the generated sibling moved onto the adapter
+        #expect(prompts.contains("'\(AgentHooksInstall.claudeWrapperPath(scriptDir: scriptDir))' active --blink"))
+        #expect(prompts.count == 2)
+    }
+
     @Test func mergeRefusesMalformedExisting() {
         // refusing leaves the user's hand-maintained settings.json untouched
         #expect(throws: AgentHooksInstall.MergeError.self) {
@@ -99,6 +229,27 @@ struct AgentHooksInstallTests {
         }
         #expect(throws: AgentHooksInstall.MergeError.self) {
             try AgentHooksInstall.mergeClaudeSettings(existing: "[1, 2, 3]", scriptDir: scriptDir)
+        }
+    }
+
+    @Test func mergeRefusesWrongShapedHooksValue() {
+        // `as? ... ?? [:]` treated a wrong-typed value as absent and wrote over it, so the merge deleted the
+        // very key it could not read; the .bak made that recoverable, not safe
+        #expect(throws: AgentHooksInstall.MergeError.self) {
+            try AgentHooksInstall.mergeClaudeSettings(existing: #"{"hooks": "nope"}"#, scriptDir: scriptDir)
+        }
+        #expect(throws: AgentHooksInstall.MergeError.self) {
+            try AgentHooksInstall.mergeClaudeSettings(existing: #"{"hooks": [1, 2]}"#, scriptDir: scriptDir)
+        }
+    }
+
+    @Test func mergeRefusesWrongShapedEventValue() {
+        for malformed in [#"{"hooks": {"Stop": "nope"}}"#,
+                          #"{"hooks": {"Stop": [1, 2]}}"#,
+                          #"{"hooks": {"Stop": {"command": "x"}}}"#] {
+            #expect(throws: AgentHooksInstall.MergeError.self) {
+                try AgentHooksInstall.mergeClaudeSettings(existing: malformed, scriptDir: scriptDir)
+            }
         }
     }
 
@@ -328,6 +479,33 @@ struct AgentHooksInstallTests {
         #expect(!AgentHooksInstall.mayOverwriteOpenCodePlugin(fileExists: true, existingContents: nil))
     }
 
+    @Test func fishIntegrationExportsAnExistingAgentRegexOverride() throws {
+        // asserting the re-export line alone passes with the guard inverted, which silently swaps the two
+        // branches and replaces a user's override with the default, so pin the polarity and the order too
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let fish = root.appendingPathComponent("agterm/Resources/agent-status/shell/integration.fish")
+        let text = try String(contentsOf: fish, encoding: .utf8)
+        let code = text.split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+        guard let guardIndex = code.firstIndex(of: "if set -q AGTERM_AGENT_RE") else {
+            Issue.record("integration.fish must guard the regex block with `if set -q AGTERM_AGENT_RE`")
+            return
+        }
+        let block = Array(code[guardIndex...].prefix(5))
+        #expect(block.count == 5)
+        #expect(block[1] == "set -gx AGTERM_AGENT_RE $AGTERM_AGENT_RE",
+                "the set branch must re-export the override the user set before sourcing")
+        #expect(block[2] == "else")
+        #expect(block[3].hasPrefix("set -gx AGTERM_AGENT_RE '^("),
+                "the else branch must export the default")
+        #expect(block[4] == "end")
+    }
+
     @Test func shippedShellIntegrationsOmitLifecycleAgentsFromDefaultRegex() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -341,12 +519,16 @@ struct AgentHooksInstallTests {
                          "agterm/Resources/agent-status/shell/integration.fish"] {
             let text = try String(contentsOf: root.appendingPathComponent(relative), encoding: .utf8)
             #expect(text.contains(expected), "\(relative) must embed the default agent regex")
-            // Match only the default assignment (not commented override examples).
+            // Match only the default assignment — keyed on the default's literal regex, because an
+            // assignment prefix alone also matches fish's re-export of an existing override (which
+            // carries no regex literal), and commented override examples are excluded either way.
             let defaultLines = text.split(separator: "\n").filter { line in
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
                 if trimmed.hasPrefix("#") { return false }
-                return trimmed.contains("AGTERM_AGENT_RE:=")
+                guard trimmed.contains("AGTERM_AGENT_RE:=")
                     || trimmed.hasPrefix("set -g AGTERM_AGENT_RE ")
+                    || trimmed.hasPrefix("set -gx AGTERM_AGENT_RE ") else { return false }
+                return trimmed.contains(expected)
             }
             #expect(defaultLines.count == 1, "\(relative) must have exactly one default AGTERM_AGENT_RE")
             for line in defaultLines {
@@ -410,5 +592,39 @@ struct AgentHooksInstallTests {
         try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o600)], ofItemAtPath: path)
         #expect(AgentHooksInstall.posixMode(ofFile: path)?.intValue == 0o600)
         #expect(AgentHooksInstall.posixMode(ofFile: dir.appendingPathComponent("nope").path) == nil)
+    }
+
+    // MARK: - agtermctl path baking
+
+    private let wrapperStub = """
+    #!/usr/bin/env bash
+    set -u
+    "${AGTERMCTL:-agtermctl}" session status "$1"
+    """
+
+    @Test func bakeInsertsTheBlockAfterTheShebang() {
+        let baked = AgentHooksInstall.bakeAgtermctlPath(into: wrapperStub, toolPath: "/Applications/agterm.app/Contents/MacOS/agtermctl")
+        let lines = baked.components(separatedBy: "\n")
+        #expect(lines.first == "#!/usr/bin/env bash")
+        #expect(lines[1] == AgentHooksInstall.agtermctlMarker)
+        #expect(lines.contains("  AGTERMCTL='/Applications/agterm.app/Contents/MacOS/agtermctl'"))
+        #expect(baked.hasSuffix(wrapperStub.components(separatedBy: "\n").dropFirst().joined(separator: "\n")))
+    }
+
+    @Test func bakedBlockFallsBackToPathWhenTheBakedBundleIsGone() {
+        // pins #472: the wrapper swallows the failure, so the block has to test the path before committing
+        let baked = AgentHooksInstall.bakeAgtermctlPath(into: wrapperStub, toolPath: "/Volumes/agterm/agterm.app/Contents/MacOS/agtermctl")
+        #expect(baked.contains(#"  [ -x "$AGTERMCTL" ] || AGTERMCTL="$(command -v agtermctl || true)""#))
+        #expect(baked.contains(#"if [ -z "${AGTERMCTL:-}" ]; then"#))
+    }
+
+    @Test func rebakingReplacesTheBlockInsteadOfStackingIt() {
+        let dmg = AgentHooksInstall.bakeAgtermctlPath(into: wrapperStub, toolPath: "/Volumes/agterm/agterm.app/Contents/MacOS/agtermctl")
+        let moved = AgentHooksInstall.bakeAgtermctlPath(into: dmg, toolPath: "/Applications/agterm.app/Contents/MacOS/agtermctl")
+        let lines = moved.components(separatedBy: "\n")
+        #expect(lines.filter { $0 == AgentHooksInstall.agtermctlMarker }.count == 1)
+        #expect(lines.filter { $0.contains("command -v agtermctl") }.count == 1)
+        #expect(!moved.contains("/Volumes/agterm"))
+        #expect(moved == AgentHooksInstall.bakeAgtermctlPath(into: wrapperStub, toolPath: "/Applications/agterm.app/Contents/MacOS/agtermctl"))
     }
 }

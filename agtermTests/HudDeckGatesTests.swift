@@ -1,4 +1,6 @@
 import agtermCore
+import AppKit
+import SwiftUI
 import XCTest
 @testable import agterm
 
@@ -139,19 +141,19 @@ final class HudDeckGatesTests: XCTestCase {
 
     // the HEIGHT decides the travel now, so the width is deliberately the one that cannot move the panel
     func testTopPlacementHoldsTheEdgeMarginClear() {
-        let style = OverlayPanelStyle.resolve(hudSession(position: .top, sizePercent: 90, heightPercent: 50))
+        let style = OverlayPanelStyle.resolve(hudSession(position: .topCenter, sizePercent: 90, heightPercent: 50))
         // pane 1000, panel 500 tall centered at 500; the top edge must land on the 10% margin, i.e. y = 100
         XCTAssertEqual(style.verticalOffset(paneHeight: 1000), -150, accuracy: 0.0001)
     }
 
     func testBottomPlacementMirrorsTop() {
-        let style = OverlayPanelStyle.resolve(hudSession(position: .bottom, sizePercent: 90, heightPercent: 50))
+        let style = OverlayPanelStyle.resolve(hudSession(position: .bottomCenter, sizePercent: 90, heightPercent: 50))
         XCTAssertEqual(style.verticalOffset(paneHeight: 1000), 150, accuracy: 0.0001)
     }
 
     // a message-sized panel travels nearly to the edge, which is what `top` and `bottom` are asked for
     func testAShortPanelReachesTheEdgeMargin() {
-        let style = OverlayPanelStyle.resolve(hudSession(position: .top, heightPercent: 10))
+        let style = OverlayPanelStyle.resolve(hudSession(position: .topCenter, heightPercent: 10))
         XCTAssertEqual(style.verticalOffset(paneHeight: 1000), -350, accuracy: 0.0001)
     }
 
@@ -171,7 +173,7 @@ final class HudDeckGatesTests: XCTestCase {
     // defensive: `HudLayout.heightPercent` keeps a live HUD at or under the height where both margins
     // still fit, so no supported path reaches this branch
     func testAPanelTooLargeForTheMarginStaysCentered() {
-        let style = OverlayPanelStyle.resolve(hudSession(position: .top, heightPercent: 95))
+        let style = OverlayPanelStyle.resolve(hudSession(position: .topCenter, heightPercent: 95))
         XCTAssertEqual(style.verticalOffset(paneHeight: 1000), 0)
     }
 
@@ -180,6 +182,179 @@ final class HudDeckGatesTests: XCTestCase {
             let style = OverlayPanelStyle.resolve(programSession(sizePercent: percent))
             XCTAssertEqual(style.position, .center)
             XCTAssertEqual(style.verticalOffset(paneHeight: 1000), 0)
+            XCTAssertEqual(style.horizontalOffset(paneWidth: 1000), 0)
         }
+    }
+
+    // MARK: - horizontal placement
+
+    func testCenterColumnIsUnoffsetHorizontally() {
+        for position in [HudPosition.topCenter, .center, .bottomCenter] {
+            let style = OverlayPanelStyle.resolve(hudSession(position: position, sizePercent: 40))
+            XCTAssertEqual(style.horizontalOffset(paneWidth: 1000), 0, "\(position) should not move sideways")
+        }
+    }
+
+    // the WIDTH decides the horizontal travel, mirroring the height on the vertical axis
+    func testLeftPlacementHoldsTheEdgeMarginClear() {
+        let style = OverlayPanelStyle.resolve(hudSession(position: .centerLeft, sizePercent: 50,
+                                                         heightPercent: 90))
+        // pane 1000, panel 500 wide centered at 500; the left edge must land on the 10% margin, i.e. x = 100
+        XCTAssertEqual(style.horizontalOffset(paneWidth: 1000), -150, accuracy: 0.0001)
+    }
+
+    func testRightPlacementMirrorsLeft() {
+        let style = OverlayPanelStyle.resolve(hudSession(position: .centerRight, sizePercent: 50,
+                                                         heightPercent: 90))
+        XCTAssertEqual(style.horizontalOffset(paneWidth: 1000), 150, accuracy: 0.0001)
+    }
+
+    func testANarrowPanelReachesTheEdgeMargin() {
+        let style = OverlayPanelStyle.resolve(hudSession(position: .bottomRight, sizePercent: 10))
+        XCTAssertEqual(style.horizontalOffset(paneWidth: 1000), 350, accuracy: 0.0001)
+    }
+
+    // a corner has to travel on BOTH axes, which is the whole point of the anchor
+    func testCornersOffsetOnBothAxes() {
+        let style = OverlayPanelStyle.resolve(hudSession(position: .topRight, sizePercent: 20,
+                                                         heightPercent: 20))
+        XCTAssertEqual(style.horizontalOffset(paneWidth: 1000), 300, accuracy: 0.0001)
+        XCTAssertEqual(style.verticalOffset(paneHeight: 1000), -300, accuracy: 0.0001)
+    }
+
+    func testLargestAllowedPanelStaysInsideThePaneHorizontally() {
+        let width: CGFloat = 1000
+        for position in HudPosition.allCases {
+            let style = OverlayPanelStyle.resolve(hudSession(position: position,
+                                                             sizePercent: HudLayout.maxSizePercent,
+                                                             heightPercent: HudLayout.maxSizePercent))
+            let panel = width * style.widthFraction
+            let left = (width - panel) / 2 + style.horizontalOffset(paneWidth: width)
+            XCTAssertGreaterThanOrEqual(left, 0, "\(position) overhangs the left")
+            XCTAssertLessThanOrEqual(left + panel, width, "\(position) overhangs the right")
+        }
+    }
+
+    // defensive, matching the vertical axis: no supported width reaches this branch, `clampSizePercent`
+    // bounding every caller's percent at `maxSizePercent`
+    func testAPanelTooWideForTheMarginStaysCentered() {
+        let style = OverlayPanelStyle.resolve(hudSession(position: .centerLeft, sizePercent: 95))
+        XCTAssertEqual(style.horizontalOffset(paneWidth: 1000), 0)
+    }
+
+    func testPanelFrameUsesThePaneRectForSizeAndAnchor() {
+        let style = OverlayPanelStyle.resolve(hudSession(position: .bottomRight,
+                                                         sizePercent: 80, heightPercent: 20))
+        let pane = CGRect(x: 500, y: 0, width: 500, height: 800)
+
+        let panel = style.panelFrame(in: pane)
+
+        XCTAssertEqual(panel.width, 400, accuracy: 0.001)
+        XCTAssertEqual(panel.height, 160, accuracy: 0.001)
+        XCTAssertEqual(panel.maxX, 950, accuracy: 0.001)
+        XCTAssertEqual(panel.maxY, 720, accuracy: 0.001)
+        XCTAssertTrue(pane.contains(panel))
+    }
+
+    func testHudMountEligibilityDistinguishesSessionWideFromHiddenPaneScope() {
+        XCTAssertTrue(OverlayPanelStyle.hudCanMount(paneIdentity: nil, paneFrameAvailable: false))
+        XCTAssertFalse(OverlayPanelStyle.hudCanMount(paneIdentity: UUID(), paneFrameAvailable: false))
+        XCTAssertTrue(OverlayPanelStyle.hudCanMount(paneIdentity: UUID(), paneFrameAvailable: true))
+    }
+
+    // MARK: - pane frame resolution
+
+    /// Discussion #384: a pane-scoped panel landed one detail-column origin off inside a split. `HSplitView`
+    /// hosts its arranged subviews across an AppKit bridge, so a pane measuring itself there reports window
+    /// coordinates; only the resolver's own space is the one the panel is positioned in. The fixture puts the
+    /// deck behind a sidebar and a titlebar so a leaked window origin has somewhere to show up.
+    func testSplitPaneFramesResolveAgainstTheDeckAndNotTheWindow() throws {
+        let frames = try resolvePaneFrames(split: true)
+
+        let left = try XCTUnwrap(frames.left)
+        let right = try XCTUnwrap(frames.right)
+        XCTAssertEqual(left.x, 0, accuracy: 0.5, "the left pane starts at the deck's own origin")
+        XCTAssertEqual(left.y, 0, accuracy: 0.5)
+        XCTAssertEqual(right.y, 0, accuracy: 0.5)
+        XCTAssertEqual(left.height, Self.deckSize.height, accuracy: 0.5)
+        XCTAssertEqual(right.x, left.width + Self.dividerAllowance, accuracy: Self.dividerAllowance)
+        XCTAssertEqual(right.x + right.width, Self.deckSize.width, accuracy: 0.5,
+                       "the panes must span the deck exactly, leaving no room for a window offset")
+    }
+
+    func testLonePaneFrameSpansTheWholeDeck() throws {
+        let frames = try resolvePaneFrames(split: false)
+
+        let left = try XCTUnwrap(frames.left)
+        XCTAssertNil(frames.right)
+        XCTAssertEqual(left.x, 0, accuracy: 0.5)
+        XCTAssertEqual(left.y, 0, accuracy: 0.5)
+        XCTAssertEqual(left.width, Self.deckSize.width, accuracy: 0.5)
+        XCTAssertEqual(left.height, Self.deckSize.height, accuracy: 0.5)
+    }
+
+    // MARK: - pane frame fixture
+
+    private static let sidebarWidth: CGFloat = 200
+    private static let titlebarHeight: CGFloat = 50
+    private static let deckSize = CGSize(width: 600, height: 550)
+    /// `HSplitView` spends a point on the divider, so the right pane starts just past the left one's width.
+    private static let dividerAllowance: CGFloat = 1
+
+    /// Mounts the production emitter and resolver in the shape that broke: a deck offset from the window by
+    /// a sidebar and a titlebar, with the panes inside `HSplitView`.
+    private func resolvePaneFrames(split: Bool) throws -> HudPaneFrames {
+        var resolved: HudPaneFrames?
+        let probe = HStack(spacing: 0) {
+            Color.clear.frame(width: Self.sidebarWidth)
+            VStack(spacing: 0) {
+                Color.clear.frame(height: Self.titlebarHeight)
+                ZStack {
+                    if split {
+                        HSplitView {
+                            Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity).hudPaneAnchor(.left)
+                            Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity).hudPaneAnchor(.right)
+                        }
+                    } else {
+                        Color.clear.hudPaneAnchor(.left)
+                    }
+                }
+                .overlayPreferenceValue(HudPaneAnchorsPreferenceKey.self) { anchors in
+                    GeometryReader { geo in
+                        let frames = anchors.frames(in: geo)
+                        Color.clear
+                            .onAppear { resolved = frames }
+                            .onChange(of: frames) { _, value in resolved = value }
+                    }
+                }
+            }
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0,
+                                                  width: Self.sidebarWidth + Self.deckSize.width,
+                                                  height: Self.titlebarHeight + Self.deckSize.height),
+                              styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        window.contentView = NSHostingView(rootView: probe)
+        window.layoutIfNeeded()
+        // the first layout pass reports a pre-layout rect, so wait for the frames to stop moving rather
+        // than for the first one to arrive — a fixed settle would only move the threshold.
+        let deadline = Date().addingTimeInterval(2)
+        var settled: HudPaneFrames?
+        var previous: HudPaneFrames?
+        var repeats = 0
+        while Date() < deadline, settled == nil {
+            // forcing a pass every turn is what makes a repeat mean "layout settled" rather than
+            // "no pass has run yet", which a pre-layout rect would satisfy just as well.
+            window.layoutIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            guard let current = resolved, current.left != nil, !split || current.right != nil else { continue }
+            repeats = current == previous ? repeats + 1 : 0
+            previous = current
+            if repeats >= 2 { settled = current }
+        }
+        // only a value that repeated is returned: handing back the last mid-flight sample would fail the
+        // assertions as a coordinate leak when the fixture simply never settled.
+        return try XCTUnwrap(settled, "the deck never reported settled pane frames")
     }
 }

@@ -42,6 +42,9 @@ paths:
 - Selection and pane focus clear unseen state and delivered banners. App activation does not transition
   the retained first responder, which caused #155; the `didBecomeKey` observer therefore calls
   `clearUnseenOnRefocus` only when `liveFocus` says this pane is the key window's first responder.
+- A pane swap clears delivered banners for that session. Notification identifiers encode the pane role and
+  cannot be retagged in place, so leaving them delivered would make a later click reveal the wrong terminal.
+  The unseen count is unchanged.
 - `notificationBadgeEnabled` gates session, workspace, and Dock counts through `effectiveUnseen`, including
   `RowContent.unseen` so toggles reload rows. It never gates the agent-status glyph.
 - `DockBadgeController` shows host-free `WindowLibrary.totalUnseenCount`. Use
@@ -101,9 +104,28 @@ paths:
   Row menus target their node; global surfaces call `clearActiveSessionStatus`; all set an empty indicator.
 - `GhosttySurfaceView.keyDown` always calls `onUserInputClearsStatus(isInterrupt:)`. Main `.left`, split
   `.right`, and scratch `.scratch` factories own the pane-scoped decision, allowing scratch to clear
-  without `view.session`. `AgentIndicator.clearedBy` clears blocked/completed on any key, active only on
-  interrupt, and only when the key's pane owns the status. Thus foreground typing cannot clear another
-  pane's status.
+  without `view.session`. `AgentIndicator.clearedBy` takes the key's kind (`InterruptKeystroke.classify`:
+  interrupt, submit for a bare Return or keypad Enter, else other) and the `StatusReset` mode: blocked and
+  completed clear on any key under `firstKey`, on submit alone under `enter`, never under `never`; active
+  clears on interrupt in every mode; and only when the key's pane owns the status. Thus foreground typing
+  cannot clear another pane's status.
+- `session.type` fires that same clear through `GhosttySurfaceView.injectAsUserInput`, the input a blocked
+  agent was waiting for having arrived. Injected text classifies as submit when it carries a newline and
+  other otherwise, never interrupt, like the AX insert, and an EMPTY payload clears nothing — `inject` queues no keystrokes yet still returns true. Unlike the AX insert it does not
+  fire `onUserInput`: that stamps the user as present and holds off auto-follow, which a script typing into
+  a background pane must not do. `quick.type` keeps plain `inject`; the quick terminal is no session and
+  carries no glyph.
+- While a session is blocked, `AppStore.applyControlStatus` REFUSES a `session.status` write from another
+  pane that is not itself `blocked`, returning `.refused(owner:)` — no status change, no
+  `statusChangedAt` restamp, no control event, and `ControlServer.setSessionStatus` returns before the
+  sound. Otherwise one pane's `PostToolUse`-driven `active` erases the other's block seconds after it is
+  set, which is `cookbook/two-agent-chat`. `blocked` passes so a second pane can report its own; `idle` does
+  NOT, because two bundled hooks emit it unprompted from their own pane — Codex's `session-start` and the
+  shell integration's `_ags_precmd`. Panes compare AFTER `AgentIndicator.normalizedPane`,
+  or a promoted survivor's baked `.right` fails to match the `.left` its own block is stored as. Every
+  internal clear and retag keeps using `setAgentIndicator` and bypasses the rule.
+- Two blocks in one session still collapse: the second pane's `blocked` replaces the first, and clearing it
+  from that pane leaves nothing. Only per-pane status storage fixes that; discussion #517 tracks it.
 - Interrupt means Esc (`keyCode == 53`) or bare Ctrl-C: control with no command/option/shift and either
   character `c` or physical key code 8. Physical matching covers non-Latin layouts; character matching
   covers Dvorak; excluding shift preserves Ctrl-Shift-C. Keep the full host-free truth table in
