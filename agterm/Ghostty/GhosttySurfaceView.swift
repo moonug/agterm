@@ -3,30 +3,51 @@
 import agtermCore
 import AppKit
 import GhosttyKit
+import os
 import QuartzCore
+
+private let logger = Logger(subsystem: "com.umputun.agterm", category: "GhosttySurfaceView")
 
 /// A Metal-backed NSView hosting one libghostty surface (one shell). Conforms to `TerminalSurface` so the
 /// host-free `Session` can own it without importing GhosttyKit/AppKit.
 ///
 /// `surface` and the `configCStrings` strdup buffers are `nonisolated(unsafe)`: mutated only on the main
 /// actor (create/destroy), and the C callbacks reading them are serialized by libghostty's tick model.
-final class GhosttySurfaceView: NSView, TerminalSurface {
+final class GhosttySurfaceView: NSView, PaneRoleMutableSurface {
     nonisolated(unsafe) private(set) var surface: ghostty_surface_t?
 
-    private let workingDirectory: String
+    let workingDirectory: String
 
     /// The command run as the surface's process instead of the login shell, nil for the login shell; read in
     /// `createSurface`. The overlay uses it to run one program (e.g. a TUI) whose exit closes the overlay.
-    private let command: String?
+    /// The three seed fields are `nonisolated(unsafe)` for `shouldCloseOnChildExitAction`, read from a C
+    /// callback: `resolveLaunchSeed` writes them on the main actor before the surface exists.
+    nonisolated(unsafe) private var command: String?
 
     /// Text fed to the pty as if typed at startup (libghostty `initial_input`), nil for none.
     /// Restore-running-command uses it: the captured foreground command line + `\n`, so a restored login
     /// shell re-runs it and returns to a prompt on exit — UNLIKE `command`, which replaces the shell.
-    private let initialInput: String?
+    nonisolated(unsafe) private var initialInput: String?
 
     /// Whether a `command`'s exit leaves the surface open on libghostty's "press any key to close" prompt
     /// instead of closing immediately. Only meaningful with `command`.
-    private let waitAfterCommand: Bool
+    nonisolated(unsafe) private var waitAfterCommand: Bool
+
+    /// Defers this pane's seed to spawn time; nil for a view built with explicit constructor values (the
+    /// overlay, scratch, quick terminal and HUD, none of which restore anything). Set by the pane
+    /// factories, resolved once in `createSurface`, dropped on resolution and on teardown.
+    var launchSeed: LaunchSeedProvider?
+
+    /// This pane's place in the launch spawn queue: the key the pacer grants and the pacer holding it, both
+    /// nil for every view that spawns on request (fresh panes, overlays, scratch, quick, HUD, and a restored
+    /// pane that replays nothing). The pacer is `weak` — the app owns it — and both are
+    /// `nonisolated(unsafe)` so the nonisolated `deinit` net can read them; written on the main actor only.
+    nonisolated(unsafe) private weak var spawnPacer: SpawnPacer?
+    nonisolated(unsafe) private var spawnKey: UUID?
+
+    /// Whether this pane is mounted and sized but still waiting for its spawn permit. `isRealized` already
+    /// reports it unrealized; this separates waiting on the pacer from waiting on a nonzero size.
+    private(set) var awaitingSpawnPermit = false
 
     /// Whether this surface grabs first responder as soon as it is created — the overlay's path: it mounts
     /// over an already-focused session, and `TerminalView.focusIfNeeded` grabs only when the view is in a
@@ -42,6 +63,11 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
 
     /// The owning model session, `weak` to break the cycle with `Session.surface`. Set by the factory.
     weak var session: Session?
+    /// Input ownership also follows sessionless overlay and scratch surfaces.
+    weak var focusSession: Session?
+
+    /// Whether this primary/split pane launched through zmx. Fixed before `createSurface` reads its config.
+    let backedByZmx: Bool
 
     /// The session whose visual config this surface inherits when it deliberately has no `session`: the scratch
     /// renders the owner's watermark without its OSC title/PWD reports mutating the session model. Nil for
@@ -97,14 +123,14 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     /// whose focus report is suppressed though the user is looking at it. Set by the main/split factories.
     var onClearUnseen: (() -> Void)?
 
-    /// Called on the main actor on EVERY keystroke into this surface, carrying whether the key interrupts the
-    /// agent (Escape or Ctrl-C). The factory decides per pane via `AgentIndicator.clearedBy(pane:isInterrupt:)`:
-    /// clear the glyph to idle only when THIS surface's pane owns a clearable status — `blocked`/`completed`
-    /// on any key, `active` only on an interrupt — so foreground typing cannot wipe a background pane's block.
-    /// Passing the pane rather than reading `view.session` lets the scratch, which has none, self-clear.
-    /// Status is otherwise control-driven; this is the one input-driven clear, for the decline case Claude
-    /// Code fires no hook for.
-    var onUserInputClearsStatus: ((Bool) -> Void)?
+    /// Called on the main actor on EVERY keystroke into this surface, carrying what the key means to the glyph
+    /// (`InterruptKeystroke.classify`: interrupt, submit or plain typing). The factory decides per pane via
+    /// `AgentIndicator.clearedBy(pane:keystroke:reset:)`: clear the glyph to idle only when THIS surface's pane
+    /// owns a clearable status — `blocked`/`completed` as the Status reset setting says, `active` only on an
+    /// interrupt — so foreground typing cannot wipe a background pane's block. Passing the pane rather than
+    /// reading `view.session` lets the scratch, which has none, self-clear. Status is otherwise
+    /// control-driven; this is the one input-driven clear, for the decline case Claude Code fires no hook for.
+    var onUserInputClearsStatus: ((StatusKeystroke) -> Void)?
 
     /// Called on the main actor on EVERY keystroke to stamp user activity and reset the window's auto-follow
     /// idle timer. Fires unconditionally, unlike `onUserInputClearsStatus`: ordinary typing in an idle
@@ -112,8 +138,8 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     var onUserInput: (() -> Void)?
 
     /// Called on the main actor with the current font size (points) when it changes (cmd +/-), so the app
-    /// can persist it. Set on the primary surface only. libghostty has no font-size getter or change event,
-    /// so it rides the CELL_SIZE action and reads via `ghostty_surface_inherited_config`.
+    /// can persist it. Pane surfaces share a live-role-aware callback; scratch and overlays leave it unset.
+    /// libghostty has no font-size getter or change event, so this rides CELL_SIZE and reads the inherited config.
     var onFontSizeChange: ((Double) -> Void)?
 
     /// Called when libghostty enters search mode (START_SEARCH) with the current needle (nil when none). The
@@ -157,8 +183,12 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     /// because the nonisolated `deinit` safety net reads them.
     nonisolated(unsafe) private var focusObservers: [NSObjectProtocol] = []
     private var pendingSurfaceCreation = false
+    var rendererVisibilityTask: Task<Void, Never>?
+    var rendererVisible = true
+    /// Sweeps the hidden layer's retained frame on a slow cadence; exits itself on reveal or teardown.
+    var hiddenJanitorTask: Task<Void, Never>?
     /// After `destroySurface()` the view is retired: never recreate a surface (a stray viewDidMoveToWindow).
-    private var isDestroyed = false
+    private(set) var isDestroyed = false
 
     /// Guards `handleProcessExit` so the close runs once. Both the `SHOW_CHILD_EXITED` action and the
     /// `close_surface_cb` can fire for one exit (ghostty documents no ordering/exclusivity between them).
@@ -178,22 +208,36 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     var deckActive = true
 
     /// Whether this surface's deck slot is on-screen (session selected, not hidden by a full overlay/scratch).
-    /// UNLIKE `deckActive` it is NOT focus-gated, so both panes of a visible split are `deckVisible`.
+    /// Unlike `deckActive` it is not split-pane-focus-gated, so both panes of a visible split are
+    /// `deckVisible`; it still drops while the quick terminal owns focus to suppress AppKit mouse routing.
     /// Load-bearing for drag-and-drop: every surface is eagerly realized, and SwiftUI's `.opacity(0)`/
     /// `.allowsHitTesting(false)` never reach AppKit's drag machinery (the NSView keeps `alphaValue == 1`, and
     /// drag-destination resolution does NOT consult `hitTest`), so with every surface registered a file drop
     /// would land on whichever is topmost in z-order — an INVISIBLE background session — not the one under
     /// the cursor. `didSet` (un)registers the drag types and the mouse-tracking area for the same reason.
-    /// ALSO drives libghostty occlusion so a background session's renderer stops drawing until it next comes
-    /// on-screen; see `applyRendererVisibility`.
     var deckVisible = true {
         didSet {
+            // the user is looking at this pane, so it goes to the front of a paced launch; a no-op when
+            // unpaced, granted or already expedited, so the per-update rewrites mint nothing. ahead of the
+            // equality guard because the first mount writes true over the default true. `deckActive` is
+            // split-focus-gated and would leave the other half of a shown split queued.
+            if deckVisible { expediteSpawn() }
             // `TerminalView` assigns this on every SwiftUI update pass, so skip the tracking-area teardown/
             // rebuild + drag re-registration unless the visibility actually flipped.
             guard deckVisible != oldValue else { return }
             updateDropRegistration()
             updatePointerTracking()
-            applyRendererVisibility()
+            postAccessibilityExposureChange() // one of the `axExposed` terms; tell AX if the element came or went
+        }
+    }
+
+    /// Whether this surface actually paints on screen. Wider than `deckVisible`: dashboard cells and
+    /// passive HUDs are visible while deliberately non-interactive, and a pane stays on screen while the
+    /// quick terminal merely holds key.
+    var deckOnScreen = true {
+        didSet {
+            guard deckOnScreen != oldValue else { return }
+            updateRendererVisibility()
         }
     }
 
@@ -205,39 +249,14 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     var viewOnly = false {
         didSet {
             guard viewOnly != oldValue else { return }
-            if viewOnly, !oldValue,
-               let window, window.firstResponder === self {
-                // acceptsFirstResponder=false blocks only NEW grabs: a surface carrying first responder in from
-                // the deck (the focused split pane at dashboard open) keeps it across the reparent and defeats
-                // the key-catcher. resign here; once view-only nothing can re-grab.
-                window.makeFirstResponder(nil)
-            }
-            applyRendererVisibility()
+            // `axExposed`'s first term. Every term drives the exposure post rather than one implying others.
+            postAccessibilityExposureChange()
+            guard viewOnly else { return }
+            // acceptsFirstResponder=false blocks only NEW grabs: a surface carrying first responder in from
+            // the deck (the focused split pane at dashboard open) keeps it across the reparent and defeats
+            // the key-catcher. resign here; once view-only nothing can re-grab.
+            if let window, window.firstResponder === self { window.makeFirstResponder(nil) }
         }
-    }
-
-    /// Whether libghostty should keep rendering this surface. The eager deck realizes every surface, but a
-    /// background session is never on-screen, and libghostty honors `ghostty_surface_set_occlusion(visible:)` to
-    /// pause rendering for hidden surfaces and resume on the next visibility change. `deckVisible` is false for
-    /// those backgrounds; `viewOnly` is true for dashboard cells whose `deckVisible` is false but whose pixels
-    /// still need to draw. A view with no `window` (the persistent quick-terminal, scratch, and split surfaces
-    /// survive view churn by staying off-host) must NOT report visible, so the renderer pauses until the host
-    /// reattaches. Caller pushes any change through `applyRendererVisibility`; the surface may not yet exist.
-    private var rendererVisible: Bool {
-        window != nil && (deckVisible || viewOnly)
-    }
-
-    /// Test seam: the renderer-visibility gate the surface pushes to libghostty. Exposed so the regression
-    /// suite can pin the hidden/detached/viewOnly rules without spinning up a real Metal surface (a
-    /// zero-frame view stays unrealized by design, so `ghostty_surface_set_occlusion` never runs there).
-    var rendererVisibleForTesting: Bool { rendererVisible }
-
-    /// Push the current `rendererVisible` value to libghostty. No-op until `ghostty_surface_new` runs; safe to
-    /// call from `didSet` and on `viewDidMoveToWindow` so background surfaces immediately stop rendering and
-    /// reattached ones resume.
-    private func applyRendererVisibility() {
-        guard let surface else { return }
-        ghostty_surface_set_occlusion(surface, rendererVisible)
     }
 
     /// Register the file/text drag types only while this surface is the on-screen deck pane, so an eagerly
@@ -281,6 +300,35 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     // IME composition state shared with GhosttySurfaceView+Input.swift (stored properties can't live in an extension).
     var _markedRange = NSRange(location: NSNotFound, length: 0)
     var _selectedRange = NSRange(location: NSNotFound, length: 0)
+    /// The in-flight composition's text. libghostty owns the preedit for RENDERING (`ghostty_surface_preedit`)
+    /// and hands nothing back, so the only way to COMMIT a live composition instead of throwing it away is to
+    /// keep our own copy — which every programmatic insert does (`commitOrDiscardComposition`). Maintained by the
+    /// three `NSTextInputClient` methods that own `_markedRange`, and always cleared with it.
+    var _markedText = ""
+
+    /// The `isAccessibilityFocused` value last announced to AX, so `postAccessibilityFocusChange` posts on
+    /// TRANSITIONS only. Every surface re-runs `updateGhosttyFocus` on any window's key change (the
+    /// `didBecomeKey`/`didResignKey` observers use `object: nil`), so an ungated post would fire once per
+    /// realized surface per key change — N notifications for one focus move.
+    var axPostedFocus = false
+
+    /// Whether a deferred focus post is already queued for this surface, so the resign+become PAIR that a
+    /// single focus move produces coalesces into one evaluation instead of two. See
+    /// `postAccessibilityFocusChange`, which schedules the hop.
+    var axFocusPostScheduled = false
+
+    /// The `axExposed` value last announced to AX, the exposure counterpart of `axPostedFocus`. Every term
+    /// of `axExposed` now has a call site (`deckVisible`/`viewOnly` didSet, surface create/destroy, window
+    /// move, and the miniaturize/hide observers), several of which can fire for a single transition, so the
+    /// latch is what keeps one flip to one `.layoutChanged`.
+    var axPostedExposed = false
+
+    /// True only for the duration of the `discardMarkedText()` call inside `commitOrDiscardComposition`,
+    /// where `insertText` refuses re-entrant input. That helper commits our copy of the composition itself
+    /// and then tears the IME session down; an input method that FINALIZES rather than abandons on that
+    /// teardown would send the same characters back through `insertText` and land them twice. Nothing else
+    /// legitimately types during that synchronous window, so dropping the re-entrant insert is safe.
+    var committingComposition = false
     var keyTextAccumulator: [String] = []
     var currentKeyEvent: NSEvent?
 
@@ -306,9 +354,9 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     /// to suppress the libghostty RELEASE (so ghostty doesn't try to fire its OSC-8 click handler against a
     /// press we already intercepted). Reset to false at every release.
     var cmdClickArmed = false
-
     init(workingDirectory: String, fontSize: Float? = nil, command: String? = nil, initialInput: String? = nil,
-         waitAfterCommand: Bool = false, autoFocus: Bool = false, env: [String: String] = [:]) {
+         waitAfterCommand: Bool = false, autoFocus: Bool = false, env: [String: String] = [:],
+         backedByZmx: Bool = false) {
         self.workingDirectory = workingDirectory
         self.initialFontSize = fontSize
         self.command = command
@@ -316,10 +364,40 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
         self.waitAfterCommand = waitAfterCommand
         self.autoFocus = autoFocus
         self.env = env
+        self.backedByZmx = backedByZmx
         super.init(frame: .zero)
         wantsLayer = true
         setupTrackingArea()
         observeKeyWindowChanges()
+        observeWindowVisibilityChanges()
+        observeDisplayWake()
+    }
+
+    /// Re-attempt creation when the displays wake. `ghostty_surface_new` returns NULL for as long as the
+    /// display is asleep, and the deck's own retries all ride SwiftUI layout, which does not run for an
+    /// off-display window — so a session a scheduled job created in that window stays dead with its
+    /// `--command` unrun until something incidental re-lays it out (#416). `object: nil` and a token in
+    /// `focusObservers` match the sibling observers, including their `NotificationCenter.default` teardown.
+    private func observeDisplayWake() {
+        let token = NotificationCenter.default.addObserver(
+            forName: .agtermScreensDidWake, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.retryCreationAfterWake() }
+        }
+        focusObservers.append(token)
+    }
+
+    /// Bounded re-attempts after a display wake: creation was measured still failing for a second or two
+    /// past `screensDidWake`, so one shot at the notification is not enough, and an unbounded retry would
+    /// spin forever against a surface that fails for some other reason. A realized surface costs nothing —
+    /// the first guard returns immediately.
+    private func retryCreationAfterWake(attempt: Int = 1) {
+        guard !isDestroyed, surface == nil else { return }
+        createSurface()
+        guard surface == nil, attempt < 10 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.retryCreationAfterWake(attempt: attempt + 1)
+        }
     }
 
     /// Watch every window's key transitions and re-evaluate focus on each. No filtering to my own window:
@@ -346,6 +424,26 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
         }
     }
 
+    /// Watch the transitions that move `window?.isVisible`, the `axExposed` term nothing else reports.
+    /// `deckVisible` is pure MODEL state, so miniaturizing the window — or hiding the app — leaves this pane
+    /// `deckVisible == true` while AppKit reports `isVisible == false`. Without these, `axExposed` went
+    /// true → false → true across a minimize/restore with no `.layoutChanged` posted at all.
+    /// `object: nil` like the key observers: the post recomputes from THIS view's own window, so another
+    /// window's notification costs one latch compare. Tokens join `focusObservers`, so teardown is unchanged.
+    private func observeWindowVisibilityChanges() {
+        let center = NotificationCenter.default
+        let names: [Notification.Name] = [
+            NSWindow.didMiniaturizeNotification, NSWindow.didDeminiaturizeNotification,
+            NSApplication.didHideNotification, NSApplication.didUnhideNotification,
+        ]
+        for name in names {
+            let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.postAccessibilityExposureChange() }
+            }
+            focusObservers.append(token)
+        }
+    }
+
     /// Clear the seen state (unseen badge + delivered banners) for this pane's session when agterm regains key
     /// focus on it. `liveFocus` (first responder of a key window, and a window is key only while the app is
     /// active) confines it to the focused pane of the now-key window, never a background one. Reusing
@@ -367,7 +465,9 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     /// responder AND that window is key — the key gate stops every window's active surface blinking at once.
     /// Reading the live responder rather than a cached flag keeps a re-hosted pane's focus true, so opening
     /// a split can't leave both panes solid.
-    private var liveFocus: Bool {
+    /// Not `private`: `+Accessibility.swift` reuses it for `isAccessibilityFocused` / the AX write guard,
+    /// the same way `currentTrackingArea` is internal so `+Tracking.swift` can reach it.
+    var liveFocus: Bool {
         guard let window else { return false }
         return window.isKeyWindow && window.firstResponder === self
     }
@@ -379,6 +479,10 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     func updateGhosttyFocus() {
         guard let surface else { return }
         ghostty_surface_set_focus(surface, liveFocus)
+        // `isAccessibilityFocused` mirrors `liveFocus`; AX must hear it move. This covers the key-window and
+        // (re)attach paths only — the first-responder transitions post for themselves, since they run before
+        // AppKit has updated `window.firstResponder` and never reach this method.
+        postAccessibilityFocusChange()
     }
 
     @available(*, unavailable)
@@ -389,6 +493,11 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     deinit {
         // free directly, not via destroySurface(): deinit is nonisolated and can't call the @MainActor method,
         // while the nonisolated(unsafe) fields free with plain C calls. the net for a view dropped untorn.
+        // the queue exit is the exception: `cancel` is main-actor, so schedule it by KEY, capturing the pacer
+        // and the key but never `self`, which is already being freed.
+        if let pacer = spawnPacer, let key = spawnKey {
+            Task { @MainActor in pacer.cancel(key) }
+        }
         focusObservers.forEach { NotificationCenter.default.removeObserver($0) }
         if let surface { ghostty_surface_free(surface) }
         configCStrings.forEach { free($0) }
@@ -423,6 +532,16 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
         // title refresh live. like applyPwd this does NOT save() — OSC set-title re-fires on every prompt
         // redraw — and sanitizes: the title flows unquoted into a /bin/sh -c line via {AGT_SESSION_NAME}.
         let title = TerminalText.sanitized(rawTitle)
+        // one value for the log and the drop below, so a trace can never name a cwd the check did not use.
+        let paneCwd = session.map { isSplitPane ? $0.cwd(for: .right) : $0.effectiveCwd }
+        logger.debug("terminal title pane=\(self.paneToken, privacy: .public) split=\(self.isSplitPane) cwd=\(paneCwd ?? "<none>", privacy: .public) title=\(rawTitle, privacy: .public)")
+
+        // libghostty answers OSC 7 with a synthetic title equal to the pwd, and its PWD action does not
+        // reliably reach `applyPwd` before that title, so no arming handshake catches it. A shell titles
+        // with a basename or an abbreviated path, never the bare absolute cwd. Compares the SANITIZED
+        // title, since `applyPwd` stores a sanitized cwd. Residual: between a cd and its OSC 7 the cwd
+        // here is still the old one, so a synthetic title for the NEW directory is accepted.
+        if title == paneCwd { return }
 
         if isSplitPane {
             if session?.splitTitle != title { session?.splitTitle = title }
@@ -431,18 +550,32 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
         }
     }
 
+    /// Marks this surface's exit as handled WITHOUT running `onExit`, so a queued callback for a process
+    /// the caller has already destroyed becomes a no-op. Returns false when the exit had already been
+    /// handled, which is the caller's signal that the pane's own teardown has run and it must not drive a
+    /// second one. Reuses `didHandleProcessExit` rather than adding a parallel flag that could drift.
+    @discardableResult
+    func claimProcessExit() -> Bool {
+        guard !didHandleProcessExit else { return false }
+        didHandleProcessExit = true
+        return true
+    }
+
     func handleProcessExit() {
         // already on the main actor (the close callbacks hop via DispatchQueue.main.async). idempotent: the
         // SHOW_CHILD_EXITED action and close_surface_cb can both fire for one exit.
         guard !didHandleProcessExit else { return }
         didHandleProcessExit = true
+        if backedByZmx {
+            logger.error("zmx attach process exited for pane \(self.paneToken, privacy: .public)")
+        }
         onExit?()
     }
 
     /// Whether a child-exit should close this surface immediately, suppressing ghostty's "press any key"
     /// prompt. True only for a command surface (the overlay) that did NOT opt into the wait prompt, which
     /// instead closes via `close_surface_cb` after the keypress. `nonisolated` so the C action callback reads
-    /// it with no main-actor hop — both backing fields are `let`s.
+    /// it with no main-actor hop.
     nonisolated var shouldCloseOnChildExitAction: Bool { command != nil && !waitAfterCommand }
 
     func reportFontSize() {
@@ -460,12 +593,6 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
         onFontSizeChange?(size) // the store no-ops a same-value write.
     }
 
-    /// Draws the surface now, servicing libghostty's `GHOSTTY_ACTION_RENDER` demand. Main-actor.
-    func renderNow() {
-        guard let surface else { return }
-        ghostty_surface_draw(surface)
-    }
-
     // MARK: - Surface lifecycle
 
     func createSurface() {
@@ -480,6 +607,10 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
             return
         }
         pendingSurfaceCreation = false
+        // after the size guard so a zero-size pane holds no pacer token; the pacer re-enters createSurface
+        // on grant. before the seed resolves so a denied pane keeps its captured argv and restore pin armed.
+        guard requestSpawnPermit() else { return }
+        resolveLaunchSeed()
 
         var config = ghostty_surface_config_new()
         config.platform_tag = GHOSTTY_PLATFORM_MACOS
@@ -506,8 +637,8 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
             config.command = nil // login shell
         }
         // restore-running-command: feed the captured command line to the login shell as if typed, so it re-runs
-        // and exits back to a prompt. same buffer lifetime; mutually exclusive with `command` (which REPLACES
-        // the shell), enforced here rather than by caller discipline alone.
+        // and exits back to a prompt. Ordinary command surfaces keep the fields mutually exclusive because a
+        // command REPLACES the shell.
         if command == nil, let initialInput, let p = strdup(initialInput) {
             configCStrings.append(p)
             config.initial_input = UnsafePointer(p)
@@ -542,20 +673,28 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
                 return ghostty_surface_new(app, &config)
             }
         }
-        guard let surface else { return }
-
+        guard let surface else {
+            // libghostty declines to build a surface while the display is asleep. Silence here is what made
+            // #416 undiagnosable from outside: `session.new` had already answered ok. Re-arm the deferred-create
+            // flag so the layout path retries too — `.agtermScreensDidWake` is what makes recovery TIMELY, not
+            // what makes it possible, and a view first mounted inside the residual post-wake window registers
+            // its observer too late for the wake that just fired.
+            pendingSurfaceCreation = true
+            logger.notice("surface creation failed (display asleep?); retrying on the next wake or layout pass")
+            return
+        }
         // record the same scheme on the surface itself, so a later `update_config` re-resolves its side.
         ghostty_surface_set_color_scheme(surface, isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
-        // pause libghostty rendering if this surface is being realized off-screen — surfaces realized lazily
-        // by a deck reveal (an overlay/quick-terminal show) come up at full frame and will be flipped back on
-        // by the deck's `deckVisible` update.
-        applyRendererVisibility()
-
         if let screen = window?.screen ?? NSScreen.main,
            let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? UInt32 {
             ghostty_surface_set_display_id(surface, displayID)
         }
         updateGhosttyFocus()
+        updateRendererVisibility(delayHide: false)
+        // the `surface != nil` term of `axExposed` just flipped: a pane whose creation was DEFERRED
+        // (`pendingSurfaceCreation`, a window still being presented) was absent from the a11y tree until
+        // now, so the first window after launch never announced its Terminal element.
+        postAccessibilityExposureChange()
 
         // a session carrying a background watermark (never shown, or restored from a snapshot) applies it now
         // the surface exists — deferred-size creation, the eager deck, relaunch; the scratch inherits via
@@ -574,6 +713,55 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
         requestAutoFocus(in: window)
     }
 
+    /// Puts this pane in the launch spawn queue: `createSurface` asks `pacer` for `key` once the view is
+    /// sized, and spawns when the grant comes back through the registry. Called by the pane factories for a
+    /// restored pane that replays a program; every other view spawns on request.
+    func useSpawnPacer(_ pacer: SpawnPacer, key: UUID) {
+        spawnPacer = pacer
+        spawnKey = key
+    }
+
+    /// Moves this pane to the front of a paced launch and grants it now. A no-op for an unpaced pane and
+    /// for a key already granted or expedited, so a caller may repeat it freely.
+    func expediteSpawn() {
+        guard let spawnPacer, let spawnKey else { return }
+        spawnPacer.expedite(spawnKey)
+    }
+
+    /// Moves the queued panes among `views` to the front, in that order, releasing none: a dashboard
+    /// opening on many queued members fills its cells at the paced rate rather than in one burst.
+    static func prioritizeSpawn(_ views: [GhosttySurfaceView]) {
+        guard let pacer = views.lazy.compactMap(\.spawnPacer).first else { return }
+        pacer.prioritize(views.compactMap { $0.spawnPacer === pacer ? $0.spawnKey : nil })
+    }
+
+    /// Whether the surface may spawn now. False leaves the pane queued and the caller returns: the pacer
+    /// re-enters `createSurface` on the grant, against the bounds the view has then, so this deferral is the
+    /// pacer's own rather than a next-tick hop racing layout. True for an unarmed or drained pacer, for a
+    /// key already granted, and for every view outside the queue, which is today's behavior unchanged.
+    func requestSpawnPermit() -> Bool {
+        guard let spawnPacer, let spawnKey else { return true }
+        awaitingSpawnPermit = !spawnPacer.request(spawnKey)
+        return !awaitingSpawnPermit
+    }
+
+    /// Consumes the deferred launch seed on the first call, latching it into `command`/`initialInput`/
+    /// `waitAfterCommand` and dropping the closure, so a creation retried after an unrelated failure never
+    /// takes the session's pending slots twice. Returns the seed in force, which for a view built without a
+    /// provider is its constructor values.
+    @discardableResult
+    func resolveLaunchSeed() -> LaunchSeed {
+        guard let provider = launchSeed else {
+            return LaunchSeed(command: command, initialInput: initialInput, waitAfterCommand: waitAfterCommand)
+        }
+        launchSeed = nil
+        let seed = provider.resolve(isSplitPane ? .right : .left)
+        command = seed.command
+        initialInput = seed.initialInput
+        waitAfterCommand = seed.waitAfterCommand
+        return seed
+    }
+
     /// Marks the surface focused in libghostty after a retried `makeFirstResponder` (the overlay/reparent
     /// grabs). By now `window.firstResponder === self`, so `updateGhosttyFocus` reports the true state.
     private func notifySurfaceFocused() {
@@ -583,7 +771,7 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     /// Starts the bounded auto-focus retry (overlay only), if not already done/in-flight.
     private func requestAutoFocus(in window: NSWindow?) {
         guard autoFocus, deckActive, !didAutoFocus, !autoFocusInFlight, let window,
-              !Self.pickOwnsFocus(in: window) else { return }
+              !deferFocusToAsk() else { return }
         autoFocusInFlight = true
         restoreAutoFocus(in: window, attempt: 0)
     }
@@ -592,7 +780,7 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     /// first responder, then marks it focused. Bounded; gives up if the view is torn down or moved windows
     /// (macterm's FocusRestoration pattern).
     private func restoreAutoFocus(in window: NSWindow, attempt: Int) {
-        guard autoFocus, deckActive, !didAutoFocus, !isDestroyed, !Self.pickOwnsFocus(in: window) else {
+        guard autoFocus, deckActive, !didAutoFocus, !isDestroyed, !deferFocusToAsk() else {
             autoFocusInFlight = false
             return
         }
@@ -625,7 +813,7 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
     }
 
     private func retryReparentFocus(attempt: Int, heldFor: Int) {
-        guard !isDestroyed, !Self.pickOwnsFocus(in: window) else {
+        guard !isDestroyed, !deferFocusToAsk() else {
             reparentFocusInFlight = false
             return
         }
@@ -644,20 +832,41 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
         }
     }
 
-    /// A picker is modal to terminal keyboard focus in its own window. The check lives inside both retry loops,
-    /// not just their callers: a picker can open after a retry starts, and the next tick must stop before it
-    /// steals first responder from the picker field.
-    static func pickOwnsFocus(in window: NSWindow?) -> Bool {
+    /// Rechecked inside retries so a newly opened dialog can claim its region's input.
+    static func pickOwnsFocus(in window: NSWindow?, session: Session? = nil, pane: OverlayPane? = nil) -> Bool {
         guard let window, let windowID = WindowRegistry.shared.windowID(for: window) else { return false }
-        return PickRegistry.shared.controller(for: windowID)?.pending != nil
+        if PickRegistry.shared.controller(for: windowID)?.modalPending == true { return true }
+        guard let session, let catcher = AskKeyCatcher.KeyCatcherView.sessionCatchers.object(forKey: session.id as NSUUID),
+              catcher.window === window else { return false }
+        return catcher.sessionInput?.blocksTerminalFocus(in: window, pane: pane) == true
     }
 
     func destroySurface() {
+        // a pane torn down before it spawned must not consume its pending slots; the session keeps them.
+        launchSeed = nil
+        // leave the launch queue: a key nobody will ever request holds every pane behind it for an interval,
+        // and the grant that arrives anyway finds a destroyed view and no-ops.
+        if let spawnKey, let spawnPacer { spawnPacer.cancel(spawnKey) }
+        spawnKey = nil
+        awaitingSpawnPermit = false
+        cancelPendingRendererVisibility()
+        hiddenJanitorTask?.cancel()
+        hiddenJanitorTask = nil
         isDestroyed = true
         focusObservers.forEach { NotificationCenter.default.removeObserver($0) }
         focusObservers = []
         if let surface { ghostty_surface_free(surface) }
         surface = nil
+        // release the custom layer libghostty installed and this view still retains. The current pin clears
+        // its display callback in `IOSurfaceLayer.release`, so this defends builds predating that fix, where
+        // the callback kept pointing at the freed renderer and the next CoreAnimation display locked a mutex
+        // in freed memory (#443). Must follow the free, which joins the render thread: dropping the layer
+        // while it still paints trades one use-after-free for another.
+        dropGhosttyLayer()
+        // the other end of the `surface != nil` term: this element just left the a11y tree, and a client
+        // holding it needs to re-resolve rather than keep writing into a closed session's pane.
+        postAccessibilityExposureChange()
+        postAccessibilityFocusChange()
         configCStrings.forEach { free($0) }
         configCStrings = []
         // the env structs only point into the freed configCStrings buffers; clear them too.
@@ -698,6 +907,20 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
         onSearchSelected = nil
     }
 
+    /// Swaps libghostty's `CALayer` subclass out for a plain one, keeping the last painted frame as its
+    /// contents so a pane about to be unmounted does not blank for a frame first. The contents are an
+    /// `IOSurface` the layer retains, so carrying the reference over outlives the freed renderer.
+    private func dropGhosttyLayer() {
+        let plain = CALayer()
+        if let stale = layer {
+            plain.frame = stale.frame
+            plain.contentsScale = stale.contentsScale
+            plain.contentsGravity = stale.contentsGravity
+            plain.contents = stale.contents
+        }
+        layer = plain
+    }
+
     /// `TerminalSurface` conformance: the model calls this when the owning session is closed.
     func teardown() {
         destroySurface()
@@ -712,13 +935,13 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil {
-            // detached: pause libghostty rendering. The persistent quick/scratch/split surfaces survive a
-            // view churn by leaving the host, and libghostty would otherwise keep redrawing them in the dark.
-            applyRendererVisibility()
-            return
-        }
-        let window = window!
+        // above the nil-window guard: DETACHING is the transition nothing else reports. Hiding the quick
+        // terminal unmounts its view with `deckVisible`/`viewOnly`/`surface` all unchanged, so this is the
+        // only site that can clear the latch — below the guard it never ran, and the re-show then compared
+        // equal and stayed silent too.
+        postAccessibilityExposureChange()
+        updateRendererVisibility()
+        guard let window else { return }
         if surface == nil {
             createSurface()
         } else {
@@ -731,8 +954,6 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
             updateGhosttyFocus()
         }
         updateMetalLayerSize()
-        // re-push occlusion: the surface may have been off-host (renderer paused) and is now back on-screen.
-        applyRendererVisibility()
         // focus is driven by TerminalView.updateNSView when this surface becomes the active session's detail
         // view; only an auto-focus (overlay) surface grabs here, since that grab misses a deferred surface.
         requestAutoFocus(in: window)
@@ -775,56 +996,5 @@ final class GhosttySurfaceView: NSView, TerminalSurface {
         // the split re-parent invalidates the Metal drawable, and neither a same-grid set_size nor the tick
         // (dirty surfaces only) repaints it — force one or the re-hosted pane stays blank over a live buffer.
         ghostty_surface_refresh(surface)
-    }
-
-    // MARK: - First responder
-
-    override var acceptsFirstResponder: Bool { !viewOnly }
-
-    /// In view-only mode refuse hit-testing, so a click passes THROUGH to the SwiftUI cell overlay instead of
-    /// reaching `mouseDown` — AppKit routes clicks here regardless of `.allowsHitTesting(false)`.
-    ///
-    /// `deckVisible` deliberately does NOT gate this. Refusing while off-screen only promotes the hidden deck
-    /// entry's own container — its `NSSplitView` or pane view — to answer in its place, and that is not a
-    /// `GhosttySurfaceView`, so `ownsPointer` then declines across the whole visible terminal and it loses
-    /// every cursor shape it paints.
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        viewOnly ? nil : super.hitTest(point)
-    }
-
-    /// Deliver the LEFT click that reactivates a background window straight to the surface (a "first mouse")
-    /// instead of letting AppKit swallow it to raise the window: otherwise clicking a pane of a two-pane split
-    /// from another window raises it but never runs `mouseDown`, leaving `splitFocused` on the previous pane.
-    /// The click then behaves like any in-window one — selects the pane AND is reported to the program — as in
-    /// Terminal.app/iTerm2/Ghostty. Gated to `.leftMouseDown`: a first-mouse right/middle click reaches
-    /// `rightMouseDown`/`otherMouseDown`, which forward to libghostty, where the default
-    /// `right-click-action = paste` would paste into a window you only meant to raise.
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-        // with auto-hide-inactive-sidebars on, activating an inactive window expands its hidden sidebar and
-        // resizes THIS surface, so an activating click on the terminal would drag the still-held press into a
-        // phantom selection. in that mode the click only raises; a follow-up click selects once key.
-        if GhosttyApp.shared.autoHideSidebarInactiveWindows { return false }
-        return event?.type == .leftMouseDown
-    }
-
-    override func becomeFirstResponder() -> Bool {
-        let result = super.becomeFirstResponder()
-        if result, let surface {
-            // report focused, gated on the window being key (a background window's surface stays hollow). push
-            // directly: `window.firstResponder` is not yet self inside this call, so `liveFocus` reads stale.
-            // onFocusChange (split-pane tracking) is independent of key state.
-            ghostty_surface_set_focus(surface, window?.isKeyWindow ?? false)
-            if !suppressFocusChange { onFocusChange?(true) }
-        }
-        return result
-    }
-
-    override func resignFirstResponder() -> Bool {
-        let result = super.resignFirstResponder()
-        if result, let surface {
-            ghostty_surface_set_focus(surface, false)
-            if !suppressFocusChange { onFocusChange?(false) }
-        }
-        return result
     }
 }

@@ -30,16 +30,16 @@ extension GhosttySurfaceView {
     // MARK: - Keyboard
 
     /// Reduce an `NSEvent` to the host-free `InterruptKeystroke` classifier — Escape or a bare Ctrl-C.
-    private func isInterruptKeystroke(_ event: NSEvent) -> Bool {
+    private func classifyKeystroke(_ event: NSEvent) -> StatusKeystroke {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         var modifiers: KeyModifiers = []
         if flags.contains(.control) { modifiers.insert(.control) }
         if flags.contains(.command) { modifiers.insert(.command) }
         if flags.contains(.option) { modifiers.insert(.option) }
         if flags.contains(.shift) { modifiers.insert(.shift) }
-        return InterruptKeystroke.isInterrupt(keyCode: event.keyCode,
-                                              character: event.charactersIgnoringModifiers,
-                                              modifiers: modifiers)
+        return InterruptKeystroke.classify(keyCode: event.keyCode,
+                                           character: event.charactersIgnoringModifiers,
+                                           modifiers: modifiers)
     }
 
     override func keyDown(with event: NSEvent) {
@@ -50,14 +50,15 @@ extension GhosttySurfaceView {
         // every keystroke is user activity: reset the auto-follow idle timer UNCONDITIONALLY, not gated on
         // the status-clear below, else typing in an idle session yanks the user to a blocked one mid-type.
         onUserInput?()
-        // a keystroke clears an attention glyph to idle: blocked/completed on ANY key, active ONLY on an
-        // interrupt (Escape or Ctrl-C), so typing while the agent works keeps the "working" glyph but
-        // cancelling a pending prompt drops it. Claude Code treats Ctrl-C like Esc for dismissing a prompt,
-        // yet neither fires a hook and a cancelled prompt can still read active (its blocked notification
-        // lands seconds later), so this is the only signal that drops the stale glyph. fire UNCONDITIONALLY
-        // with the isInterrupt flag: the pane-scoped decision belongs to AgentIndicator.clearedBy, so the
-        // scratch (no view.session) self-clears too and a background pane's block survives foreground typing.
-        onUserInputClearsStatus?(isInterruptKeystroke(event))
+        // a keystroke clears an attention glyph to idle: blocked/completed as the Status reset setting says,
+        // active ONLY on an interrupt (Escape or Ctrl-C), so typing while the agent works keeps the "working"
+        // glyph but cancelling a pending prompt drops it. Claude Code treats Ctrl-C like Esc for dismissing a
+        // prompt, yet neither fires a hook and a cancelled prompt can still read active (its blocked
+        // notification lands seconds later), so this is the only signal that drops the stale glyph. fire
+        // UNCONDITIONALLY with the classified key: the pane-scoped decision belongs to AgentIndicator.clearedBy,
+        // so the scratch (no view.session) self-clears too and a background pane's block survives foreground
+        // typing.
+        onUserInputClearsStatus?(classifyKeystroke(event))
         let action: ghostty_input_action_e = event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
@@ -151,23 +152,24 @@ extension GhosttySurfaceView {
     }
 
     /// ⌘+click opens the link under the cursor via the `link-rules.conf` regex rules (wezterm-style
-    /// hyperlink click) and CONSUMES the event so libghostty doesn't ALSO fire its OSC-8 click handler —
-    /// cmd means "use my rules", unmodded click still means OSC-8. When the press isn't ⌘-held, behaviour
-    /// is unchanged: focus grab + forwarded to ghostty.
+    /// hyperlink click). The press is consumed ONLY when a regex actually matches — OSC-8 links and a
+    /// TUI's own `onMouseUp` (e.g. OpenCode's Link component) still need the press when agterm has nothing
+    /// to open. Unmodded click is unchanged: focus grab + forwarded to ghostty for the OSC-8 path.
     override func mouseDown(with event: NSEvent) {
+        guard !deferMouseToAsk(with: event) else { return }
         guard let surface else { return }
         window?.makeFirstResponder(self)
         updateGhosttyFocus()
         reportMousePos(from: event)
-        if event.modifierFlags.contains(.command) {
+        if event.modifierFlags.contains(.command), openLinkAtMouseCursor() != nil {
             cmdClickArmed = true
-            openLinkAtMouseCursor()
             return
         }
         _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods(event))
     }
 
     override func mouseUp(with event: NSEvent) {
+        guard !askBlocksFocus else { return }
         guard let surface else { return }
         reportMousePos(from: event)
         // skip the ghostty release when a ⌘+click press was intercepted — without its paired press
@@ -366,9 +368,14 @@ extension GhosttySurfaceView {
 
 extension GhosttySurfaceView: @preconcurrency NSTextInputClient {
     func insertText(_ string: Any, replacementRange _: NSRange) {
+        // the AX path commits our copy of a live composition and THEN tears the IME session down; an input
+        // method that finalizes on that teardown would re-send the same characters here. See
+        // `commitOrDiscardComposition` — the flag is set only for that one synchronous call.
+        guard !committingComposition else { return }
         let text = (string as? String) ?? (string as? NSAttributedString)?.string ?? ""
         guard !text.isEmpty else { return }
         _markedRange = NSRange(location: NSNotFound, length: 0)
+        _markedText = ""
         if let surface { ghostty_surface_preedit(surface, nil, 0) }
         if currentKeyEvent != nil {
             keyTextAccumulator.append(text)
@@ -382,23 +389,80 @@ extension GhosttySurfaceView: @preconcurrency NSTextInputClient {
         }
     }
 
+    /// Units matter twice here, and `text.count` (grapheme clusters) is wrong for both.
+    /// `ghostty_surface_preedit` takes a BYTE length over the UTF-8 buffer `withCString` hands it — the same
+    /// contract `insertPasted` honors with `text.utf8.count` — so a 3-character `にほん` reported as 3 had
+    /// libghostty render the first 3 BYTES, i.e. one truncated character, for every CJK/emoji/combining
+    /// composition. `NSRange`, meanwhile, is UTF-16 over the string AppKit sees, so `markedRange()` owes
+    /// `utf16.count`.
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange _: NSRange) {
         guard let surface else { return }
         let text = (string as? String) ?? (string as? NSAttributedString)?.string ?? ""
-        _markedRange = text.isEmpty ? NSRange(location: NSNotFound, length: 0) : NSRange(location: 0, length: text.count)
+        _markedRange = text.isEmpty
+            ? NSRange(location: NSNotFound, length: 0)
+            : NSRange(location: 0, length: text.utf16.count)
+        _markedText = text
         _selectedRange = selectedRange
-        text.withCString { ghostty_surface_preedit(surface, $0, UInt(text.count)) }
+        text.withCString { ghostty_surface_preedit(surface, $0, UInt(text.utf8.count)) }
     }
 
     func unmarkText() {
         guard let surface else { return }
         _markedRange = NSRange(location: NSNotFound, length: 0)
+        _markedText = ""
         ghostty_surface_preedit(surface, nil, 0)
     }
 
-    func selectedRange() -> NSRange { _selectedRange }
+    /// Dictation needs a valid caret outside a composition (#555), and the stored IME selection is stale
+    /// once one ends.
+    func selectedRange() -> NSRange {
+        hasMarkedText() ? _selectedRange : NSRange(location: 0, length: 0)
+    }
     func markedRange() -> NSRange { _markedRange }
     func hasMarkedText() -> Bool { _markedRange.location != NSNotFound }
+
+    /// End any in-flight IME composition before a PROGRAMMATIC insert — by COMMITTING it, not throwing it
+    /// away. Lives here, beside the `_markedText`/`_markedRange` state it operates on, because every
+    /// programmatic writer owes it: the AX dictation insert, a file/text drop (`insertPasted`) and
+    /// `session.type` (`inject`). Left alone, the composition survives the insert and re-commits on the
+    /// next keystroke, landing the user's half-typed word after whatever was inserted.
+    ///
+    /// The composition is text the user has already typed. `discardMarkedText()` alone abandons the
+    /// conversion session without committing, so a CJK user mid-word when an insert arrives lost those
+    /// characters outright. AppKit's own behaviour when a field gives up an active composition (a click
+    /// away, a focus change) is to commit it, so that is what this does: send our copy of the marked string
+    /// through the ordinary `insertText` path first, THEN `discardMarkedText()` so the input context drops
+    /// its now-committed session and cannot re-commit the same characters. Exactly once, either way.
+    ///
+    /// The copy is needed because libghostty owns the preedit for rendering and hands nothing back, and
+    /// `attributedSubstring(forProposedRange:)` returns nil — `_markedText` is the only source for it.
+    ///
+    /// "Exactly once" is enforced, not assumed. `discardMarkedText()` is documented to abandon the session
+    /// without committing, but an input method that FINALIZES on teardown instead would push the same
+    /// characters back through `insertText` and land them a second time (`今日今日` ahead of the inserted
+    /// text). `committingComposition` fences that one synchronous call so a re-entrant insert is dropped;
+    /// nothing else can legitimately type inside it. Whether any shipping IME behaves that way is the one
+    /// thing that cannot be settled without a live IME — this makes the answer not matter.
+    ///
+    /// Two guards make it safe on the paths that reach a NON-focused surface (`inject` types into any
+    /// realized session, focused or not). `hasMarkedText()` is per-view state, so a pane with no
+    /// composition of its own does nothing at all. And the input context is only torn down when this view
+    /// actually holds first responder: `inputContext` resolves to the SHARED context, so discarding from a
+    /// background pane would abandon the composition of whichever view is really composing. A background
+    /// pane's own stale composition is still committed — only the IME session teardown is skipped, and
+    /// that session isn't ours to end.
+    func commitOrDiscardComposition() {
+        guard hasMarkedText() else { return }
+        if _markedText.isEmpty {
+            unmarkText()
+        } else {
+            insertText(_markedText, replacementRange: NSRange(location: NSNotFound, length: 0))
+        }
+        guard window?.firstResponder === self else { return }
+        committingComposition = true
+        inputContext?.discardMarkedText()
+        committingComposition = false
+    }
 
     func attributedSubstring(forProposedRange _: NSRange, actualRange _: NSRangePointer?) -> NSAttributedString? {
         nil

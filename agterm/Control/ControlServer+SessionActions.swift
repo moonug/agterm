@@ -104,7 +104,8 @@ extension ControlServer: ControlActions {
             guard store.resizeOverlay(id, sizePercent: sizePercent) else {
                 return ControlResponse(ok: false, error: "no overlay")
             }
-            if hud, let session, !self.writeHudBody(session, pane: self.paneMetrics(for: session)) {
+            if hud, let session,
+               !self.writeHudBody(session, pane: self.paneMetrics(for: session, pane: session.hudTargetPane)) {
                 store.resizeOverlay(id, sizePercent: previousSize)
                 return ControlResponse(ok: false, error: OverlayHudError.writeFailed)
             }
@@ -265,10 +266,16 @@ extension ControlServer: ControlActions {
         }
     }
 
-    /// Drive the split on the target's OWN store, not active-only `AppActions.toggleSplit()`. `on|off|toggle`
-    /// is computed against `isSplit`, so both are idempotent. Always `AppStore.toggleSplit` — a ⌘D-style
-    /// keep-alive hide/show that never tears the hidden pane's surface down (`closeSplit` is shell-exit-only).
+    /// Compatibility entry point. An omitted axis preserves an existing split's axis and defaults a new
+    /// split to left/right.
     func splitSession(_ target: String?, window: String?, mode: String?) -> ControlResponse {
+        splitSession(target, window: window, mode: mode, axis: nil)
+    }
+
+    /// Drive the split on the target's own store. An explicit axis creates or transposes; `nil` preserves
+    /// the current axis. `on|off|toggle` is computed against `isSplit` and keeps a hidden pane alive;
+    /// `session.split.close` is the teardown verb.
+    func splitSession(_ target: String?, window: String?, mode: String?, axis: SplitAxis?) -> ControlResponse {
         return resolver.resolveSession(target, window: window) { store, id in
             guard let session = store.session(withID: id) else {
                 return ControlResponse(ok: false, error: "no such session: \(target ?? "active")")
@@ -276,12 +283,42 @@ extension ControlServer: ControlActions {
             guard let parsedMode = ControlToggleMode.parse(mode) else {
                 return ControlResponse(ok: false, error: "invalid split mode: \(mode ?? "toggle")")
             }
-            let want = parsedMode.desiredValue(current: session.isSplit)
-            if want != session.isSplit {
-                store.toggleSplit(id)
+            switch parsedMode {
+            case .on:
+                store.setSplitVisibility(id, shown: true, axis: axis)
+            case .off:
+                store.setSplitVisibility(id, shown: false)
+            case .toggle:
+                store.toggleSplit(id, axis: axis)
             }
             actions.focusSplitPane(session, wantSplit: session.splitFocused)
             return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
+        }
+    }
+
+    /// Tear the target's split pane down, which `session.split off` cannot: it hides and keeps the shell.
+    /// Kills whatever the pane runs, the point of it — `session.type $'exit\n'` reaches only a shell at a
+    /// prompt. Idempotent: no right pane answers ok, so a script need not read `tree` first.
+    func closeSessionSplit(_ target: String?, window: String?) -> ControlResponse {
+        return resolver.resolveSession(target, window: window) { store, id in
+            guard let session = store.session(withID: id) else {
+                return ControlResponse(ok: false, error: "no such session: \(target ?? "active")")
+            }
+            guard session.hasSplit else {
+                return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
+            }
+            store.closeSplit(id)
+            actions.focusSplitPane(session, wantSplit: false)
+            return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
+        }
+    }
+
+    /// Resolve the control target, then delegate every swap side effect to the AppActions operation the GUI
+    /// twin also uses.
+    func swapSessionPanes(_ target: String?, window: String?) async -> ControlResponse {
+        switch resolver.resolveSessionTarget(target, window: window) {
+        case .failure(let response): return response
+        case .success(let (store, id)): return await actions.swapSessionPanes(id, in: store)
         }
     }
 
@@ -335,8 +372,8 @@ extension ControlServer: ControlActions {
     }
 
     /// Resize a split's divider (control-native — the GUI only drags it, or double-clicks it for an even
-    /// split). `ratio` is an absolute left-pane
-    /// fraction, `delta` a signed nudge (positive grows the left pane) on the current fraction (0.5 when
+    /// split). `ratio` is an absolute primary-pane
+    /// fraction, `delta` a signed nudge (positive grows the primary pane) on the current fraction (0.5 when
     /// never moved); exactly one must be set. `applySplitRatio` clamps + persists, then
     /// `.agtermApplySplitRatio` pokes the session's `SplitProbeView` to move the live divider — a no-op
     /// while the split is hidden, where the stored value applies on next show. Errors without a split, and
@@ -374,30 +411,50 @@ extension ControlServer: ControlActions {
     /// ride the EPHEMERAL indicator, lasting only until the next `session.status` without them.
     /// `update.pane` (`StatusPane`, dispatcher-validated, nil = `left`/main) records the pane that set the
     /// status, driving the pane-scoped keystroke-clear and pane-aware reveal. Renders on every non-idle one.
-    func setSessionStatus(_ target: String?, window: String?, update: ControlSessionStatusUpdate) -> ControlResponse {
-        // validated before any mutation; an empty value counts as none, matching `AgentStatus.effectiveSound`.
-        if let sound = update.sound, !sound.isEmpty, StatusSoundPlayer.shared.action(for: sound) == nil {
-            let hint = StatusSoundPlayer.standardNames.joined(separator: ", ")
-            return ControlResponse(ok: false, error: "unknown sound: \(sound) (use 'default', 'beep', or one of: \(hint))")
-        }
-        return resolver.resolveSession(target, window: window) { store, id in
-            let session = store.session(withID: id)
-            // capture the status BEFORE mutating so the Settings default plays only on a real transition.
-            let wasBlocked = session?.agentIndicator.status == .blocked
-            // `--pane-id` resolves against the LIVE surfaces and overrides the stale role `--pane`, so a
-            // promoted-then-re-split pane lands on its CURRENT slot (#199); absent/unknown falls back to it.
-            let resolvedPane = update.paneID.flatMap { session?.paneRole(forToken: $0) } ?? update.pane
-            store.setAgentIndicator(AgentIndicator(status: update.status, blink: update.blink ?? false,
-                                                   autoReset: update.autoReset ?? false,
-                                                   color: update.color, shape: update.shape,
-                                                   statusPane: resolvedPane), forSession: id)
-            // per-call sound wins on any status; the Settings default plays only on a NEW entry into `blocked`.
-            let blockedDefault = wasBlocked ? nil : self.settingsModel.settings.blockedStatusSoundName
-            if let name = update.status.effectiveSound(perCall: update.sound, blockedDefault: blockedDefault) {
-                StatusSoundPlayer.shared.play(name)
+    /// While a session is blocked, a write from ANOTHER pane that is neither `blocked` nor `idle` is refused
+    /// whole (`AppStore.applyControlStatus`) with a `blocked status owned by pane` error and no sound — one
+    /// pane's `active`/`completed` must not erase the other's block.
+    func setSessionStatus(_ target: String?, window: String?, update: ControlSessionStatusUpdate) async -> ControlResponse {
+        // bind active/prefix targets before suspension, but preserve unknown-sound error precedence.
+        let captured = resolver.resolveSessionTarget(target, window: window)
+        var prepared: (() -> Void)?
+        // empty per-call sounds fall through to the default, matching AgentStatus.effectiveSound.
+        if let sound = update.sound, !sound.isEmpty {
+            prepared = await statusSoundPlayer.action(for: sound)
+            guard prepared != nil else {
+                let hint = StatusSoundPlayer.standardNames.joined(separator: ", ")
+                return ControlResponse(ok: false, error: "unknown sound: \(sound) (use 'default', 'beep', or one of: \(hint))")
             }
-            return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
         }
+        let store: AppStore
+        let id: UUID
+        switch captured {
+        case .failure(let response): return response
+        case .success(let resolved): (store, id) = resolved
+        }
+        guard library.windowID(for: store) != nil, let session = store.session(withID: id) else {
+            return ControlResponse(ok: false, error: "no such session: \(target ?? "active")")
+        }
+        let wasBlocked = session.agentIndicator.status == .blocked
+        // pane tokens and blocked ownership use the live state after resolution, with no further await.
+        // #199: promotion followed by another split can put a pane token in a different role.
+        let resolvedPane = update.paneID.flatMap { session.paneRole(forToken: $0) } ?? update.pane
+        let indicator = AgentIndicator(status: update.status, blink: update.blink ?? false,
+                                       autoReset: update.autoReset ?? false,
+                                       color: update.color, shape: update.shape, statusPane: resolvedPane)
+        // rejected writes must return before playback: no status change means no sound.
+        if case .refused(let owner) = store.applyControlStatus(indicator, forSession: id) {
+            return ControlResponse(ok: false, error: "blocked status owned by pane \(owner.rawValue) " +
+                "(write from that pane to change it)")
+        }
+        if let name = update.sound, let prepared {
+            statusSoundPlayer.play(name, using: prepared)
+        } else if let name = update.status.effectiveSound(perCall: nil,
+                                                         blockedDefault: wasBlocked ? nil : settingsModel.settings.blockedStatusSoundName) {
+            // a configured default is best-effort and must not delay or reject the status update.
+            Task { await statusSoundPlayer.play(name) }
+        }
+        return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
     }
 
     /// Pin (or unpin) the target pane's restore-command override — the per-pane shell line that wins over
@@ -412,8 +469,8 @@ extension ControlServer: ControlActions {
     /// baked role `update.pane`, defaulting to main) with ONE divergence: an unresolvable `--pane-id`
     /// WITHOUT an explicit `--pane` is an ERROR here, since a bad fallback would overwrite the MAIN pane's
     /// persisted command when a hook meant the split (a status only puts a glyph on the wrong row).
-    /// `.scratch` and a `.right` without a split are rejected too. A `set` while restore-running-command is
-    /// off still succeeds with a note in `result.text`; `none`/`clear` get none — their outcome lands anyway.
+    /// `.scratch` and a `.right` without a split are rejected too. `set` and `none` outside rerun mode still
+    /// save policy and return a note naming the active mode; either clear form remains mode-independent.
     func setSessionRestore(_ target: String?, window: String?,
                            update: ControlSessionRestoreUpdate) -> ControlResponse {
         return resolver.resolveSession(target, window: window) { store, id in
@@ -447,9 +504,9 @@ extension ControlServer: ControlActions {
                 return ControlResponse(ok: false,
                                        error: "failed to save the restore override, the previous value is still in effect")
             }
-            var result = ControlResult(id: id.uuidString)
-            if case .pin = update.pin, self.settingsModel.settings.restoreRunningCommand != true {
-                result.text = "saved, but \"Restore running commands on restart\" is off, so the override will not run"
+            var result = ControlResult(id: id.uuidString, pane: pane.rawValue)
+            if update.pin != .unpin, self.launchRestoreMode != .rerun {
+                result.text = "saved for rerun mode; active restore mode is \(self.launchRestoreMode.rawValue)"
             }
             return ControlResponse(ok: true, result: result)
         }
@@ -478,6 +535,18 @@ extension ControlServer: ControlActions {
             default: return ControlResponse(ok: false, error: "invalid flag mode: \(mode)")
             }
             store.setFlag(want, forSession: id) // no-op + no save when unchanged (idempotent)
+            return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
+        }
+    }
+
+    /// Set or clear a session's title-bar context. The value is already trimmed and validated by the
+    /// dispatcher, so nil here means clear rather than "nothing supplied".
+    func setSessionContext(_ target: String?, window: String?, context: String?) -> ControlResponse {
+        resolver.resolveSession(target, window: window) { store, id in
+            guard store.session(withID: id) != nil else {
+                return ControlResponse(ok: false, error: "no such session: \(target ?? "active")")
+            }
+            store.setContext(context, forSession: id) // no-op, no save and no event when unchanged
             return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
         }
     }
@@ -639,6 +708,14 @@ extension ControlServer: ControlActions {
         if rawTarget == "active" {
             return setActiveSurfaceZoom(window: window, mode: mode)
         }
+        // `quick` names the detached panel, which no window's zoom controller can hold — it fills its own
+        // screen instead of a window. It takes no `--window` for the same reason.
+        if rawTarget == "quick" {
+            guard QuickTerminalController.shared.setZoom(mode) else {
+                return ControlResponse(ok: false, error: "surface not available: quick")
+            }
+            return ControlResponse(ok: true, result: ControlResult(id: "quick"))
+        }
         switch resolveSurfaceZoom(rawTarget, window: window) {
         case .failure(let response):
             return response
@@ -648,15 +725,14 @@ extension ControlServer: ControlActions {
             }
             let want = mode.desiredValue(current: controller.target == resolved.target)
             if want, controller.target != resolved.target,
-               PickRegistry.shared.controller(for: resolved.windowID)?.pending != nil {
-                return ControlResponse(ok: false, error: "pick pending")
+               let error = PickRegistry.shared.controller(for: resolved.windowID)?.pendingModalError {
+                return ControlResponse(ok: false, error: error)
             }
             // `hide` is idempotent: skip the availability check for `.off`, since the surface may have
             // vanished (an exited overlay auto-clears the zoom) while the end state holds; `set(.off, …)`
             // on a non-matching target is a no-op.
             if mode != .off {
-                guard TerminalZoomController.isTargetValid(resolved.target, in: resolved.store,
-                                                           quickTerminalVisible: quickVisible(in: resolved.windowID)) else {
+                guard TerminalZoomController.isTargetValid(resolved.target, in: resolved.store) else {
                     return ControlResponse(ok: false, error: "surface not available: \(resolved.controlID)")
                 }
             }
@@ -674,8 +750,8 @@ extension ControlServer: ControlActions {
                 return ControlResponse(ok: false, error: "window not open — window.select it first")
             }
             if controller.target == nil, mode != .off,
-               PickRegistry.shared.controller(for: windowID)?.pending != nil {
-                return ControlResponse(ok: false, error: "pick pending")
+               let error = PickRegistry.shared.controller(for: windowID)?.pendingModalError {
+                return ControlResponse(ok: false, error: error)
             }
             // this arm only picks the effective target (the current zoom when one is up, so on/off/toggle
             // act on it, else the resolved active surface) and shapes the response; mode-vs-state semantics
@@ -687,12 +763,10 @@ extension ControlServer: ControlActions {
                 guard mode != .off else {
                     return ControlResponse(ok: true)
                 }
-                let quickVisible = quickVisible(in: windowID)
-                guard let zoomTarget = TerminalZoomController.resolveTarget(store: store,
-                                                                            quickTerminalVisible: quickVisible) else {
+                guard let zoomTarget = TerminalZoomController.resolveTarget(store: store) else {
                     return ControlResponse(ok: false, error: "no active surface")
                 }
-                guard TerminalZoomController.isTargetValid(zoomTarget, in: store, quickTerminalVisible: quickVisible) else {
+                guard TerminalZoomController.isTargetValid(zoomTarget, in: store) else {
                     return ControlResponse(ok: false, error: "surface not available: \(zoomTarget.controlID)")
                 }
                 effectiveTarget = zoomTarget
@@ -711,17 +785,7 @@ extension ControlServer: ControlActions {
 
     private func resolveSurfaceZoom(_ target: String, window: String?)
         -> ControlTargetResolver.Resolution<SurfaceZoomResolution> {
-        // `quick` is the control id this command emits for a quick-terminal zoom, so it must be accepted
-        // back as a target; visibility is checked by the caller's shared `isTargetValid` gate.
-        if target == "quick" {
-            switch resolveOpenWindow(window) {
-            case .failure(let response):
-                return .failure(response)
-            case .success(let (windowID, store)):
-                return .success(SurfaceZoomResolution(windowID: windowID, store: store,
-                                                      target: .quick, controlID: "quick"))
-            }
-        }
+        // `quick` never arrives here — `setSurfaceZoom` routes it to the panel before resolving a window.
         guard let surfaceID = TerminalSurfaceID(rawValue: target) else {
             return .failure(ControlResponse(ok: false, error: "invalid surface: \(target)"))
         }
@@ -735,7 +799,7 @@ extension ControlServer: ControlActions {
         }
     }
 
-    private func resolveOpenWindow(_ window: String?) -> ControlTargetResolver.Resolution<(WindowInfo.ID, AppStore)> {
+    func resolveOpenWindow(_ window: String?) -> ControlTargetResolver.Resolution<(WindowInfo.ID, AppStore)> {
         guard let window = trimmed(window) else {
             guard let windowID = library.activeWindowID, let store = library.store(for: windowID) else {
                 return .failure(ControlResponse(ok: false, error: "no open window"))
@@ -753,7 +817,7 @@ extension ControlServer: ControlActions {
         }
     }
 
-    private func resolveSurfaceOwner(_ surfaceID: TerminalSurfaceID, window: String?)
+    func resolveSurfaceOwner(_ surfaceID: TerminalSurfaceID, window: String?)
         -> ControlTargetResolver.Resolution<(WindowInfo.ID, AppStore)> {
         if trimmed(window) != nil {
             switch resolveOpenWindow(window) {
@@ -773,7 +837,4 @@ extension ControlServer: ControlActions {
         return .success((windowID, store))
     }
 
-    private func quickVisible(in windowID: WindowInfo.ID) -> Bool {
-        QuickTerminalRegistry.shared.controller(for: windowID)?.isVisible ?? false
-    }
 }

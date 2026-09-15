@@ -20,6 +20,13 @@ final class GhosttyApp {
     /// libghostty attributes none to a file. `reloadConfig` surfaces it for the Reload Config /
     /// `config.reload` warning; the Console log names the offending line.
     private(set) var lastConfigDiagnosticsCount = 0
+    /// What the launch's Live sessions reset did, recorded before any window mounts and posted from the
+    /// window task once notifications are registered; nil when no marker was consumed.
+    private(set) var liveResetOutcome: LiveReset.Outcome?
+
+    func recordLiveResetOutcome(_ outcome: LiveReset.Outcome) {
+        liveResetOutcome = outcome
+    }
     /// Terminal background from the resolved config; tints the window so the title bar blends with the
     /// terminal instead of the default titlebar material. Nil when unread.
     private(set) var terminalBackgroundColor: NSColor?
@@ -55,14 +62,22 @@ final class GhosttyApp {
     /// Whether the sidebar draws the red unseen-notification count badge. The sidebar Coordinator reads it
     /// (gating the count to 0 when off); settings-mirrored like `toolbarMode`.
     private(set) var notificationBadgeEnabled: Bool = true
+    /// Which keystroke clears a blocked or completed glyph; read at keystroke time by the surface factories'
+    /// status-clear closure. Settings-mirrored like `toolbarMode`.
+    private(set) var statusReset: StatusReset = .firstKey
     /// Whether a click anywhere on a sidebar workspace row toggles its expansion; on by default. The sidebar
     /// Coordinator reads it in `handleSingleClick`, and the disclosure triangle ignores it because AppKit
     /// toggles that natively. Settings-mirrored like `toolbarMode`.
     private(set) var workspaceRowClickExpands: Bool = true
-    /// Whether a restored pane re-runs its last clean-quit foreground command; the surface factories read it to
-    /// decide whether to feed that command as `initial_input`. Affects only the next restore — no live
-    /// re-render notification.
-    private(set) var restoreRunningCommand: Bool = false
+    /// The persisted choice and effective mode frozen before the first surface. An ineligible live request
+    /// falls back to fresh shells without releasing its daemon claims. Settings changes never mutate either
+    /// latch, so later sessions, reap, and reopened windows use the same launch policy.
+    let restoreLaunchDecision: RestoreLaunchDecision
+    var requestedRestoreMode: RestoreMode { restoreLaunchDecision.requested }
+    var launchRestoreMode: RestoreMode { restoreLaunchDecision.active }
+    var liveRestoreUnavailableReason: String? { restoreLaunchDecision.liveUnavailableReason }
+    var restoreRunningCommand: Bool { launchRestoreMode == .rerun }
+    static func capturesForegroundOnExit(mode: RestoreMode) -> Bool { mode == .rerun || mode == .live }
     /// Whether the window title bar shows the attention bell icon; off by default. The title bar reads it via
     /// `WindowContentView`'s mirrored chrome state; settings-mirrored like `toolbarMode`.
     private(set) var attentionButtonEnabled: Bool = false
@@ -88,6 +103,9 @@ final class GhosttyApp {
     /// The sizes the palette/picker and session switcher derive from the separate `interfaceFontSize`,
     /// resolved once per settings change rather than per row.
     private(set) var interfaceMetrics = InterfaceMetrics(fontSize: AppSettings.defaultInterfaceFontSize)
+    /// The share of the focused screen the quick-terminal panel takes, as a percentage; nil = the built-in
+    /// size. `QuickTerminalController` reads it when it frames the panel; settings-mirrored like `toolbarMode`.
+    private(set) var quickTerminalSizePercent: Int?
     /// The base terminal font size in points (the Settings default; nil → the ghostty built-in). The renderer
     /// never reads it — it is the size a session with a nil `session.fontSize` reverts to, which the dashboard
     /// font-override clear needs to recognize its own async CELL_SIZE report (`pendingFontRestore`).
@@ -109,7 +127,12 @@ final class GhosttyApp {
     private var resourcesDir: String?
 
     private init() {
-        resolveResources()
+        let resolvedResources = Self.resolveResources()
+        let initialSettings = Self.settingsStore().load()
+        let restoreDecision = initialSettings.effectiveRestoreMode.launchDecision(
+            liveUnavailableReason: ZmxLaunch.liveUnavailableReason())
+        restoreLaunchDecision = restoreDecision
+        resourcesDir = resolvedResources
         // macOS login scans up to the inherited soft fd limit before exec. When needed, keep the limit Ghostty
         // records for child restoration reasonable, then return the parent process to its original limit.
         let originalFileDescriptorLimit = GhosttyResourceLimits.lowerSoftFileDescriptorLimit()
@@ -119,7 +142,7 @@ final class GhosttyApp {
             logger.error("ghostty_init failed")
             return
         }
-        let configInputs = Self.resolveConfigInputs()
+        let configInputs = Self.resolveConfigInputs(settings: initialSettings)
         guard let cfg = loadConfig(configInputs) else {
             logger.error("ghostty_config_new failed")
             return
@@ -130,9 +153,13 @@ final class GhosttyApp {
         rt.supports_selection_clipboard = true
         rt.wakeup_cb = { _ in GhosttyApp.shared.callbacks.wakeup() }
         rt.action_cb = { _, target, action in GhosttyApp.shared.callbacks.action(target: target, action: action) }
-        rt.read_clipboard_cb = { ud, loc, state in GhosttyApp.shared.callbacks.readClipboard(ud: ud, location: loc, state: state) }
-        rt.confirm_read_clipboard_cb = { ud, content, state, request in
-            GhosttyApp.shared.callbacks.confirmReadClipboard(ud: ud, content: content, state: state, request: request)
+        rt.read_clipboard_cb = { ud, loc, state, mimes, mimesLen, list in
+            GhosttyApp.shared.callbacks.readClipboard(.init(
+                userdata: ud, location: loc, state: state,
+                mimes: mimes, mimesLen: UInt(mimesLen), list: list))
+        }
+        rt.confirm_read_clipboard_cb = { ud, confirm, state, request in
+            GhosttyApp.shared.callbacks.confirmReadClipboard(ud: ud, confirm: confirm, state: state, request: request)
         }
         rt.write_clipboard_cb = { ud, _, content, len, confirm in
             GhosttyApp.shared.callbacks.writeClipboard(ud: ud, content: content, len: UInt(len), confirm: confirm)
@@ -148,13 +175,34 @@ final class GhosttyApp {
         config = cfg
         // boot: no surface yet, so the NSApp read is the only side source and nothing rendered can disagree.
         resolveThemeColors(from: cfg, inputs: configInputs, isDark: Self.currentIsDark())
-        // demand-driven, no poll timer (like Ghostty.app/conterm): ticks come from libghostty wakeups
-        // (coalesced in GhosttyCallbacks.wakeup), surfaces draw on GHOSTTY_ACTION_RENDER — idle costs nothing.
+        // no poll timer (like Ghostty.app/conterm): ticks come from libghostty wakeups, coalesced in
+        // GhosttyCallbacks.wakeup, and the renderer thread paints on its own — idle costs nothing.
     }
 
     func tick() {
         guard let app else { return }
         ghostty_app_tick(app)
+    }
+
+    /// Re-side the APP config to the launch appearance, BEFORE the first surface is created.
+    ///
+    /// `Surface.init` rebuilds a surface's config whenever the app's conditional state differs from the
+    /// config's, and that rebuild replays the config FILES only: it carries `working-directory` over and
+    /// drops the per-surface `env_vars`, `initial_input` and `command` the host set on the struct. A
+    /// host-built config always resolves LIGHT, so on a dark launch with a dual `theme = light:,dark:`
+    /// every surface created before the first re-feed spawns with no `AGTERM_*`, no restore replay and no
+    /// `session.new --command` (#260). Only the `update_config` round trip re-sides the stored app config
+    /// — after it the states match and surfaces keep what they were built with. The KVO appearance reload
+    /// does the same thing but is debounced, so it lands well after the launch restore.
+    ///
+    /// Must run where `NSApp` exists (`GhosttyApp` is built before that, so its own read is always light)
+    /// and before any scene mounts, which is why `applicationDidFinishLaunching` calls it.
+    func syncLaunchColorScheme() {
+        guard let app, Self.currentIsDark(), let config else { return }
+        ghostty_app_set_color_scheme(app, GHOSTTY_COLOR_SCHEME_DARK)
+        ghostty_app_update_config(app, config)
+        // the reply carries the config libghostty APPLIED; take and free it so the box holds no stale clone.
+        if let derived = callbacks.takeDerivedAppConfig() { ghostty_config_free(derived) }
     }
 
     /// Set the window translucency the chrome applies. `SettingsModel` calls this and every setter below at
@@ -176,12 +224,12 @@ final class GhosttyApp {
         workspaceRowClickExpands = enabled
     }
 
-    func setRestoreRunningCommand(_ enabled: Bool) {
-        restoreRunningCommand = enabled
-    }
-
     func setAttentionButtonEnabled(_ enabled: Bool) {
         attentionButtonEnabled = enabled
+    }
+
+    func setStatusReset(_ mode: StatusReset) {
+        statusReset = mode
     }
 
     func setHiddenInterfaceElements(_ elements: Set<InterfaceElement>) {
@@ -218,6 +266,11 @@ final class GhosttyApp {
     /// `InterfaceMetrics` clamps its own input, so a hand-edited out-of-range value lands in range here too.
     func setInterfaceFontSize(_ size: Double) {
         interfaceMetrics = InterfaceMetrics(fontSize: size)
+    }
+
+    /// `QuickTerminalMetrics.panelSize` clamps what it is given, so the raw setting is stored as-is.
+    func setQuickTerminalSizePercent(_ percent: Int?) {
+        quickTerminalSizePercent = percent
     }
 
     /// Set the agent-status glyph colors from the user's hex settings; nil or malformed → the system default.
@@ -289,7 +342,10 @@ final class GhosttyApp {
     }
 
     static func resolveConfigInputs() -> ConfigInputs {
-        let settings = settingsStore().load()
+        resolveConfigInputs(settings: settingsStore().load())
+    }
+
+    private static func resolveConfigInputs(settings: AppSettings) -> ConfigInputs {
         let configDir = ConfigPaths.configDirectory(
             setting: settings.configDirectory,
             stateDir: ProcessInfo.processInfo.environment["AGTERM_STATE_DIR"],
@@ -493,6 +549,30 @@ final class GhosttyApp {
         return cfg
     }
 
+    /// Their ssh wrappers require a `ghostty` CLI absent from agterm's bundle.
+    private static let unsupportedShellFeatures: Set<String> = ["ssh-env", "ssh-terminfo"]
+
+    /// Applies the override after recursive includes so no user config can re-enable these features.
+    private func forceUnsupportedShellFeaturesOff(_ cfg: ghostty_config_t) {
+        let key = "shell-integration-features"
+        var bits: UInt32 = 0
+        guard key.withCString({ ghostty_config_get(cfg, &bits, $0, UInt(key.utf8.count)) }) else {
+            logger.warning("could not read \(key, privacy: .public); leaving ssh shell features as configured")
+            return
+        }
+        let value = ShellIntegrationFeatures.overrideValue(resolvedBits: bits,
+                                                          disabled: Self.unsupportedShellFeatures)
+        let tmp = (NSTemporaryDirectory() as NSString).appendingPathComponent("agterm-sif-\(UUID().uuidString).conf")
+        do {
+            try "shell-integration-features = \(value)\n".write(toFile: tmp, atomically: true, encoding: .utf8)
+        } catch {
+            logger.warning("shell-integration-features override write failed: \(error.localizedDescription, privacy: .public)")
+            return
+        }
+        tmp.withCString { ghostty_config_load_file(cfg, $0) }
+        try? FileManager.default.removeItem(atPath: tmp)
+    }
+
     private func loadConfig(_ inputs: ConfigInputs, extraOverlayPath: String? = nil) -> ghostty_config_t? {
         guard let cfg = ghostty_config_new() else { return nil }
 
@@ -522,7 +602,7 @@ final class GhosttyApp {
             scopedPath.withCString { ghostty_config_load_file(cfg, $0) }
         }
 
-        // agterm's own appearance settings (font/size/theme), loaded last so the UI-managed keys win.
+        // agterm's own settings conf, loaded last so every key `ghosttyConfigLines()` emits wins.
         let settingsConf = Self.settingsConfigURL.path
         if FileManager.default.fileExists(atPath: settingsConf) {
             settingsConf.withCString { ghostty_config_load_file(cfg, $0) }
@@ -535,6 +615,7 @@ final class GhosttyApp {
         }
 
         ghostty_config_load_recursive_files(cfg)
+        forceUnsupportedShellFeaturesOff(cfg)
         ghostty_config_finalize(cfg)
 
         let diagCount = ghostty_config_diagnostics_count(cfg)
@@ -575,7 +656,7 @@ final class GhosttyApp {
         return paths
     }()
 
-    private func resolveResources() {
+    private static func resolveResources() -> String? {
         // resolve from our own candidates (bundle first), ignoring any inherited GHOSTTY_RESOURCES_DIR: a stale
         // one shadows our complete bundle and leaves libghostty deriving a broken TERMINFO. TERMINFO itself is
         // never set here — libghostty overwrites it at shell spawn with dirname(GHOSTTY_RESOURCES_DIR)/terminfo,
@@ -586,10 +667,10 @@ final class GhosttyApp {
         )
         guard let dir = resolver.resolve() else {
             unsetenv("GHOSTTY_RESOURCES_DIR")
-            return
+            return nil
         }
-        resourcesDir = dir
         setenv("GHOSTTY_RESOURCES_DIR", dir, 1)
+        return dir
     }
 }
 
@@ -612,6 +693,13 @@ extension Notification.Name {
     /// accessibility environment values.
     static let agtermAccessibilityDisplayOptionsChanged =
         Notification.Name("agterm.accessibilityDisplayOptionsChanged")
+
+    /// Posted by `SystemWakeObserver` when the displays wake. `ghostty_surface_new` returns NULL while the
+    /// display is asleep, so a session created in that window realizes no surface — the `--command` never runs
+    /// and every later call reports `session not realized` (#416). Nothing re-attempts on a schedule, because
+    /// the deck's retries all ride SwiftUI layout, which does not run for an off-display window. UNREALIZED
+    /// surfaces re-attempt creation here; a realized one is left alone.
+    static let agtermScreensDidWake = Notification.Name("agterm.screensDidWake")
 
     /// Posted when a window becomes frontmost (async, via the window's didBecomeKey), so the control server can
     /// refresh its cached `window.list` — its `active` flag would otherwise stay stale until the next command.

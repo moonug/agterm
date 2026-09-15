@@ -10,9 +10,47 @@ paths:
   - "agterm/Views/SplitRatioAccessor.swift"
   - "agterm/Views/TerminalView.swift"
   - "agterm/Views/TerminalSearchBar.swift"
+  - "scripts/setup.sh"
 ---
 
 ## libghostty gotchas
+
+## Rendering
+
+- Nothing in agterm paints a surface. `src/apprt/embedded.zig` declares no `must_draw_from_app_thread`, so
+  `renderer/Thread.drawFrame` draws on the render thread instead of posting `redraw_surface`, the only
+  producer of `GHOSTTY_ACTION_RENDER`. The action is therefore unreachable on the embedded apprt and the
+  `action` switch drops it to `default`. If `GHOSTTY_REV` ever advances onto a libghostty that declares
+  that constant, panes stop painting until a RENDER arm calling `ghostty_surface_draw` comes back.
+- The render thread is not the only painter: libghostty installs its own `CALayer` subclass as the surface
+  view's layer, and its `display` calls a callback holding a raw `*Renderer`, so CoreAnimation draws on the
+  main thread too. Before upstream `4b4a5b241109` nothing cleared that callback — `Metal.deinit` dropped
+  only ghostty's retain while the view kept the layer alive — so after `ghostty_surface_free` the layer
+  pointed into a freed renderer and the next display aborted on
+  `BUG IN CLIENT OF LIBPLATFORM: os_unfair_lock is corrupt` (#443). Reproduced deterministically only under
+  `MallocScribble=1`; on unrecycled memory the same sequence survives, which is why one report over 46
+  hours was the expected shape rather than a weak signal.
+- `destroySurface` swaps in a plain layer anyway, carrying the last frame's contents, and must do it AFTER
+  the free, which is what joins the render thread. The current pin carries the upstream fix, so this is
+  defence against building on a libghostty that does not — keep it even though it looks redundant.
+- `ghostty_surface_set_occlusion(false)` stops hidden rendering and releases the Metal swap chain on the
+  current pin. Drive it from `deckOnScreen`, not `deckVisible`: dashboard cells and passive HUDs paint while
+  non-interactive, and `deckVisible`'s quick-terminal `holdsKey` term is focus ownership, not visibility —
+  the inset panel leaves panes on screen. A detached quick/scratch/split host is hidden regardless of its
+  last deck value, and the ordered-out quick panel clears `deckOnScreen` itself since `orderOut` keeps
+  `window` set.
+- Occlusion is TERMINAL visibility, not a renderer lever: every edge flips `terminal.flags.visible` and,
+  under mode 2033, emits a visibility report, so never toggle it to force a GPU re-release for a pane
+  that stayed hidden. The release is edge-triggered while the CA display callback draws unguarded, so a
+  present after the hide edge rebuilds the swap chain and only an upstream fix can re-release it; the
+  hidden janitor sweeps only the layer's retained frame. Reveal draws synchronously
+  (`ghostty_surface_draw`) because that sweep cleared `contents` and `refresh` merely queues a render.
+- A hidden pane also clears `needsDisplayOnBoundsChange` on libghostty's layer and restores it on
+  reveal. Without that, a window resize makes CoreAnimation display every mounted hidden pane and
+  rebuild the chain the release just freed. At `683d8db`, `Metal.init` installs one `IOSurfaceLayer`
+  for the surface renderer and sets the flag once; no later Ghostty path replaces the layer or
+  rewrites the flag. A `GHOSTTY_REV` bump has to recheck both, and that the synchronous reveal draw
+  still restores the intended visible-resize path.
 
 ## Theme and sidebar
 
@@ -20,9 +58,15 @@ paths:
   `selection-*` keys, even when set, so `resolveSelectionColors` parses the same last-wins config sources
   and named bundled theme file. Selected rows use selection background/foreground, with black/white
   luminance fallback. Tint borderless New Session through `.tint`; its label ignores foreground style.
-- Pass `theme = light:X,dark:Y` raw. Pinned libghostty `4dcb09ada` supports conditional themes, but
+- Pass `theme = light:X,dark:Y` raw. The pinned libghostty supports conditional themes, but
   `set_color_scheme` only changes conditional state and emits an unhandled soft reload. agterm must set
   app and surface schemes, then call `update_config`.
+- A dark launch must re-side the app config through `update_config` BEFORE the first surface exists;
+  `GhosttyApp.syncLaunchColorScheme`, called from `applicationDidFinishLaunching`, owns that.
+  `Surface.init` rebuilds a surface config whose conditional state differs from the app's, keeps only
+  `working-directory`, and drops the per-surface env, `initial_input` and `command` (#260).
+  A host-built config always resolves light, and `GhosttyApp` is built before `NSApp` exists, so its own
+  appearance read is always light; the KVO reload is debounced and lands after the launch restore.
 - Observe app-level `NSApplication.effectiveAppearance` through KVO, not per-view appearance,
   `AppleInterfaceStyle`, or the early distributed notification. Post the KVO-delivered settled `isDark`
   and thread it through `reloadConfigPreservingSessionZoom`; do not use `apply`, whose unchanged text skips
@@ -63,6 +107,35 @@ paths:
   nil every store-capturing callback to break the store/session/surface/closure cycle.
 - Create surfaces only with nonzero backing size; otherwise Metal stays blank. Defer through
   `pendingSurfaceCreation` until `setFrameSize`.
+- After the size guard `createSurface()` asks the launch `SpawnPacer` for a permit, then resolves the
+  launch seed, in that order. A launch that replays commands arms the pacer before any window mounts with
+  every open window's restored primary and shown split. Among those keys, a pane whose seed would start a
+  program is denied unless it is in the burst (each window's selected panes) or was expedited before it
+  asked; a key outside the armed order, a hidden split shown later for one, is granted synchronously; a
+  denied pane is resumed by its grant, which
+  re-enters `createSurface()` against the bounds the view has THEN, so the wait cannot race layout: a
+  zero-size pane never asks, and its later `setFrameSize` retry is the request. The seed resolves on the
+  first PERMITTED creation attempt, right before `ghostty_surface_config_new`, and stays cached on the view
+  when `ghostty_surface_new` fails, so until then the captured argv and restore pin stay on the session.
+  Only a burst or pre-expedited key is granted inside `request` itself; `SpawnRegistry.grant` resumes only
+  a pane already denied, because re-entering under the requester spawned the surface twice.
+- The pacer never jumps an expected key, and only a built view cancels one, so a pane leaving the visible
+  model before its window mounts would hold the queue at the head forever and silence `onDrain`. Every
+  hard or soft session close, workspace removal, shown-split hide or close, and loaded-window close or
+  delete therefore calls the store's `launchPaneDrop`, wired to `SpawnPacer.discard`, so the key is
+  dropped even when no view exists. A new removal path owes the same call; a drop after a view's teardown
+  is harmless.
+- `ghostty_surface_new` returns NULL for as long as the DISPLAY is asleep, with a valid backing size —
+  measured 21 consecutive failures over 40s, then success within ~2s of wake while the screen was still
+  LOCKED. Unlock is irrelevant; display wake is the earliest moment creation can succeed, so retrying
+  during sleep is pure spin. Nothing in the deck re-attempts on its own: every other retry path rides
+  SwiftUI layout, which does not run for an off-display window, so `updateNSView` never fires. That is why
+  a session a scheduled job creates overnight realized no surface and never ran its `--command`, while
+  `session.new` had already answered `ok` (#416). `SystemWakeObserver` posts `.agtermScreensDidWake` and
+  `GhosttySurfaceView.retryCreationAfterWake` re-attempts, bounded, because creation can still fail for a
+  second or two after the notification. A failed create also re-arms `pendingSurfaceCreation`, so the
+  layout path retries as well: the wake hook makes recovery TIMELY, not possible, and a view first
+  mounted inside that residual window registered its observer too late for the wake that just fired.
 - `working_directory`, `initial_input`, and environment strdup buffers must outlive
   `ghostty_surface_new`; retain them until destruction.
 - Reparenting invalidates the drawable while leaving terminal buffer intact. `set_size` with an unchanged
@@ -79,9 +152,27 @@ paths:
   submit a trailing newline when the program disables mode 2004. Do not reuse `inject`, which intentionally
   translates newline/return into Return for `session.type`. `pasteboardText` remains shared with clipboard
   paste, and `ShellEscape.path` keeps file paths one token; #96 newline escaping remains defense in depth.
+- AX exposure (`axExposed` in `GhosttySurfaceView+Accessibility.swift`) rides on FOUR terms: `!viewOnly`,
+  `deckVisible`, `surface != nil`, and `window?.isVisible`. Every one drives
+  `postAccessibilityExposureChange` behind the `axPostedExposed` latch, so a new term owes a post site;
+  none may be assumed to imply another. Detach posts from `viewDidMoveToWindow` ABOVE its nil-window
+  guard, the only site that sees the quick terminal unmount. `liveFocus` has a second consumer here
+  (`isAccessibilityFocused` and the AX write guard) besides the cursor, so it is not `private`.
+  Focus posts are deferred one run-loop turn because `window.firstResponder` reads stale inside the
+  responder transitions; the per-view `axPostedFocus` latch, not `axFocusPostScheduled`, is what stops a
+  resign/become pair from announcing twice. This bridge adds no user action and no per-session state, so
+  it is a genuine exemption from the control-API keep-in-sync rule: `session.type` already drives text in.
+- Both programmatic writers commit a live IME composition first through `commitOrDiscardComposition`, in
+  `GhosttySurfaceView+Input.swift` beside the `_markedText`/`_markedRange` state it operates on:
+  `insertPasted` (drop and the AX control-character branch) and `inject` (`session.type`). Text inserted
+  under a composition leaves it to re-commit on the next keystroke, landing the half-typed word after the
+  inserted text. It no-ops unless this pane is composing, and it tears the IME session down only while the
+  view holds first responder, because `inputContext` resolves to the shared context and discarding from a
+  background pane would abandon whichever view is really composing.
 - Never change the `sessionDetail` ZStack shape for per-session toggles; doing so rehosts `NSSplitView`
   into the titlebar. Search bar is a `detailPane` top-trailing overlay, above deck, scratch, and overlays.
-  Overlay panel stays an always-present `sessionDetail` sibling whose internal content changes.
+  Overlay panel stays in an always-present `sessionDetail` overlay preference layer whose internal
+  content changes.
 - The boundary is the arranged subview, not what it contains. Inside one, a constant-shape ZStack may swap
   children and change modifier values freely: a real NSView mounting and unmounting there held the divider
   across repeated toggles, both focus states, and a 0.85 ratio. That is what makes per-pane chrome — the
@@ -90,18 +181,21 @@ paths:
   `paneDim` — in `WindowContentView+Detail.swift` so `WindowContentView.swift` remains below the
   1000-line limit. `sessionDetail` owns the constant-shape statement; every other site cross-references it.
   One `deckPane` renders each pane, so the split's two arranged subviews are the same view type.
-- Window-level quick terminal, palettes, switcher, and dashboard live in `windowOverlayLayer`, inset by
-  `titlebarHeight` below `customTitlebar`. A body overlay's 0.2-opacity black scrim darkens the transparent
-  tall titlebar.
+- Palettes, switcher, and dashboard live in `windowOverlayLayer`, inset by
+  `titlebarHeight` below `customTitlebar`. The quick terminal is NOT among them: it is a detached
+  `QuickTerminalPanel` above every window, so it needs no inset and paints its own frame ([[windows]]).
+  A body overlay's 0.2-opacity black scrim darkens the transparent tall titlebar.
   The seam appears in 48px normal mode; 30px compact remains inside the native band.
   Keep the empty overlay layer free of Color/contentShape so it cannot intercept hits. Do not add an opaque
   titlebar background; it breaks translucent chrome.
 - With translucency, every surface has zero background opacity. A full overlay has no opaque SwiftUI
-  backing, so hide panes and scratch beneath it and remove their drop eligibility. Floating overlay and
-  quick terminal have opaque terminal-color panels.
-- Because those two leave a live terminal around the panel, their tap-catcher also paints the
+  backing, so hide panes and scratch beneath it and remove their drop eligibility. A floating overlay has
+  an opaque terminal-color panel; the quick terminal takes the same backing from its own panel's content,
+  through `WindowContentView.resolvedTerminalColor`.
+- Because a floating overlay leaves a live terminal around its panel, its tap-catcher also paints the
   `inactivePaneMuteStrength` wash. Fill the existing catcher; never add a sibling scrim. Suppress `paneDim`
-  while a backdrop wash is up or the covered inactive pane takes both.
+  while a backdrop wash is up or the covered inactive pane takes both. The quick terminal no longer takes
+  part: its panel is a separate window, so there is no in-window margin left to catch a tap or wash.
 - Anything that HIDES a pane in place takes the wash with it, so the cover must carry `paneDim` itself:
   `paneOverlayPanel` washes an overlay opened on the unfocused pane, or split focus stops reading.
   Wash a cover against ITS OWN background, not `washColor(for:)`. An overlay surface is sessionless and
@@ -119,7 +213,7 @@ paths:
 - Handle background `GHOSTTY_ACTION_COLOR_CHANGE` per pane. Under zero surface opacity, apply a surface
   config overlay containing only `background-opacity = windowOpacity`; never include `background`.
   Preserve and reassert the latch through reload, opacity, and dashboard font changes.
-- A live OSC 11 override masks config defaults in pinned libghostty `4dcb09ada`. No embedding API clears
+- A live OSC 11 override masks config defaults in the pinned libghostty. No embedding API clears
   it: RIS leaves colors, PTY writes bypass the parser, and COLOR_CHANGE is outbound-only.
   `session.background color` changes only the default and cannot override live OSC.
 - OSC 111 copies current default into override. Per-surface update also reseeds default from a
@@ -169,6 +263,12 @@ paths:
   `shell-integration-features = no-cursor,no-title`. `no-cursor` prevents prompt DECSCUSR bar resets;
   `no-title` prevents abbreviated local cwd OSC 2 from overriding sidebar names. User/remote OSC titles
   still work, and OSC 7 is unaffected.
+- `ssh-env` and `ssh-terminfo` are forced OFF after `ghostty_config_load_recursive_files`, so no user
+  source including a `config-file` include can enable them: their wrappers call a `ghostty` CLI agterm
+  does not bundle, and enabling either broke `ssh` outright (#463). The override reads the resolved
+  packed bits back and restates all six flags, because ghostty re-parses the key from its defaults on
+  every occurrence. Setting either is a silent no-op with no diagnostic: a report that it has no effect
+  is by design, while a report that it still installs an `ssh` wrapper or breaks `ssh` is a regression.
 - A one-shot local OSC 2 is cleared by the next prompt. Hold the shell with
   `printf '\033]2;X\007'; cat` to test; SSH works because it blocks the local prompt cycle.
 - `liveFocus` is key window and first responder. The key gate is essential because AppKit retains one
@@ -222,12 +322,17 @@ paths:
 ## OSC 52 clipboard
 
 - Gate clipboard in host callbacks. Write carries `confirm` for `clipboard-write = ask`; read confirmation
-  identifies OSC 52 read versus paste. Prompt only OSC read, never Command-V.
+  distinguishes OSC 52 / Kitty reads and writes from paste and list. Prompt only protocol reads and writes,
+  never Command-V.
 - `ClipboardPromptController` owns app-session-wide per-direction ask/allow/deny policy. Coalesce by
   requesting surface plus direction so separate surfaces cannot inherit one decision.
 - Defer sheets to the next main turn because callbacks occur inside a libghostty tick and a modal loop
-  would reenter it. Denied reads must complete with empty text and `confirmed = true`; false causes an
-  endless re-prompt.
+  would reenter it. Deny via `ghostty_surface_deny_clipboard_request`, which writes the protocol's denial
+  reply and invalidates the request; completing with `confirmed = false` re-asks in an endless loop.
+- A text read always completes, serving a zero-length `text/plain` when the pasteboard is empty: an
+  `UNAVAILABLE` result never starts the request, so an OSC 52 reader would wait for a reply that never comes.
+- A write keeps every representation (`NSPasteboard.PasteboardType(mimeType:)` mapping): the callback is
+  void and core reports `DONE` right after it, so a dropped representation is a false success.
 - Default ungated writes are synchronous so a same-tick read sees them. Read defaults to ask; write defaults
   allow and can be changed in agterm `ghostty.conf`.
 - Deferred completion captures `GhosttySurfaceView`, then rereads its live surface. If a pane closed while
