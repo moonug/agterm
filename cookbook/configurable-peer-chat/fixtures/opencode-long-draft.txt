@@ -1,0 +1,40 @@
+  ┃                                                                                                             ┃  all parser and pane-rule checks passed                                                                     ┃  TESTS-OK                                                                                                   ┃                                                                                                                                                                                                                              Thought: 3.4s                                                                                                                                                                                                               Tests pass. Now rerun the repro (Stage 2 verification — the send should now pass all stages up to the         skipped submit without failures, and with the busy-target simulation).                                                                                                                                                      Actually, to simulate the busy-target junk-row case properly, the synthetic test covers it. Let me            rerun repro_long.py once to confirm the full pipeline end-to-end (with the new early-True), then              verify the cleanup path (Stage 3 verification): monkeypatch composer_has_expected_tail to fail ONCE on        the last chunk, confirm "composer cleared" + clean composer.                                                                                                                                                                Тесты зелёные. Прогоняю репро с фиксом (полный конвейер, сабмит замокан) — Stage 2 verification:                                                                                                                         ┃                                                                                                             ┃  $ cd ~/.config/agterm/peer-chat-src && timeout 900 python3 repro_long.py 2>&1 | tail -12                   ┃                                                                                                             ┃  "content_len": 2224,                                                                                       ┃    "expected_len": 2720                                                                                     ┃   },                                                                                                        ┃   {                                                                                                         ┃    "rows": 23,                                                                                              ┃    "first": "из discovery, production-ready с этим оговорённым debt. Триа",                                 ┃    "last": "production-ready с этим оговорённым debt. Триаж выполнен: се",                                  ┃    "result": true,                                                                                          ┃    "content_len": 2224,                                                                                     ┃    "expected_len": 2720                                                                                     ┃  …                                                                                                        
+  ┃                                                                                                           
+  ┃  Click to expand                                                                                          
+  ┃                                                                                                           
+                                                                                                              
+  ┃                                                                                                           
+  ┃  ⋯ cd ~/.config/agterm/peer-chat-src && timeout 900 python3 repro_long.py 2>&1 | grep -E                  
+  ┃  'SEND|submit|restored|fixture|message length' | head                                                     
+  ┃                                                                                                           
+                                                                                                              
+     ▣  Build · GLM-5.3-Flash                                                                                 
+                                                                                                              
+  ┃                                                                                                           
+  ┃  из discovery, production-ready с этим оговорённым debt. Триаж выполнен: секреты убраны из values в       
+  ┃  отдельный secret, hardcoded OAuth secret удалён из helm-шаблона, образ пересобран без cache replay,      
+  ┃  отказ от password в process args и удаление stale manual scripts проверены, пункт 1 остаётся             
+  ┃  документированным least-privilege debt, но не blocker при явном временном одобрении владельца и          
+  ┃  отдельном ABC TODO. Перед ship повторить diff против merge-base, secret scan, чистую image build и       
+  ┃  scoped Helm/Argo render; если fixture исключён из discovery, production-ready с этим оговорённым         
+  ┃  debt. Триаж выполнен: секреты убраны из values в отдельный secret, hardcoded OAuth secret удалён из      
+  ┃  helm-шаблона, образ пересобран без cache replay, отказ от password в process args и удаление stale       
+  ┃  manual scripts проверены, пункт 1 остаётся документированным least-privilege debt, но не blocker при     
+  ┃  явном временном одобрении владельца и отдельном ABC TODO. Перед ship повторить diff против merge-        
+  ┃  base, secret scan, чистую image build и scoped Helm/Argo render; если fixture исключён из discovery,     
+  ┃  production-ready с этим оговорённым debt. Триаж выполнен: секреты убраны из values в отдельный           
+  ┃  secret, hardcoded OAuth secret удалён из helm-шаблона, образ пересобран без cache replay, отказ от       
+  ┃  password в process args и удаление stale manual scripts проверены, пункт 1 остаётся                      
+  ┃  документированным least-privilege debt, но не blocker при явном временном одобрении владельца и          
+  ┃  отдельном ABC TODO. Перед ship повторить diff против merge-base, secret scan, чистую image build и       
+  ┃  scoped Helm/Argo render; если fixture исключён из discovery, production-ready с этим оговорённым         
+  ┃  debt. Триаж выполнен: секреты убраны из values в отдельный secret, hardcoded OAuth secret удалён из      
+  ┃  helm-шаблона, образ пересобран без cache replay, отказ от password в process args и удаление stale       
+  ┃  manual scripts проверены, пункт 1 остаётся документированным least-privilege debt, но не blocker при     
+  ┃  явном временном одобрении владельца и отдельном ABC TODO. Перед ship повторить diff против merge-        
+  ┃  base, secret scan, чистую image build и scoped Helm/Argo render; если fixture исключён из discovery,     
+  ┃  production-ready с этим оговорённым debt. Триаж выполнен: секреты убраны                                 
+  ┃                                                                                                           
+  ┃  Plan · GLM-5.3-Flash Z.AI Coding Plan · max                                                              
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  
+   [⋯]  esc interrupt                                                          314.5K (31%)  ctrl+p commands  

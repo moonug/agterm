@@ -49,6 +49,7 @@ its *needs* column, so searching this page for `claude` or `kiro` finds those di
 | [session-context-nudge](session-context-nudge/) | Claude Code keeps the title bar saying what the session is working on | 0.26.0, jq, Claude Code |
 | [status-announcer](status-announcer/) | demo: speak agent status changes from a dedicated session | 0.16.0, jq |
 | [two-agent-chat](two-agent-chat/) | let Claude Code and Codex talk to each other in one split | 0.24.0, python3, Claude Code, Codex |
+| [configurable-peer-chat](configurable-peer-chat/) | chat between any two configured agents (claude flavours, codex, opencode) in one split | 0.24.0, python3, any two configured agents |
 
 ### Panes, pickers and input
 

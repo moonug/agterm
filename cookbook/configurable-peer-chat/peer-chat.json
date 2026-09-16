@@ -1,0 +1,9 @@
+{
+  "agents": {
+    "claude": {"kind": "claude", "command": "claude"},
+    "claude-zai": {"kind": "claude", "command": "claude"},
+    "claude-minimax": {"kind": "claude", "command": "claude"},
+    "codex": {"kind": "codex", "command": "codex"},
+    "opencode": {"kind": "opencode", "command": "opencode"}
+  }
+}
