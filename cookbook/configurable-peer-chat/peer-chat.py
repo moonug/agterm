@@ -86,7 +86,10 @@ CLAUDE_STARTUP_HINT_RE = re.compile(r'^Try ".+"$')
 OPENCODE_BORDER_RE = re.compile(r"^\s*[│┃]")
 OPENCODE_BOTTOM_RE = re.compile(r"^\s*[╹╰┗][▀─]*\s*╯?", re.MULTILINE)
 OPENCODE_STATUS_RE = re.compile(r"^\S+ · .+ · \S+$", re.MULTILINE)
-OPENCODE_PLACEHOLDER_RE = re.compile(r"^Ask anything")
+OPENCODE_PLACEHOLDER_RE = re.compile(r'^Ask (?:anything|Codex)[….]?( "[^"]+")?$')
+# opencode renders the session cwd as a bare path row separated from the
+# status row by blank rows. A user draft never has that blank gap, so the
+# hint is dropped only in that exact position.
 OPENCODE_PATH_HINT_RE = re.compile(r"^[~/]\S*$")
 OPENCODE_GLYPH_ROWS = {"*"}
 # A pending permission dialog replaces the input area entirely; typing into it
@@ -682,7 +685,11 @@ def opencode_inner_text(line: str) -> str | None:
     return OPENCODE_BORDER_RE.sub("", line, count=1).strip()
 
 
-OPENCODE_ROW_SPLIT_RE = re.compile(r" {3,}(?=┃  )")
+OPENCODE_ROW_SPLIT_RE = re.compile(r" {2,}(?=[│┃] {2}\S)")
+
+# A single screen row fits the pane width; anything longer means rows were
+# glued by the capture.
+UNFLATTEN_MIN_LINE = 165
 
 
 def opencode_unflatten(text: str) -> list[str]:
@@ -690,13 +697,21 @@ def opencode_unflatten(text: str) -> list[str]:
 
     When the composer box scrolls internally, the pane capture can merge many
     screen rows into a single long line. Rows keep their trailing spaces up to
-    the pane width and box rows restart with the border, so splitting before
-    every border run restores them.
+    the pane width and the next row restarts with its border glyph, so
+    splitting before every border run restores them for both border styles.
     """
     lines: list[str] = []
     for line in text.splitlines():
-        if len(line) > 300:
-            lines.extend(OPENCODE_ROW_SPLIT_RE.split(line))
+        if len(line) > UNFLATTEN_MIN_LINE:
+            pieces: list[str] = []
+            last = 0
+            for match in OPENCODE_ROW_SPLIT_RE.finditer(line):
+                if match.start() == 0:
+                    continue
+                pieces.append(line[last : match.start()])
+                last = match.start()
+            pieces.append(line[last:])
+            lines.extend(pieces)
         else:
             lines.append(line)
     return lines
@@ -746,6 +761,11 @@ def opencode_composer_walk(text: str) -> tuple[str | None, bool]:
             continue
         block.insert(0, row_inner)
         index -= 1
+    if not saw_input and block and OPENCODE_PATH_HINT_RE.match(block[-1]):
+        # Wide layout renders the cwd hint unconditionally as the bottom-most
+        # box row (under any draft). The narrow layout has no hint row at all
+        # and always keeps the blank input row below a draft (saw_input).
+        block = block[:-1]
     content = [
         row
         for row in block
@@ -753,7 +773,6 @@ def opencode_composer_walk(text: str) -> tuple[str | None, bool]:
         and not OPENCODE_STATUS_RE.match(row)
         and row not in OPENCODE_GLYPH_ROWS
         and not OPENCODE_PLACEHOLDER_RE.match(row)
-        and not OPENCODE_PATH_HINT_RE.match(row)
     ]
     return "\n".join(content), saw_input
 
@@ -1280,6 +1299,13 @@ def clear_composer(
         allow exact deletion to resume.
         """
         if profile.agent != "opencode" or initial[0] != "":
+            return False, state, spans
+        # Blind backspacing assumes every visible character is ours. A draft
+        # that is not a tail of the owned text means foreign content shares
+        # the composer (a mis-parse or user input); refuse to delete it.
+        flat_content = (state[0] or "").replace("\n", "")
+        flat_owned = owned_text.replace("\n", "")
+        if not flat_owned.endswith(flat_content):
             return False, state, spans
         for _ in range(3):
             type_text(sid, profile, "\x7f" * (len(owned_text) + 8), window)

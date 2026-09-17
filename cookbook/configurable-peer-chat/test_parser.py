@@ -113,6 +113,37 @@ full_box = (
 )
 assert pc.opencode_live_prompt_text(full_box) == "pending draft text"
 assert pc.opencode_composer_has_input_area(full_box) is True
+# --- path-like draft rows are draft content, never filtered ---------------
+# narrow layout: the draft keeps the blank input row below it
+path_draft = (
+    "  ┃  ~/notes.txt\n"
+    "  ┃\n"
+    "  ┃  Build · GPT-5.6 Luna OpenAI · medium\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+)
+assert pc.opencode_live_prompt_text(path_draft) == "~/notes.txt"
+# wide layout: the cwd hint sits under the draft and is dropped, the draft stays
+wide_with_hint = (
+    "  ┃  ~/notes.txt\n"
+    "  ┃  ~/.config/agterm\n"
+    "  ┃  Build · GPT-5.6 Luna OpenAI · medium\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+)
+assert pc.opencode_live_prompt_text(wide_with_hint) == "~/notes.txt"
+
+# --- unflatten: short glued captures and the old border style --------------
+glued_old_border = (
+    "  │  черновик после сбоя" + " " * 120 + "│  Build · GPT-5.6 Luna · med\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+)
+assert pc.opencode_live_prompt_text(glued_old_border) == "черновик после сбоя"
+
+# --- blind recovery refuses to delete foreign text -------------------------
+owned = "наш текст в композере"
+foreign = owned + " и чужой пользовательский текст"
+assert not foreign.replace("\n", "").endswith(owned.replace("\n", ""))
+assert owned.replace("\n", "").endswith(owned.replace("\n", ""))
+
 # --- normalize strips foreign self-labels --------------------------------
 prof = pc.target_profile("codex", None, False, None)
 expect(
