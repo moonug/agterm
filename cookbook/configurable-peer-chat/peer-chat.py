@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -542,9 +543,10 @@ def type_text(
 
     # Live sends into a redrawing opencode TUI occasionally lose one character
     # from a single large write. Pace the event in small slices; verification
-    # and markers stay per whole chunk. Pure-backspace cleanup events skip the
-    # pacing: over-backspacing an empty composer is harmless and the rounds
-    # repeat anyway.
+    # and markers stay per whole chunk. Paste is not an alternative here:
+    # opencode collapses a bracketed paste into a "[Pasted ~1 lines]" token.
+    # Pure-backspace cleanup events skip the pacing: over-backspacing an empty
+    # composer is harmless and the rounds repeat anyway.
     if (
         profile.agent == "opencode"
         and len(text) > OPENCODE_TYPE_SLICE
@@ -680,6 +682,26 @@ def opencode_inner_text(line: str) -> str | None:
     return OPENCODE_BORDER_RE.sub("", line, count=1).strip()
 
 
+OPENCODE_ROW_SPLIT_RE = re.compile(r" {3,}(?=┃  )")
+
+
+def opencode_unflatten(text: str) -> list[str]:
+    """Restore screen rows from a capture that glued them into one line.
+
+    When the composer box scrolls internally, the pane capture can merge many
+    screen rows into a single long line. Rows keep their trailing spaces up to
+    the pane width and box rows restart with the border, so splitting before
+    every border run restores them.
+    """
+    lines: list[str] = []
+    for line in text.splitlines():
+        if len(line) > 300:
+            lines.extend(OPENCODE_ROW_SPLIT_RE.split(line))
+        else:
+            lines.append(line)
+    return lines
+
+
 def opencode_composer_walk(text: str) -> tuple[str | None, bool]:
     """Walk the composer box upward from the bottom border.
 
@@ -688,7 +710,7 @@ def opencode_composer_walk(text: str) -> tuple[str | None, bool]:
     box top. A non-bordered row ends the box: that is the transcript above it,
     not a parse error.
     """
-    lines = text.splitlines()[-BOX_LINES:]
+    lines = opencode_unflatten(text)[-BOX_LINES:]
     bottom = next(
         (
             index
@@ -913,26 +935,35 @@ def type_body(
                         "the target composer; submit withheld",
                         marked,
                     )
-                type_text(sid, profile, "\x7f" * len(marker), window)
                 settle_delay = (
                     COMPOSER_SETTLE_DELAY
                     if index == len(chunks) - 1
                     else CHUNK_SETTLE_DELAY
                 )
-                unmarked = wait_for_composer_change(
-                    sid,
-                    profile,
-                    changed,
-                    settle_delay,
-                    window,
-                    matches=partial(
-                        chunk_is_visible,
-                        expected=attempted,
-                        chunk=chunk,
-                        tolerant=tolerant,
-                        marker=marker,
-                    ),
-                )
+                # Backspace writes race the redrawing TUI the same way text
+                # writes do: some control characters never land, leaving part
+                # of the marker behind. Verify the removal and repeat; lost
+                # backspaces only under-delete, never over-delete.
+                unmarked = None
+                for _ in range(3):
+                    type_text(sid, profile, "\x7f" * len(marker), window)
+                    unmarked = wait_for_composer_change(
+                        sid,
+                        profile,
+                        changed,
+                        settle_delay,
+                        window,
+                        matches=partial(
+                            chunk_is_visible,
+                            expected=attempted,
+                            chunk=chunk,
+                            tolerant=tolerant,
+                            marker=marker,
+                        ),
+                    )
+                    if unmarked is not None and marker not in unmarked[0]:
+                        break
+                    unmarked = None
                 if unmarked is None or marker in unmarked[0]:
                     raise ComposerDirty(
                         f"message marker after chunk {index + 1}/{len(chunks)} was "
@@ -1066,6 +1097,7 @@ def composer_has_expected_tail(
     """Match a source suffix while allowing visual line wrapping."""
     positions = {len(expected)}
     rows = content.splitlines() or [content]
+    probe_start = max(0, len(expected) - len(chunk) - CHUNK_VERIFY_OVERLAP)
     for index in range(len(rows) - 1, -1, -1):
         readings = row_readings(rows[index], tolerant)
         matched = {
@@ -1088,6 +1120,12 @@ def composer_has_expected_tail(
                 # The whole expected suffix is already accounted for by the
                 # rows below; anything above it (a busy target's live tool
                 # rows, a clipped draft top) is outside the verified suffix.
+                return True
+            if min(positions) <= probe_start:
+                # The chunk region is anchored. A long draft scrolls inside
+                # the composer box, so the remaining rows above may simply be
+                # out of view; the bottom-up chain already proved the typed
+                # chunk contiguously, which is what this check is for.
                 return True
         else:
             positions = matched
