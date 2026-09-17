@@ -1442,6 +1442,23 @@ def raise_after_composer_dirty(
     raise ComposerDirty(f"{dirty}; {detail}", dirty.owned_text) from dirty
 
 
+def claude_permission_dialog(pane: str) -> bool:
+    """A claude permission chooser replaces the input prompt row.
+
+    The chooser options keep their cursor glyph (``❯ 1. Yes``), so a tail with
+    numbered options and no standalone input prompt is a modal. Numbered list
+    rows inside the transcript coexist with the input prompt and stay harmless.
+    """
+    tail = [row.strip() for row in pane.splitlines()[-8:]]
+
+    def is_choice(row: str) -> bool:
+        return bool(CODEX_CHOICE_RE.match(row.lstrip("❯ ").strip()))
+
+    has_choices = any(is_choice(row) for row in tail)
+    has_prompt = any("❯" in row and not is_choice(row) for row in tail)
+    return has_choices and not has_prompt
+
+
 def send(
     sid: str,
     profile: Profile,
@@ -1468,10 +1485,7 @@ def send(
                 "target has a pending permission dialog; nothing was typed; "
                 "the user must answer it in that pane"
             )
-        if profile.agent == "claude" and any(
-            CODEX_CHOICE_RE.match(row.strip())
-            for row in pane.splitlines()[-12:]
-        ):
+        if profile.agent == "claude" and claude_permission_dialog(pane):
             raise PromptBlocked(
                 "target has a pending permission dialog; nothing was typed; "
                 "the user must answer it in that pane"
