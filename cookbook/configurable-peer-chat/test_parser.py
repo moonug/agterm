@@ -82,25 +82,37 @@ dialog = fixture("opencode-permission-dialog.txt")
 assert pc.OPENCODE_DIALOG_RE.search(dialog) is not None
 assert pc.opencode_live_prompt_text(dialog) is None
 
+# collapsed busy: transcript row directly above the status row, no input area
 collapsed = (
     "                                         Thought: Planning the next step\n"
     "  ┃  Build · GPT-5.6 Luna OpenAI · medium\n"
-    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
 )
-assert pc.opencode_live_prompt_text(collapsed) is None
-assert not pc.opencode_input_block_present(collapsed)
+assert pc.opencode_live_prompt_text(collapsed) == ""
+assert not pc.opencode_composer_has_input_area(collapsed)
 pure_thinking = (
     "                                         Thought: Planning the next step\n"
     "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
 )
-assert not pc.opencode_input_block_present(pure_thinking)
+assert pc.opencode_live_prompt_text(pure_thinking) is None
+# idle empty composer: transcript above, blank input row between it and status
+idle_empty = (
+    "                                         Thought: Planning the next step\n"
+    "  ┃\n"
+    "  ┃  Build · GPT-5.6 Luna OpenAI · medium\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+)
+assert pc.opencode_live_prompt_text(idle_empty) == ""
+assert pc.opencode_composer_has_input_area(idle_empty) is True
+# draft above the status row: content is recognised
 full_box = (
     "  ┃  pending draft text\n"
     "  ┃\n"
     "  ┃  Build · GPT-5.6 Luna OpenAI · medium\n"
-    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
 )
-assert pc.opencode_input_block_present(full_box) is True
+assert pc.opencode_live_prompt_text(full_box) == "pending draft text"
+assert pc.opencode_composer_has_input_area(full_box) is True
 # --- normalize strips foreign self-labels --------------------------------
 prof = pc.target_profile("codex", None, False, None)
 expect(

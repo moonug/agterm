@@ -680,11 +680,13 @@ def opencode_inner_text(line: str) -> str | None:
     return OPENCODE_BORDER_RE.sub("", line, count=1).strip()
 
 
-def opencode_input_block_present(text: str) -> bool:
-    """True when a bordered input row sits above the status row.
+def opencode_composer_walk(text: str) -> tuple[str | None, bool]:
+    """Walk the composer box upward from the bottom border.
 
-    A thinking opencode collapses the input area: the bottom border keeps only
-    the status row and border-less thinking/tool rows above it.
+    Returns the draft content above the status row ("" when empty) and whether
+    an input row (a blank bordered row) sits between the status row and the
+    box top. A non-bordered row ends the box: that is the transcript above it,
+    not a parse error.
     """
     lines = text.splitlines()[-BOX_LINES:]
     bottom = next(
@@ -696,63 +698,31 @@ def opencode_input_block_present(text: str) -> bool:
         None,
     )
     if bottom is None:
-        return False
-
-    def blank(row: str) -> bool:
-        inner = opencode_inner_text(row)
-        return inner == "" or (inner is None and not row.strip())
-
+        return None, False
     index = bottom - 1
-    while index >= 0 and blank(lines[index]):
-        index -= 1
-    if index < 0:
-        return False
-    if not OPENCODE_STATUS_RE.match(opencode_inner_text(lines[index]) or ""):
-        return False
-    index -= 1
-    if index >= 0 and blank(lines[index]):
-        index -= 1
-    return (
-        index >= 0
-        and not blank(lines[index])
-        and opencode_inner_text(lines[index]) is not None
-    )
 
+    def inner(row: str) -> str | None:
+        return opencode_inner_text(row)
 
-def opencode_live_prompt_text(text: str) -> str | None:
-    lines = text.splitlines()[-BOX_LINES:]
-    bottom = next(
-        (
-            index
-            for index in range(len(lines) - 1, -1, -1)
-            if OPENCODE_BOTTOM_RE.match(lines[index])
-        ),
-        None,
-    )
-    if bottom is None:
-        return None
-    index = bottom - 1
-    # A box row holding only the border counts as a blank separator.
-    def blank(row: str) -> bool:
-        inner = opencode_inner_text(row)
-        return inner == "" or (inner is None and not row.strip())
-
-    while index >= 0 and blank(lines[index]):
+    while index >= 0 and inner(lines[index]) == "":
         index -= 1
-    if index < 0:
-        return None
-    status = opencode_inner_text(lines[index])
+    status = inner(lines[index]) if index >= 0 else None
     if status is None or not OPENCODE_STATUS_RE.match(status):
-        return None
+        return None, False
     index -= 1
-    if index >= 0 and blank(lines[index]):
-        index -= 1
     block: list[str] = []
-    while index >= 0 and not blank(lines[index]):
-        inner = opencode_inner_text(lines[index])
-        if inner is None:
-            return None
-        block.insert(0, inner)
+    saw_input = False
+    while index >= 0:
+        row_inner = inner(lines[index])
+        if row_inner is None:
+            break
+        if row_inner == "":
+            if block:
+                break
+            saw_input = True
+            index -= 1
+            continue
+        block.insert(0, row_inner)
         index -= 1
     content = [
         row
@@ -763,7 +733,16 @@ def opencode_live_prompt_text(text: str) -> str | None:
         and not OPENCODE_PLACEHOLDER_RE.match(row)
         and not OPENCODE_PATH_HINT_RE.match(row)
     ]
-    return "\n".join(content)
+    return "\n".join(content), saw_input
+
+
+def opencode_live_prompt_text(text: str) -> str | None:
+    return opencode_composer_walk(text)[0]
+
+
+def opencode_composer_has_input_area(text: str) -> bool:
+    state, saw_input = opencode_composer_walk(text)
+    return state is not None and saw_input
 
 
 def live_prompt_text(profile: Profile, text: str) -> str | None:
@@ -1435,16 +1414,18 @@ def send(
             )
         empty_text = live_prompt_text(profile, pane)
         if empty_text is None:
-            if profile.agent == "opencode" and not opencode_input_block_present(
-                pane
-            ):
-                raise PromptBlocked(
-                    "target composer is collapsed (agent busy thinking); "
-                    "nothing was typed"
-                )
             raise PromptBlocked(
                 "target composer prompt is not recognisable (shell mode, disabled "
                 "input, a trailing modal or status row, or an unknown prompt glyph); "
+                "nothing was typed"
+            )
+        if (
+            profile.agent == "opencode"
+            and empty_text == ""
+            and not opencode_composer_has_input_area(pane)
+        ):
+            raise PromptBlocked(
+                "target composer is collapsed (agent busy thinking); "
                 "nothing was typed"
             )
         # Claude's free-form suggestions look like drafts in plain screen text.
