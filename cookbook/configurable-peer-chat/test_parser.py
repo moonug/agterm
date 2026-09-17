@@ -6,10 +6,9 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-_script = os.path.join(HERE, "peer-chat.py")
-if not os.path.exists(_script):
-    _script = os.path.expanduser("~/bin/peer-chat.py")
-spec = importlib.util.spec_from_file_location("peer_chat", _script)
+spec = importlib.util.spec_from_file_location(
+    "peer_chat", os.path.join(os.path.expanduser("~/bin"), "peer-chat.py")
+)
 pc = importlib.util.module_from_spec(spec)
 sys.modules["peer_chat"] = pc
 spec.loader.exec_module(pc)
@@ -78,6 +77,30 @@ assert pc.composer_has_expected_tail(content, expected, expected) is True
 content_bad = "alpha beta\nJUNK live row\ngamma delta\nepsilon zeta"
 assert pc.composer_has_expected_tail(content_bad, expected, expected) is False
 
+# --- pending permission dialog and collapsed composer -------------------
+dialog = fixture("opencode-permission-dialog.txt")
+assert pc.OPENCODE_DIALOG_RE.search(dialog) is not None
+assert pc.opencode_live_prompt_text(dialog) is None
+
+collapsed = (
+    "                                         Thought: Planning the next step\n"
+    "  ┃  Build · GPT-5.6 Luna OpenAI · medium\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+)
+assert pc.opencode_live_prompt_text(collapsed) is None
+assert not pc.opencode_input_block_present(collapsed)
+pure_thinking = (
+    "                                         Thought: Planning the next step\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+)
+assert not pc.opencode_input_block_present(pure_thinking)
+full_box = (
+    "  ┃  pending draft text\n"
+    "  ┃\n"
+    "  ┃  Build · GPT-5.6 Luna OpenAI · medium\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+)
+assert pc.opencode_input_block_present(full_box) is True
 # --- normalize strips foreign self-labels --------------------------------
 prof = pc.target_profile("codex", None, False, None)
 expect(

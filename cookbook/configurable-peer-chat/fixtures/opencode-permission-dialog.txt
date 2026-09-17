@@ -1,0 +1,12 @@
+     ▣  Build · GPT-6 Astra
+  ┃
+  ┃  △ Permission required
+  ┃    ← Access external directory ~/a.yandex-team.ru/noc/admin/argocd/apps
+  ┃
+  ┃  Patterns
+  ┃
+  ┃  - /Users/moonug/a.yandex-team.ru/noc/admin/argocd/apps/*
+  ┃
+  ┃
+  ┃   Allow once   Allow always   Reject                       ctrl+f fullscreen  ⇆ select  enter confirm
+  ┃

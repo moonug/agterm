@@ -83,11 +83,16 @@ CLAUDE_STARTUP_HINT_RE = re.compile(r'^Try ".+"$')
 # cursor glyph (`*`) and a right-aligned cwd hint inside the box; a fresh
 # session shows a rotated `Ask anything…` placeholder instead of input rows.
 OPENCODE_BORDER_RE = re.compile(r"^\s*[│┃]")
-OPENCODE_BOTTOM_RE = re.compile(r"^\s*[╹╰┗][▀─]*\s*╯?")
-OPENCODE_STATUS_RE = re.compile(r"^\S+ · .+ · \S+$")
+OPENCODE_BOTTOM_RE = re.compile(r"^\s*[╹╰┗][▀─]*\s*╯?", re.MULTILINE)
+OPENCODE_STATUS_RE = re.compile(r"^\S+ · .+ · \S+$", re.MULTILINE)
 OPENCODE_PLACEHOLDER_RE = re.compile(r"^Ask anything")
 OPENCODE_PATH_HINT_RE = re.compile(r"^[~/]\S*$")
 OPENCODE_GLYPH_ROWS = {"*"}
+# A pending permission dialog replaces the input area entirely; typing into it
+# (or pressing its confirm key) would answer for the user.
+OPENCODE_DIALOG_RE = re.compile(r"△ Permission required|Allow once\s+Allow always")
+# While the agent is thinking, the input area and status row collapse and only
+# the bottom border remains above the footer. The state is transient.
 OPENCODE_TYPE_SLICE = 24
 OPENCODE_TYPE_PAUSE = 0.08
 MESSAGE_NAME_RE = re.compile(r"peer-chat-[a-z0-9][a-z0-9-]{2,48}\.txt")
@@ -673,6 +678,45 @@ def opencode_inner_text(line: str) -> str | None:
     if not OPENCODE_BORDER_RE.match(line):
         return None
     return OPENCODE_BORDER_RE.sub("", line, count=1).strip()
+
+
+def opencode_input_block_present(text: str) -> bool:
+    """True when a bordered input row sits above the status row.
+
+    A thinking opencode collapses the input area: the bottom border keeps only
+    the status row and border-less thinking/tool rows above it.
+    """
+    lines = text.splitlines()[-BOX_LINES:]
+    bottom = next(
+        (
+            index
+            for index in range(len(lines) - 1, -1, -1)
+            if OPENCODE_BOTTOM_RE.match(lines[index])
+        ),
+        None,
+    )
+    if bottom is None:
+        return False
+
+    def blank(row: str) -> bool:
+        inner = opencode_inner_text(row)
+        return inner == "" or (inner is None and not row.strip())
+
+    index = bottom - 1
+    while index >= 0 and blank(lines[index]):
+        index -= 1
+    if index < 0:
+        return False
+    if not OPENCODE_STATUS_RE.match(opencode_inner_text(lines[index]) or ""):
+        return False
+    index -= 1
+    if index >= 0 and blank(lines[index]):
+        index -= 1
+    return (
+        index >= 0
+        and not blank(lines[index])
+        and opencode_inner_text(lines[index]) is not None
+    )
 
 
 def opencode_live_prompt_text(text: str) -> str | None:
@@ -1374,8 +1418,30 @@ def send(
         typed = prepared
     try:
         pane = pane_text(sid, profile, window)
+        # Distinct, non-retryable refusals for pending dialogs: typing there
+        # (or landing the confirm key) would answer for the user.
+        if profile.agent == "opencode" and OPENCODE_DIALOG_RE.search(pane):
+            raise PromptBlocked(
+                "target has a pending permission dialog; nothing was typed; "
+                "the user must answer it in that pane"
+            )
+        if profile.agent == "claude" and any(
+            CODEX_CHOICE_RE.match(row.strip())
+            for row in pane.splitlines()[-12:]
+        ):
+            raise PromptBlocked(
+                "target has a pending permission dialog; nothing was typed; "
+                "the user must answer it in that pane"
+            )
         empty_text = live_prompt_text(profile, pane)
         if empty_text is None:
+            if profile.agent == "opencode" and not opencode_input_block_present(
+                pane
+            ):
+                raise PromptBlocked(
+                    "target composer is collapsed (agent busy thinking); "
+                    "nothing was typed"
+                )
             raise PromptBlocked(
                 "target composer prompt is not recognisable (shell mode, disabled "
                 "input, a trailing modal or status row, or an unknown prompt glyph); "
@@ -1515,6 +1581,9 @@ def send_with_retry(
             try:
                 return send(sid, profile, message, window, prepared, delivery)
             except PromptBlocked as err:
+                if "pending permission dialog" in str(err):
+                    # A dialog needs the user, not another attempt.
+                    raise
                 if attempt == RETRY_ATTEMPTS:
                     raise PromptBlocked(
                         f"{err} after {RETRY_ATTEMPTS} attempts"

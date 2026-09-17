@@ -117,6 +117,10 @@ Never answer anything on the user's behalf: not a chooser entry, not a trust pro
 permission or approval request, not a warning. Those answers carry the user's authority and are his
 to give.
 
+If the refusal says `target has a pending permission dialog` — the target pane has an unanswered permission prompt. Do not retry: tell the user to answer that dialog in the target pane, and resend only after it is gone. Never answer a permission prompt yourself, and never resend blind after a dialog refusal.
+
+If the refusal says `target composer is collapsed (agent busy thinking)` — the peer is mid-thought and its input area is temporarily hidden; the default retries will ride it out, so simply let them run.
+
 If the script reports a pre-write refusal, nothing was written. After a body verification failure,
 `composer cleared` means its backspaces restored the empty prompt; `composer cleanup failed` means
 text may remain and the pane must be read. Cleanup checks each visible owned section before a bounded
