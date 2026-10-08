@@ -6,9 +6,10 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-spec = importlib.util.spec_from_file_location(
-    "peer_chat", os.path.join(os.path.expanduser("~/bin"), "peer-chat.py")
-)
+source = os.path.join(HERE, "peer-chat.py")
+if not os.path.exists(source):
+    source = os.path.join(os.path.expanduser("~/bin"), "peer-chat.py")
+spec = importlib.util.spec_from_file_location("peer_chat", source)
 pc = importlib.util.module_from_spec(spec)
 sys.modules["peer_chat"] = pc
 spec.loader.exec_module(pc)
