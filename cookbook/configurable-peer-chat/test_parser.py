@@ -162,14 +162,12 @@ expect("plain shell text is refused", pc.opencode_live_prompt_text("zsh-5.9$ ls\
 expect("empty screen is refused", pc.opencode_live_prompt_text(""), None)
 
 # --- claude parser smoke (upstream logic, untouched) ------------------------------------
-claude_screen = "\n".join(
-    [
-        "✻ Truncating… (esc to interrupt · 1m 2s)",
-        "",
-        "❯ hello there",
-        "  ──────────",
-        "  ? for shortcuts",
-    ]
+claude_screen = (
+    "✻ Truncating… (esc to interrupt · 1m 2s)\n"
+    "\n"
+    "❯ hello there\n"
+    "  ──────────\n"
+    "  ? for shortcuts"
 )
 expect("claude prompt is read", pc.claude_live_prompt_text(claude_screen), "hello there")
 
