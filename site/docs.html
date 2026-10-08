@@ -2741,7 +2741,10 @@
                 >https</span
               >) and <span style="font-family: &quot;JetBrains Mono&quot;, monospace; color: #cbc6bc">mailto</span> links still open as
               before. A <span style="font-family: &quot;JetBrains Mono&quot;, monospace; color: #cbc6bc">file://</span> link that names
-              another host is ignored rather than revealed, so a stray link can't trigger a Finder network mount.
+              another host is ignored rather than revealed, so a stray link can't trigger a Finder network mount. Plain-text URLs go
+              through the same policy: a URL the terminal has soft-wrapped across rows opens whole from any of its rows, and trailing
+              punctuation such as <span style="font-family: &quot;JetBrains Mono&quot;, monospace; color: #cbc6bc">).,</span> or quotes
+              stays out of the opened target.
             </p>
             <p style="font-size: 15px; line-height: 1.65; color: #949ba4; margin: 16px 0 0">
               Link detection follows the program in the pane. While one has mouse reporting on —

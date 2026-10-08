@@ -118,20 +118,66 @@ public struct LinkRules {
     }
 
     /// The first rule whose match at or straddling `offset` yields a URL, in rule order (defaults first).
-    /// Nil when nothing matches — the caller reports "no link under cursor".
+    /// The resolved URL sheds trailing punctuation (`):`, `.,`, quotes) so a URL ending a sentence opens
+    /// clean; a click on that shed tail still counts as inside the match. Nil when nothing matches —
+    /// the caller reports "no link under cursor".
     public static func firstMatch(rules: [Rule], cellText: String, offset: Int) -> String? {
         guard offset >= 0, offset < cellText.utf16.count else { return nil }
         let nsText = cellText as NSString
+        let full = NSRange(location: 0, length: nsText.length)
         for rule in rules {
-            let matches = rule.regex.matches(in: cellText, range: NSRange(location: 0, length: nsText.length))
-            for match in matches where match.range.length > 0 {
-                if match.range.contains(offset) || match.range.location == offset || match.range.upperBound == offset + 1 {
-                    guard let range = Range(match.range, in: cellText) else { continue }
-                    return resolvedURL(match: match, in: cellText, format: rule.format, range: range)
-                }
+            for match in rule.regex.matches(in: cellText, range: full) where match.range.length > 0 {
+                guard match.range.contains(offset), let range = Range(match.range, in: cellText) else { continue }
+                let resolved = resolvedURL(match: match, in: cellText, format: rule.format, range: range)
+                let trimmed = trimmedTrailingPunctuation(resolved)
+                if !trimmed.isEmpty { return trimmed }
             }
         }
         return nil
+    }
+
+    /// Resolve the URL under a cursor cell, where `lines` are the viewport's LOGICAL lines as read from
+    /// the surface (libghostty pre-joins soft wraps; `\n` marks only hard newlines) and `row`/`col` are
+    /// physical cells. Each line occupies `max(1, ceil(graphemeCount/cols))` physical rows, so the walk
+    /// finds the owning line and the cell offset `(row - startRow) * cols + col` inside it; that offset
+    /// converts through a grapheme prefix because VS16/emoji fill one cell with two UTF-16 units, and a
+    /// click past the line's end clamps to `firstMatch`'s own bound. CJK glyphs (two cells, one grapheme)
+    /// stay a 1-cell approximation. Nil when the cell is past every line or nothing matches.
+    public static func urlAtCursor(rules: [Rule], lines: [String], cols: Int, row: Int, col: Int) -> String? {
+        guard cols > 0, row >= 0, col >= 0 else { return nil }
+        var start = 0
+        for line in lines {
+            let span = max(1, (line.count + cols - 1) / cols)
+            if row < start + span {
+                let cell = (row - start) * cols + col
+                let cut = line.index(line.startIndex, offsetBy: min(cell, line.count))
+                return firstMatch(rules: rules, cellText: line, offset: line[..<cut].utf16.count)
+            }
+            start += span
+        }
+        return nil
+    }
+
+    /// Strip what prose hangs off a URL's end: `.,;:!?` and quotes always, a closing bracket only while
+    /// its opener is unmatched inside — `…/Foo_(bar).)` keeps its balanced `)`, a bare `):` sheds both.
+    /// Runs right-to-left and stops at the first kept closer, so inner balanced pairs stay intact.
+    static func trimmedTrailingPunctuation(_ raw: String) -> String {
+        let always: Set<Character> = [".", ",", ";", ":", "!", "?", "\"", "'"]
+        let openers: [Character: Character] = [")": "(", "]": "[", "}": "{"]
+        var chars = Array(raw)
+        while let last = chars.last {
+            if always.contains(last) {
+                chars.removeLast()
+                continue
+            }
+            guard let opener = openers[last] else { break }
+            let rest = chars.dropLast()
+            let opens = rest.filter { $0 == opener }.count
+            let closes = rest.filter { $0 == last }.count
+            guard closes >= opens else { break }
+            chars.removeLast()
+        }
+        return String(chars)
     }
 
     // MARK: - Private helpers

@@ -115,4 +115,75 @@ struct LinkRulesTests {
                                        cellText: "NOCDEV-1234", offset: 50)
         #expect(url == nil)
     }
+
+    // MARK: trailing punctuation
+
+    @Test func sentencePunctuationShedsFromMatch() {
+        let url = LinkRules.firstMatch(rules: LinkRules.defaultRules(),
+                                       cellText: "see https://example.com/a): end", offset: 5)
+        #expect(url == "https://example.com/a")
+    }
+
+    @Test func clickOnShedTailStillOpens() {
+        let text = "see https://example.com/a):"
+        let url = LinkRules.firstMatch(rules: LinkRules.defaultRules(), cellText: text, offset: text.count - 2)
+        #expect(url == "https://example.com/a")
+    }
+
+    @Test func balancedCloserKept() {
+        let url = LinkRules.firstMatch(rules: LinkRules.defaultRules(),
+                                       cellText: "(see https://en.wikipedia.org/wiki/Foo_(bar).)", offset: 6)
+        #expect(url == "https://en.wikipedia.org/wiki/Foo_(bar)")
+    }
+
+    @Test func formatExpansionShedsToo() throws {
+        let rule = try #require(try NSRegularExpression(pattern: "https?://[^[:space:]]+"))
+        let rules = [LinkRules.Rule(regex: rule, format: "$0", sourceLine: nil)]
+        let url = LinkRules.firstMatch(rules: rules, cellText: "go https://x.com/a). b", offset: 4)
+        #expect(url == "https://x.com/a")
+    }
+
+    @Test func trailingTrimCases() {
+        #expect(LinkRules.trimmedTrailingPunctuation("https://x/a):") == "https://x/a")
+        #expect(LinkRules.trimmedTrailingPunctuation("https://x/a_(b))") == "https://x/a_(b)")
+        #expect(LinkRules.trimmedTrailingPunctuation("https://x/a)") == "https://x/a")
+        #expect(LinkRules.trimmedTrailingPunctuation("https://x/a'\"") == "https://x/a")
+        #expect(LinkRules.trimmedTrailingPunctuation("https://x/a_b") == "https://x/a_b")
+        #expect(LinkRules.trimmedTrailingPunctuation("https://x/a%3A") == "https://x/a%3A")
+    }
+
+    // MARK: urlAtCursor (physical rows → logical lines)
+
+    @Test func wrappedUrlMatchesFromAnyPhysicalRow() {
+        let url = "https://example.com/very/long/path/to/page"
+        let lines = ["$ " + url, "next hard line"]
+        #expect(LinkRules.urlAtCursor(rules: LinkRules.defaultRules(), lines: lines, cols: 20, row: 0, col: 25) == url)
+        #expect(LinkRules.urlAtCursor(rules: LinkRules.defaultRules(), lines: lines, cols: 20, row: 1, col: 8) == url)
+        #expect(LinkRules.urlAtCursor(rules: LinkRules.defaultRules(), lines: lines, cols: 20, row: 2, col: 3) == url)
+        #expect(LinkRules.urlAtCursor(rules: LinkRules.defaultRules(), lines: lines, cols: 20, row: 2, col: 19) == nil)
+        #expect(LinkRules.urlAtCursor(rules: LinkRules.defaultRules(), lines: lines, cols: 20, row: 3, col: 1) == nil)
+    }
+
+    @Test func exactColsLineOccupiesOnePhysicalRow() {
+        let lines = [String(repeating: "a", count: 20), "https://x.example"]
+        #expect(LinkRules.urlAtCursor(rules: LinkRules.defaultRules(), lines: lines, cols: 20, row: 1, col: 2) == "https://x.example")
+    }
+
+    @Test func emptyLinesSpanOnePhysicalRow() {
+        let lines = ["", "https://x.example", ""]
+        #expect(LinkRules.urlAtCursor(rules: LinkRules.defaultRules(), lines: lines, cols: 20, row: 1, col: 0) == "https://x.example")
+        #expect(LinkRules.urlAtCursor(rules: LinkRules.defaultRules(), lines: lines, cols: 20, row: 2, col: 5) == nil)
+    }
+
+    @Test func graphemeOffsetSurvivesEmojiPrompt() {
+        // ✔️ is one cell and one grapheme but two UTF-16 units; the click on `h` (cell 2) must not
+        // land inside the variation selector.
+        let url = LinkRules.urlAtCursor(rules: LinkRules.defaultRules(), lines: ["✔️ https://x.example"], cols: 30, row: 0, col: 2)
+        #expect(url == "https://x.example")
+    }
+
+    @Test func clickRightOfRowTextReturnsNil() {
+        #expect(LinkRules.urlAtCursor(rules: LinkRules.defaultRules(), lines: ["ab"], cols: 30, row: 0, col: 10) == nil)
+        #expect(LinkRules.urlAtCursor(rules: LinkRules.defaultRules(), lines: ["ab"], cols: 30, row: 3, col: 0) == nil)
+    }
 }

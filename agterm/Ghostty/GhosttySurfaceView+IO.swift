@@ -83,8 +83,9 @@ extension GhosttySurfaceView {
     /// yet, or `ghostty_surface_read_text` fails), so a caller can tell that from a genuinely blank screen,
     /// which reads as an empty string. Region: the visible screen by default, the whole screen plus scrollback
     /// when `all` or `lines` is set; `lines` keeps the last N CONTENT lines (trailing blank grid rows trimmed).
-    /// Ignores focus and copies-then-frees the buffer like `readSelection`; UTF-8 only, no per-cell color or
-    /// SGR. Covered by the `session.text` XCUITest e2e, which needs a live surface.
+    /// Lines are LOGICAL: libghostty pre-joins soft-wrapped rows and keeps trailing spaces, so `\n` marks
+    /// only hard newlines. Ignores focus and copies-then-frees the buffer like `readSelection`; UTF-8 only,
+    /// no per-cell color or SGR. Covered by the `session.text` XCUITest e2e, which needs a live surface.
     func readScreenText(all: Bool, lines: Int?) -> String? {
         guard let surface else { return nil }
         // a zero-init ghostty_point_s is GHOSTTY_POINT_ACTIVE / GHOSTTY_POINT_COORD_EXACT (both enum 0), not
