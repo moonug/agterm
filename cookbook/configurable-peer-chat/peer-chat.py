@@ -903,6 +903,28 @@ def wait_for_composer_change(
         time.sleep(PROBE_INTERVAL)
 
 
+def verify_diag(
+    sid: str,
+    profile: Profile,
+    window: str | None,
+    expected_len: int,
+    marker: str,
+) -> str:
+    """One-line observation for a failed chunk verify; no message text."""
+    try:
+        state = composer_state(sid, profile, window)
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+        state = None
+    if state is None:
+        return f"expected ~{expected_len} chars; composer state not recognisable"
+    rows = state[0].splitlines() or [""]
+    held = "marker present" if marker and marker in state[0] else "marker absent"
+    return (
+        f"expected ~{expected_len} chars; observed {len(state[0])} chars in "
+        f"{len(rows)} rows; {held}"
+    )
+
+
 def type_body(
     sid: str,
     profile: Profile,
@@ -942,7 +964,9 @@ def type_body(
                 if changed is None:
                     raise ComposerDirty(
                         f"message chunk {index + 1}/{len(chunks)} was typed but the "
-                        "target composer did not confirm it; submit withheld",
+                        "target composer did not confirm it "
+                        f"({verify_diag(sid, profile, window, len(marked), marker)}); "
+                        "submit withheld",
                         marked,
                     )
                 if not composer_has_expected_tail(
@@ -950,7 +974,9 @@ def type_body(
                 ):
                     raise ComposerDirty(
                         f"message chunk {index + 1}/{len(chunks)} is incomplete in "
-                        "the target composer; submit withheld",
+                        "the target composer "
+                        f"({verify_diag(sid, profile, window, len(marked), marker)}); "
+                        "submit withheld",
                         marked,
                     )
                 settle_delay = (
@@ -1274,8 +1300,12 @@ def clear_composer(
     initial: tuple[str, int],
     owned_text: str,
     window: str | None = None,
+    reason: list[str] | None = None,
 ) -> bool:
-    """Backspace text owned by this send without interrupting an active turn."""
+    """Backspace text owned by this send without interrupting an active turn.
+
+    On failure appends a short cause (no message text) to ``reason`` when given.
+    """
     allowed_ends = set(range(1, len(owned_text) + 1))
     settled = wait_for_cleanup_state(
         sid,
@@ -1287,25 +1317,35 @@ def clear_composer(
         accept_empty=False,
     )
     if settled is None:
+        if reason is not None:
+            reason.append("composer state never stabilised")
         return False
     state, spans = settled
+
+    def fail(text: str) -> bool:
+        if reason is not None:
+            reason.append(text)
+        return False
 
     def blind_recovery(state, spans):
         """Bounded blind backspacing; only for a proven-empty pre-write.
 
-        Returns (True, ...) when the empty composer was confirmed,
-        (False, ...) when recovery is hopeless, (None, ...) when fresh spans
-        allow exact deletion to resume.
+        Returns (outcome, state, spans, why) where outcome is True when the
+        empty composer was confirmed, False when recovery is hopeless, None
+        when fresh spans allow exact deletion to resume; why explains False.
         """
         if profile.agent != "opencode" or initial[0] != "":
-            return False, state, spans
+            return False, state, spans, ""
         # Blind backspacing assumes every visible character is ours. A draft
         # that is not a tail of the owned text means foreign content shares
         # the composer (a mis-parse or user input); refuse to delete it.
         flat_content = (state[0] or "").replace("\n", "")
         flat_owned = owned_text.replace("\n", "")
         if not flat_owned.endswith(flat_content):
-            return False, state, spans
+            return False, state, spans, (
+                "visible text is not a confirmed tail of the sent text; "
+                "blind deletion refused"
+            )
         for _ in range(3):
             type_text(sid, profile, "\x7f" * (len(owned_text) + 8), window)
             settled = wait_for_cleanup_state(
@@ -1317,30 +1357,37 @@ def clear_composer(
                 window,
             )
             if settled is None:
-                return False, state, spans
+                return False, state, spans, (
+                    "blind backspace batch never reached a stable state"
+                )
             state, spans = settled
             if composer_is_clear(profile, state):
-                return True, state, spans
+                return True, state, spans, ""
             if spans:
-                return None, state, spans
-        return False, state, spans
+                return None, state, spans, ""
+        return False, state, spans, "blind recovery did not confirm an empty composer"
 
-    for _ in range(12):
+    # Each confirmed round deletes at most TYPE_CHUNK_BYTES characters, so a
+    # fixed round budget abandoned long drafts mid-way; scale it with length.
+    max_rounds = 12
+    if owned_text:
+        max_rounds = max(12, -(-len(owned_text) // TYPE_CHUNK_BYTES) + 4)
+    for _ in range(max_rounds):
         if state == initial or composer_is_clear(profile, state):
             return True
         if not spans:
-            outcome, state, spans = blind_recovery(state, spans)
+            outcome, state, spans, why = blind_recovery(state, spans)
             if outcome is True:
                 return True
             if outcome is None:
                 continue
-            return False
+            return fail(why or "cleanup made no confirmed progress")
         previous_end = max(end for _, end in spans)
         delete_count = min(
             TYPE_CHUNK_BYTES, min(end - start for start, end in spans)
         )
         if not delete_count:
-            return False
+            return fail("no confirmed owned span to delete")
         type_text(sid, profile, "\x7f" * delete_count, window)
         next_ends = {
             candidate
@@ -1351,7 +1398,7 @@ def clear_composer(
             sid, profile, state, owned_text, next_ends, window
         )
         if settled is None:
-            return False
+            return fail("no stable state after a backspace batch")
         state, spans = settled
         if composer_is_clear(profile, state):
             return True
@@ -1359,14 +1406,16 @@ def clear_composer(
             # Nothing left to match, or exact deletion stalled on a long
             # corrupted draft; a proven-empty pre-write makes every remaining
             # character ours, corrupted or not.
-            outcome, state, spans = blind_recovery(state, spans)
+            outcome, state, spans, why = blind_recovery(state, spans)
             if outcome is True:
                 return True
             if outcome is None:
                 continue
-            return False
+            return fail(why or "cleanup stalled without confirmed progress")
         allowed_ends = {end for _, end in spans}
-    return False
+    return fail(
+        f"deletion rounds exhausted ({max_rounds}); part of the draft may remain"
+    )
 
 
 def wait_for_accepted(
@@ -1425,9 +1474,10 @@ def raise_after_composer_dirty(
     window: str | None = None,
 ) -> None:
     """Attempt guarded cleanup, then raise with the resulting composer state."""
+    reason: list[str] = []
     try:
         cleared = clear_composer(
-            sid, profile, initial, dirty.owned_text, window
+            sid, profile, initial, dirty.owned_text, window, reason
         )
     except KeyboardInterrupt as cleanup_err:
         raise KeyboardInterrupt(
@@ -1436,6 +1486,8 @@ def raise_after_composer_dirty(
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
         cleared = False
     detail = "composer cleared" if cleared else "composer cleanup failed"
+    if not cleared and reason:
+        detail += f" ({'; '.join(reason)})"
     if dirty.interrupted:
         raise KeyboardInterrupt(f"{dirty}; {detail}") from dirty
     raise ComposerDirty(f"{dirty}; {detail}", dirty.owned_text) from dirty
