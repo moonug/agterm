@@ -6,6 +6,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+os.environ["PEER_CHAT_CONFIG"] = os.path.join(HERE, "fixtures", "peer-chat.json")
 source = os.path.join(HERE, "peer-chat.py")
 if not os.path.exists(source):
     source = os.path.join(os.path.expanduser("~/bin"), "peer-chat.py")
