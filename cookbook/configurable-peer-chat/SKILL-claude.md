@@ -27,10 +27,23 @@ other pane does not run the peer, say so and stop.
 ## Sending
 
 ```bash
-peer-chat.py --to codex --stdin <<'CHAT'
+peer-chat.py --to codex --defer --stdin <<'CHAT'
 the message goes here, as one paragraph
 CHAT
 ```
+
+A successful send prints a JSON receipt with `"queued"`, a message `id` and a
+deadline. `queued` means the message is stored and a short-lived worker will
+type it into the peer's composer as soon as that pane is confirmably ready for
+input — including right after the user answers a permission dialog there. It
+does not mean the peer has read the message or will answer. Report that the
+message is queued, then move on; do not watch the pane and do not poll — run
+`peer-chat.py --queue-status <id>` once if a status is genuinely needed, and
+`--queue-cancel <id>` if the message must not be delivered after all.
+
+If the command refuses because this agterm lacks the pane-id capability
+(`--defer requires agterm with the session.type.pane-id capability`), repeat
+the same send without `--defer`: the direct path below is unchanged.
 
 `--to` takes the peer name the user used: `claude-zai`, `claude-minimax`, `claude`, `codex`, or
 `opencode`. Pass the message on stdin through a quoted heredoc, never as an argument. The script
@@ -40,6 +53,10 @@ fragment before it, so write for one paragraph.
 The script finds the peer pane on its own; the pane side (left or right) does not matter. When
 both panes run the same command it targets the pane opposite to yours. If it still asks for a
 pane, add `--pane left|right` as it instructs.
+
+A deferred message is pinned to the exact pane observed at send time. If that pane is replaced,
+the split is closed, or agterm restarts before delivery, the record is cancelled or fails — it is
+never retargeted to whatever appears in its place. Say so and let the user decide about resending.
 
 Before typing, the script confirms the target pane really is running the peer, matching what
 agterm reports for that pane. If the peer runs through a wrapper or an alias, the visible process
@@ -57,7 +74,7 @@ Add `--queue` only when the target is `codex` and the message is an informationa
 no action before Codex's current turn ends. It changes Return to Tab for that send:
 
 ```bash
-peer-chat.py --to codex --queue --stdin <<'CHAT'
+peer-chat.py --to codex --queue --defer --stdin <<'CHAT'
 the background check finished; no action is needed in this turn
 CHAT
 ```
@@ -117,9 +134,15 @@ Never answer anything on the user's behalf: not a chooser entry, not a trust pro
 permission or approval request, not a warning. Those answers carry the user's authority and are his
 to give.
 
-If the refusal says `target has a pending permission dialog` — the target pane has an unanswered permission prompt. Do not retry: tell the user to answer that dialog in the target pane, and resend only after it is gone. Never answer a permission prompt yourself, and never resend blind after a dialog refusal.
+A deferred send whose target pane shows a permission dialog stays queued until the user answers
+that dialog in the target pane. Tell the user once which pane needs his answer; never answer a
+prompt there yourself, and never resend the queued message — the queue delivers it as soon as the
+pane is ready. A direct (non-deferred) send refuses immediately with
+`target has a pending permission dialog`; do not retry it, and never resend blind after that
+refusal. A record reported as `uncertain` by `--queue-status` may or may not have been submitted:
+read the target pane before doing anything.
 
-If the refusal says `target composer is collapsed (agent busy thinking)` — the peer is mid-thought and its input area is temporarily hidden; the default retries will ride it out, so simply let them run.
+If the refusal says `target composer is collapsed (agent busy thinking)` — the peer is mid-thought and its input area is temporarily hidden; a deferred send simply waits it out, and the default retries ride it out in direct mode.
 
 If the script reports a pre-write refusal, nothing was written. After a body verification failure,
 `composer cleared` means its backspaces restored the empty prompt; `composer cleanup failed` means

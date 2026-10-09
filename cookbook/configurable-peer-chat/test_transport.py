@@ -8,6 +8,7 @@ any live agterm pane. Any attempt to reach the real CLI fails the test.
 """
 
 import importlib.util
+import json
 import os
 import sys
 import textwrap
@@ -22,6 +23,13 @@ spec = importlib.util.spec_from_file_location("peer_chat", SOURCE)
 pc = importlib.util.module_from_spec(spec)
 sys.modules["peer_chat"] = pc
 spec.loader.exec_module(pc)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def fixture_text(name: str) -> str:
+    with open(os.path.join(HERE, "fixtures", name), encoding="utf-8") as fh:
+        return fh.read()
 
 PANE_WIDTH = 104
 VISIBLE_ROWS = 6
@@ -179,13 +187,13 @@ class SendScenarios(unittest.TestCase):
     def test_unconfirmable_last_chunk_cleans_and_refuses(self):
         message = long_message(4000)
         pane = FakePane(cap=3900)  # the true tail can never land
-        with Harness(pane):
-            with self.assertRaises(pc.ComposerDirty) as ctx:
-                pc.send_with_retry("sid", opencode_profile(), message)
+        with Harness(pane), self.assertRaises(pc.ComposerDirty) as ctx:
+            pc.send_with_retry("sid", opencode_profile(), message)
         err = str(ctx.exception)
         self.assertIn("composer cleared", err)
         self.assertNotIn("cleanup failed", err)
         self.assertNotIn("КВИНТЭССЕНЦИЯ", err)
+        self.assertTrue(ctx.exception.cleared)
         self.assertEqual(pane.submit_count, 0)
         self.assertEqual(pane.text, "")
 
@@ -232,13 +240,13 @@ class SendScenarios(unittest.TestCase):
                 pane.text += foreign
 
         pane.type = injecting_type
-        with Harness(pane):
-            with self.assertRaises(pc.ComposerDirty) as ctx:
-                pc.send_with_retry("sid", opencode_profile(), message)
+        with Harness(pane), self.assertRaises(pc.ComposerDirty) as ctx:
+            pc.send_with_retry("sid", opencode_profile(), message)
         err = str(ctx.exception)
         self.assertIn("cleanup failed", err)
         self.assertIn("blind deletion refused", err)
         self.assertNotIn("КВИНТЭССЕНЦИЯ", err)
+        self.assertFalse(ctx.exception.cleared)
         self.assertEqual(pane.submit_count, 0)
         # Nothing is deleted: the composer still holds the owned prefix and
         # the foreign text, so the user can read what happened in the pane.
@@ -248,23 +256,203 @@ class SendScenarios(unittest.TestCase):
     def test_ambiguous_submit_is_not_retried(self):
         message = long_message(800)
         pane = FakePane(accept_submit=False)
-        with Harness(pane):
-            with self.assertRaises(pc.DeliveryAmbiguous) as ctx:
-                pc.send_with_retry("sid", opencode_profile(), message)
+        with Harness(pane), self.assertRaises(pc.DeliveryAmbiguous) as ctx:
+            pc.send_with_retry("sid", opencode_profile(), message)
         self.assertIn("do not resend", str(ctx.exception))
         self.assertEqual(pane.submit_count, 1)
 
     def test_diag_reports_sizes_without_message_text(self):
         message = long_message(4000)
         pane = FakePane(cap=3900)
-        with Harness(pane):
-            with self.assertRaises(pc.ComposerDirty) as ctx:
-                pc.send_with_retry("sid", opencode_profile(), message)
+        with Harness(pane), self.assertRaises(pc.ComposerDirty) as ctx:
+            pc.send_with_retry("sid", opencode_profile(), message)
         err = str(ctx.exception)
         self.assertRegex(err, r"chunk \d+/\d+ was typed")
         self.assertIn("expected ~", err)
         self.assertIn("chars in 6 rows", err)
         self.assertNotIn("КВИНТЭССЕНЦИЯ", err)
+        # every attempt cleans up provably, so even the final refusal is a
+        # confirmed-clear result
+        self.assertTrue(ctx.exception.cleared)
+
+
+class PreWriteRefusals(unittest.TestCase):
+    """Occupied or unrecognisable targets must refuse before any event."""
+
+    def test_permission_dialog_blocks_before_any_event(self):
+        pane = FakePane()
+        pane.render = lambda: fixture_text("opencode-permission-dialog.txt")
+        with Harness(pane), self.assertRaises(pc.PromptBlocked) as ctx:
+            pc.send_with_retry("sid", opencode_profile(), "ping")
+        self.assertEqual(ctx.exception.reason, "permission_dialog")
+        self.assertEqual(pane.events, [])
+        self.assertEqual(pane.submit_count, 0)
+        self.assertIn("nothing was typed", str(ctx.exception))
+
+    def test_foreign_draft_blocks_before_any_event(self):
+        pane = FakePane(text="черновик пользователя в панели")
+        with Harness(pane), self.assertRaises(pc.PromptBlocked) as ctx:
+            pc.send_with_retry("sid", opencode_profile(), "ping")
+        self.assertEqual(ctx.exception.reason, "composer_not_empty")
+        self.assertEqual(pane.events, [])
+        self.assertEqual(pane.submit_count, 0)
+
+
+class CtlWorld:
+    """A ctl-level fake: tree, text, cursor and type over one pane model."""
+
+    def __init__(self, info, socket="/fake/agterm.sock", fingerprint=(1, 2, 3)):
+        self.info = info
+        self.socket = socket
+        self.fingerprint = fingerprint
+        self.buffer = ""
+        self.type_events = []
+        self.submit_count = 0
+        self.accept_submit = True
+        self.armed_swap = False
+
+    PANE_WIDTH = 104
+
+    def render(self) -> str:
+        shown = wrap_rows(self.buffer)[-VISIBLE_ROWS:]
+        box = [f"  ┃  {row}" for row in shown]
+        box += ["  ┃", "  ┃  Build · Test · high", "  ╹" + "▀" * 70]
+        return "\n".join(box)
+
+    def ctl(self, *args, input_text=None):
+        if args[:2] == ("tree", "--json"):
+            payload = {"result": {"tree": {"workspaces": [{"sessions": [self.info]}]}}}
+            return json.dumps(payload)
+        if args[:2] == ("session", "text"):
+            return self.render()
+        if args[:2] == ("surface", "cursor"):
+            return "2\n"
+        if args[:2] == ("session", "type"):
+            assert os.environ.get("PEER_CHAT_SOCKET") == self.socket, (
+                "pinned sends must run with the pinned socket env"
+            )
+            assert os.environ.get("AGTERMCTL") == "agtermctl-under-test"
+            self.type_events.append((args, input_text))
+            if input_text == "\n":
+                self.submit_count += 1
+                if self.accept_submit:
+                    self.buffer = ""
+                return "ok"
+            if set(input_text) == {"\x7f"}:
+                self.buffer = self.buffer[: -len(input_text)]
+                return "ok"
+            self.buffer += input_text
+            if self.armed_swap:
+                self.armed_swap = False
+                self.fingerprint = (9, 9, 9)
+            return "ok"
+        raise AssertionError(f"unexpected ctl call: {args!r}")
+
+    def fake_fingerprint(self, path):
+        assert path == self.socket, f"fingerprint probed the wrong socket: {path}"
+        return self.fingerprint
+
+    def pinned_profile(self):
+        return pc.Profile(
+            agent="opencode",
+            command="opencode",
+            label="",
+            submit="\n",
+            pane="left",
+            window="win",
+            session="sid",
+            pane_id=self.info["paneID"],
+            socket=self.socket,
+            socket_fingerprint=self.fingerprint,
+        )
+
+
+class PinnedDelivery(unittest.TestCase):
+    """Deferred sends stay bound to the pane they were queued against."""
+
+    def info(self, pane_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"):
+        return {
+            "id": "sid",
+            "hasSplit": True,
+            "foreground": ["opencode"],
+            "splitForeground": ["zsh"],
+            "paneID": pane_id,
+            "splitPaneID": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        }
+
+    def run_pinned(self, world, message):
+        env = {
+            "AGTERMCTL": "agtermctl-under-test",
+            "PEER_CHAT_SOCKET": world.socket,
+        }
+        with patch.dict(pc.__dict__, {
+            "ctl": world.ctl,
+            "socket_fingerprint": world.fake_fingerprint,
+            "time": FakeTime(),
+        }), patch.dict(os.environ, env):
+            return pc.send_with_retry(
+                "sid", world.pinned_profile(), message, window="win"
+            )
+
+    def test_type_events_carry_pane_id_and_socket(self):
+        world = CtlWorld(self.info())
+        sent = self.run_pinned(world, "ping from the deferred queue")
+        self.assertEqual(sent, len("ping from the deferred queue"))
+        self.assertGreaterEqual(len(world.type_events), 3)
+        for args, part in world.type_events:
+            self.assertIn("--pane-id", args)
+            self.assertEqual(args[args.index("--pane-id") + 1], world.info["paneID"])
+        self.assertEqual(world.submit_count, 1)
+        self.assertEqual(world.buffer, "")
+
+    def run_pinned_env(self):
+        return {
+            "AGTERMCTL": "agtermctl-under-test",
+            "PEER_CHAT_SOCKET": "/fake/agterm.sock",
+        }
+
+    def test_socket_replacement_blocks_mid_body(self):
+        world = CtlWorld(self.info())
+        world.armed_swap = True  # the server restarts after the first event
+        with self.assertRaises(pc.PromptBlocked) as ctx:
+            self.run_pinned(world, long_message(600))
+        self.assertEqual(ctx.exception.reason, "socket_replaced")
+        self.assertEqual(len(world.type_events), 1)
+        self.assertEqual(world.submit_count, 0)
+
+    def test_pane_id_mismatch_refuses_before_any_event(self):
+        world = CtlWorld(self.info())
+        profile = world.pinned_profile()
+        profile.pane_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        env = self.run_pinned_env()
+        with patch.dict(pc.__dict__, {
+            "ctl": world.ctl,
+            "socket_fingerprint": world.fake_fingerprint,
+            "time": FakeTime(),
+        }), patch.dict(os.environ, env), self.assertRaises(pc.PromptBlocked) as ctx:
+            pc.send_with_retry("sid", profile, "ping", window="win")
+        self.assertEqual(ctx.exception.reason, "pane_replaced")
+        self.assertEqual(world.type_events, [])
+        self.assertEqual(world.submit_count, 0)
+
+    def test_vanished_session_refuses_before_any_event(self):
+        world = CtlWorld(self.info())
+        profile = world.pinned_profile()
+
+        def no_session(sid, window=None):
+            raise RuntimeError("no such session: sid")
+
+        env = self.run_pinned_env()
+        with patch.dict(pc.__dict__, {
+            "ctl": world.ctl,
+            "socket_fingerprint": world.fake_fingerprint,
+            "find_node": no_session,
+            "time": FakeTime(),
+        }), patch.dict(os.environ, env), self.assertRaises(RuntimeError) as ctx:
+            pc.send_with_retry("sid", profile, "ping", window="win")
+        self.assertIn("nothing was typed", str(ctx.exception))
+        self.assertEqual(world.type_events, [])
+        self.assertEqual(world.submit_count, 0)
 
 
 if __name__ == "__main__":

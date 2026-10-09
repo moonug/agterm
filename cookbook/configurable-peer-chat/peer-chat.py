@@ -4,15 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import re
+import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unicodedata
+import uuid as uuid_module
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import partial
@@ -92,8 +97,12 @@ OPENCODE_PLACEHOLDER_RE = re.compile(r'^Ask (?:anything|Codex)[….]?( "[^"]+")?
 OPENCODE_PATH_HINT_RE = re.compile(r"^[~/]\S*$")
 OPENCODE_GLYPH_ROWS = {"*"}
 # A pending permission dialog replaces the input area entirely; typing into it
-# (or pressing its confirm key) would answer for the user.
+# (or pressing its confirm key) would answer for the user. The bare phrase is
+# only a signal: the live modal is confirmed by its choice row inside the same
+# composer block (see opencode_permission_dialog), so a transcript quote of an
+# old dialog above a live input area does not block sends.
 OPENCODE_DIALOG_RE = re.compile(r"△ Permission required|Allow once\s+Allow always")
+OPENCODE_DIALOG_SCAN_ROWS = 24
 # While the agent is thinking, the input area and status row collapse and only
 # the bottom border remains above the footer. The state is transient.
 OPENCODE_TYPE_SLICE = 24
@@ -110,13 +119,25 @@ DEFAULT_CONFIG_PATH = Path.home() / ".config" / "agterm" / "peer-chat.json"
 @dataclass
 class Profile:
     """One configured agent. `agent` is the composer kind; `pane` is resolved
-    against the live tree by require_target and None until then."""
+    against the live tree by require_target and None until then.
+
+    The pin fields bind deferred delivery to the exact destination observed
+    when the message was queued: the owning window and session, the pane side
+    with its stable pane-id token, the control socket path and its filesystem
+    fingerprint, and the agtermctl binary to drive them with. A synchronous
+    send leaves them None and resolves everything live, as before."""
 
     agent: str
     command: str
     label: str
     submit: str
     pane: str | None = None
+    window: str | None = None
+    session: str | None = None
+    pane_id: str | None = None
+    socket: str | None = None
+    socket_fingerprint: tuple[int, int, int] | None = None
+    agtermctl: str | None = None
 
 
 def load_agents() -> dict[str, dict[str, str]]:
@@ -158,28 +179,61 @@ PROFILES_REMOVED = None
 
 
 class PromptBlocked(RuntimeError):
-    """The target prompt is occupied before any text was written."""
+    """The target prompt is occupied before any text was written.
+
+    `reason` is the machine-readable cause for callers that must distinguish
+    states (a permission dialog is final, a transient redraw is retryable);
+    the message text stays human-oriented.
+    """
+
+    def __init__(self, message: str, reason: str = "blocked") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class ComposerDirty(RuntimeError):
-    """A body write started but could not be verified before submission."""
+    """A body write started but could not be verified before submission.
+
+    `cleared` records that guarded cleanup provably restored the confirmed
+    empty pre-write state, so a caller may retry safely without parsing the
+    message text.
+    """
 
     def __init__(
-        self, message: str, owned_text: str, interrupted: bool = False
+        self,
+        message: str,
+        owned_text: str,
+        interrupted: bool = False,
+        cleared: bool = False,
     ) -> None:
         super().__init__(message)
         self.owned_text = owned_text
         self.interrupted = interrupted
+        self.cleared = cleared
 
 
 class DeliveryAmbiguous(RuntimeError):
     """Submission may have started, so the caller must not resend."""
 
 
+# PromptBlocked reasons that are final for any retry loop: the destination a
+# send was pinned to no longer exists in the form it was pinned to.
+IDENTITY_BLOCK_REASONS = frozenset(
+    {"socket_gone", "socket_replaced", "pane_gone", "pane_changed", "pane_replaced"}
+)
+
+
 def ctl(*args: str, input_text: str | None = None) -> str:
     command = os.environ.get("AGTERMCTL", "agtermctl")
+    call = [command, *args]
+    # A queue worker must reach the exact server its records were pinned to,
+    # not whatever instance the default rendezvous finds later; the pinning
+    # environment is set by the worker itself, never inherited from a sender.
+    pinned_socket = os.environ.get("PEER_CHAT_SOCKET")
+    if pinned_socket:
+        call += ["--socket", pinned_socket]
     result = subprocess.run(
-        [command, *args],
+        call,
         capture_output=True,
         check=False,
         input=input_text,
@@ -392,7 +446,7 @@ def resolve_pane(info: dict[str, Any], profile: Profile) -> str:
 def require_target(
     sid: str, profile: Profile, window: str | None = None
 ) -> str:
-    info = find_node(sid, window)
+    info = find_node(sid, pinned_window(profile, window))
     if not info.get("hasSplit"):
         raise RuntimeError(f"session {sid} has no split")
     if profile.pane is None:
@@ -477,6 +531,63 @@ def resolve_target(
     return window, sid
 
 
+def pinned_window(profile: Profile, window: str | None) -> str | None:
+    """The explicit window, or the pinned one for a deferred delivery."""
+    return window if window is not None else profile.window
+
+
+def socket_fingerprint(path: str) -> tuple[int, int, int]:
+    """Filesystem identity of the control socket: device, inode, ctime."""
+    info = os.stat(path)
+    return (info.st_dev, info.st_ino, info.st_ctime_ns)
+
+
+def verify_pinned_identity(
+    sid: str, profile: Profile, window: str | None = None
+) -> None:
+    """Re-check a pinned destination right before a typed event.
+
+    Raises PromptBlocked when the socket was replaced, the session or split
+    is gone, the pane side changed, or the pane-id token no longer matches.
+    A deferred send must land in the pane that was observed when the message
+    was queued — never in whatever later occupies the same side.
+    """
+    if profile.pane_id is None and profile.socket_fingerprint is None:
+        return
+    if profile.socket_fingerprint is not None and profile.socket:
+        try:
+            current = socket_fingerprint(profile.socket)
+        except OSError as err:
+            raise PromptBlocked(
+                "target control socket is gone; delivery cancelled",
+                "socket_gone",
+            ) from err
+        if current != profile.socket_fingerprint:
+            raise PromptBlocked(
+                "target control socket was replaced (agterm restarted); "
+                "delivery cancelled",
+                "socket_replaced",
+            )
+    info = find_node(sid, pinned_window(profile, window))
+    if not info.get("hasSplit"):
+        raise PromptBlocked(
+            "target split no longer exists; delivery cancelled", "pane_gone"
+        )
+    pane = profile.pane
+    if pane not in pane_candidates(info, profile):
+        raise PromptBlocked(
+            f"target pane {pane} no longer runs {profile.command!r}; "
+            "delivery cancelled",
+            "pane_changed",
+        )
+    token = info.get("paneID") if pane == "left" else info.get("splitPaneID")
+    if profile.pane_id and token != profile.pane_id:
+        raise PromptBlocked(
+            "target pane was replaced (pane-id changed); delivery cancelled",
+            "pane_replaced",
+        )
+
+
 def pane_text(
     sid: str, profile: Profile, window: str | None = None
 ) -> str:
@@ -496,7 +607,7 @@ def _pane_text_unchecked(
         sid,
         "--lines",
         str(BOX_LINES),
-        *window_option(window),
+        *window_option(pinned_window(profile, window)),
     )
 
 
@@ -517,7 +628,7 @@ def _cursor_column_unchecked(
         "cursor",
         "--target",
         f"surface:{sid}:{profile.pane}",
-        *window_option(window),
+        *window_option(pinned_window(profile, window)),
     ).strip()
     try:
         return int(value)
@@ -528,9 +639,16 @@ def _cursor_column_unchecked(
 def type_text(
     sid: str, profile: Profile, text: str, window: str | None = None
 ) -> None:
+    # A pinned (deferred) delivery re-proves the destination before every
+    # event: verification between chunks is worthless if the pane can be
+    # swapped in between two of them.
+    verify_pinned_identity(sid, profile, window)
     require_target(sid, profile, window)
 
     def event(part: str) -> None:
+        pinned = (
+            ("--pane-id", profile.pane_id) if profile.pane_id else ()
+        )
         ctl(
             "session",
             "type",
@@ -539,7 +657,8 @@ def type_text(
             profile.pane,
             "--target",
             sid,
-            *window_option(window),
+            *pinned,
+            *window_option(pinned_window(profile, window)),
             input_text=part,
         )
 
@@ -555,6 +674,7 @@ def type_text(
         and text.strip("\x7f")
     ):
         for index in range(0, len(text), OPENCODE_TYPE_SLICE):
+            verify_pinned_identity(sid, profile, window)
             event(text[index : index + OPENCODE_TYPE_SLICE])
             time.sleep(OPENCODE_TYPE_PAUSE)
         return
@@ -785,6 +905,74 @@ def opencode_composer_has_input_area(text: str) -> bool:
     return state is not None and saw_input
 
 
+def opencode_box_rows(pane: str) -> list[str] | None:
+    """Raw bordered rows of the composer box, top-most first; None when the
+    capture shows no bottom border (the box cannot be located)."""
+    lines = opencode_unflatten(pane)[-BOX_LINES:]
+    bottom = next(
+        (
+            index
+            for index in range(len(lines) - 1, -1, -1)
+            if OPENCODE_BOTTOM_RE.match(lines[index])
+        ),
+        None,
+    )
+    if bottom is None:
+        return None
+    rows: list[str] = []
+    for index in range(bottom - 1, -1, -1):
+        row = opencode_inner_text(lines[index])
+        if row is None:
+            break
+        rows.append(row)
+        if len(rows) >= OPENCODE_DIALOG_SCAN_ROWS:
+            break
+    rows.reverse()
+    return rows
+
+
+def opencode_dialog_rows_signal(rows: list[str]) -> bool:
+    """Signal phrase and choice row together in the given raw rows.
+
+    The phrase alone is not enough — a draft or transcript may quote it — so
+    the modal counts only when its choice row (Allow once / Allow always /
+    Reject) sits among the same rows.
+    """
+    texts = []
+    for row in rows:
+        inner = opencode_inner_text(row)
+        texts.append(inner if inner is not None else row.strip())
+    has_signal = any(OPENCODE_DIALOG_RE.search(text) for text in texts)
+    has_choice = any("Allow" in text and "Reject" in text for text in texts)
+    return has_signal and has_choice
+
+
+def opencode_permission_dialog(pane: str) -> bool:
+    """A live permission modal, judged structurally instead of pane-wide.
+
+    With a recognisable composer box, only rows inside the box are judged, so
+    a transcript quote of an old dialog above a live input area never blocks
+    a send. When no bottom border exists at all, the box is gone — the one
+    live state that removes it is a dialog filling the pane — and the bottom
+    tail is judged directly. Everything else falls through to the ordinary
+    readiness gates, which fail closed.
+    """
+    rows = opencode_box_rows(pane)
+    if rows is not None:
+        return opencode_dialog_rows_signal(rows)
+    tail = opencode_unflatten(pane)[-OPENCODE_DIALOG_SCAN_ROWS:]
+    return opencode_dialog_rows_signal(tail)
+
+
+def active_modal(profile: Profile, pane: str) -> bool:
+    """Whether the captured pane shows a live permission modal."""
+    if profile.agent == "opencode":
+        return opencode_permission_dialog(pane)
+    if profile.agent == "claude":
+        return claude_permission_dialog(pane)
+    return False
+
+
 def live_prompt_text(profile: Profile, text: str) -> str | None:
     if profile.agent == "codex":
         return codex_live_prompt_text(text)
@@ -850,9 +1038,12 @@ def composer_state(
     sid: str, profile: Profile, window: str | None = None
 ) -> tuple[str, int] | None:
     resolved = require_target(sid, profile, window)
-    content = live_prompt_text(
-        profile, _pane_text_unchecked(resolved, profile, window)
-    )
+    pane = _pane_text_unchecked(resolved, profile, window)
+    if active_modal(profile, pane):
+        # A live modal is not a composer state at all: every verification
+        # against it must fail closed rather than try to read a draft.
+        return None
+    content = live_prompt_text(profile, pane)
     if content is None:
         return None
     return content, _cursor_column_unchecked(resolved, profile, window)
@@ -1024,6 +1215,11 @@ def type_body(
                     )
                 progress.owned_text = attempted
             except ComposerDirty:
+                raise
+            except PromptBlocked:
+                # A pinned destination that stopped matching (or a dialog that
+                # appeared mid-send) must surface as the final refusal it is,
+                # not as a retryable body failure.
                 raise
             except (
                 OSError,
@@ -1490,7 +1686,9 @@ def raise_after_composer_dirty(
         detail += f" ({'; '.join(reason)})"
     if dirty.interrupted:
         raise KeyboardInterrupt(f"{dirty}; {detail}") from dirty
-    raise ComposerDirty(f"{dirty}; {detail}", dirty.owned_text) from dirty
+    raise ComposerDirty(
+        f"{dirty}; {detail}", dirty.owned_text, cleared=cleared
+    ) from dirty
 
 
 def claude_permission_dialog(pane: str) -> bool:
@@ -1508,6 +1706,65 @@ def claude_permission_dialog(pane: str) -> bool:
     has_choices = any(is_choice(row) for row in tail)
     has_prompt = any("❯" in row and not is_choice(row) for row in tail)
     return has_choices and not has_prompt
+
+
+def check_composer_ready(
+    sid: str, profile: Profile, window: str | None = None
+) -> tuple[str, int]:
+    """Pre-write readiness gates; returns the confirmed initial state.
+
+    Raises PromptBlocked for every occupied or unrecognisable target state,
+    with a machine-readable `reason` on the exception. Nothing is typed
+    before this returns.
+    """
+    pane = pane_text(sid, profile, window)
+    # Distinct, non-retryable refusals for pending dialogs: typing there
+    # (or landing the confirm key) would answer for the user.
+    if active_modal(profile, pane):
+        raise PromptBlocked(
+            "target has a pending permission dialog; nothing was typed; "
+            "the user must answer it in that pane",
+            "permission_dialog",
+        )
+    empty_text = live_prompt_text(profile, pane)
+    if empty_text is None:
+        raise PromptBlocked(
+            "target composer prompt is not recognisable (shell mode, disabled "
+            "input, a trailing modal or status row, or an unknown prompt glyph); "
+            "nothing was typed",
+            "composer_not_recognisable",
+        )
+    if (
+        profile.agent == "opencode"
+        and empty_text == ""
+        and not opencode_composer_has_input_area(pane)
+    ):
+        raise PromptBlocked(
+            "target composer is collapsed (agent busy thinking); "
+            "nothing was typed",
+            "composer_collapsed",
+        )
+    # Claude's free-form suggestions look like drafts in plain screen text.
+    # opencode renders no fixed prompt column (splash box, status rows), so
+    # its cursor position is not a usable emptiness signal and is skipped.
+    if profile.agent in ("codex", "opencode") and not composer_is_empty(
+        profile, empty_text
+    ):
+        raise PromptBlocked(
+            "target composer contains text; nothing was typed",
+            "composer_not_empty",
+        )
+    column = (
+        EMPTY_CURSOR_COLUMN
+        if profile.agent == "opencode"
+        else cursor_column(sid, profile, window)
+    )
+    if column != EMPTY_CURSOR_COLUMN:
+        raise PromptBlocked(
+            "target composer is not confirmably empty; nothing was typed",
+            "composer_not_confirmed_empty",
+        )
+    return empty_text, column
 
 
 def send(
@@ -1528,53 +1785,8 @@ def send(
     else:
         typed = prepared
     try:
-        pane = pane_text(sid, profile, window)
-        # Distinct, non-retryable refusals for pending dialogs: typing there
-        # (or landing the confirm key) would answer for the user.
-        if profile.agent == "opencode" and OPENCODE_DIALOG_RE.search(pane):
-            raise PromptBlocked(
-                "target has a pending permission dialog; nothing was typed; "
-                "the user must answer it in that pane"
-            )
-        if profile.agent == "claude" and claude_permission_dialog(pane):
-            raise PromptBlocked(
-                "target has a pending permission dialog; nothing was typed; "
-                "the user must answer it in that pane"
-            )
-        empty_text = live_prompt_text(profile, pane)
-        if empty_text is None:
-            raise PromptBlocked(
-                "target composer prompt is not recognisable (shell mode, disabled "
-                "input, a trailing modal or status row, or an unknown prompt glyph); "
-                "nothing was typed"
-            )
-        if (
-            profile.agent == "opencode"
-            and empty_text == ""
-            and not opencode_composer_has_input_area(pane)
-        ):
-            raise PromptBlocked(
-                "target composer is collapsed (agent busy thinking); "
-                "nothing was typed"
-            )
-        # Claude's free-form suggestions look like drafts in plain screen text.
-        # opencode renders no fixed prompt column (splash box, status rows), so
-        # its cursor position is not a usable emptiness signal and is skipped.
-        if profile.agent in ("codex", "opencode") and not composer_is_empty(
-            profile, empty_text
-        ):
-            raise PromptBlocked(
-                "target composer contains text; nothing was typed"
-            )
-        column = (
-            EMPTY_CURSOR_COLUMN
-            if profile.agent == "opencode"
-            else cursor_column(sid, profile, window)
-        )
-        if column != EMPTY_CURSOR_COLUMN:
-            raise PromptBlocked(
-                "target composer is not confirmably empty; nothing was typed"
-            )
+        verify_pinned_identity(sid, profile, window)
+        initial = check_composer_ready(sid, profile, window)
     except PromptBlocked:
         raise
     except KeyboardInterrupt as err:
@@ -1586,7 +1798,6 @@ def send(
             f"pre-write check failed; nothing was typed: {err}"
         ) from err
 
-    initial = (empty_text, column)
     if delivery is not None:
         delivery.phase = "started"
     phase = "body"
@@ -1634,6 +1845,10 @@ def send(
             raise_after_composer_dirty(sid, profile, initial, err, window)
         except DeliveryAmbiguous:
             raise
+        except PromptBlocked:
+            # A destination that stopped matching mid-delivery is a final
+            # refusal; cleanup backspaces must not chase the new occupant.
+            raise
         except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as err:
             if phase == "body":
                 dirty = ComposerDirty(
@@ -1647,7 +1862,7 @@ def send(
                 detail = "submit request failed"
             else:
                 detail = "submission confirmation failed"
-            raise RuntimeError(
+            raise DeliveryAmbiguous(
                 f"{detail}; delivery is ambiguous; do not resend: {err}"
             ) from err
     except KeyboardInterrupt as err:
@@ -1691,12 +1906,17 @@ def send_with_retry(
             try:
                 return send(sid, profile, message, window, prepared, delivery)
             except PromptBlocked as err:
-                if "pending permission dialog" in str(err):
+                if err.reason == "permission_dialog":
                     # A dialog needs the user, not another attempt.
+                    raise
+                if err.reason in IDENTITY_BLOCK_REASONS:
+                    # A destination that stopped matching never matches
+                    # again by waiting; retrying would only re-probe a
+                    # pane this send must not touch.
                     raise
                 if attempt == RETRY_ATTEMPTS:
                     raise PromptBlocked(
-                        f"{err} after {RETRY_ATTEMPTS} attempts"
+                        f"{err} after {RETRY_ATTEMPTS} attempts", err.reason
                     ) from err
                 print(
                     f"peer-chat: attempt {attempt}/{RETRY_ATTEMPTS} blocked; "
@@ -1706,12 +1926,16 @@ def send_with_retry(
                 )
                 time.sleep(RETRY_DELAY)
             except ComposerDirty as err:
-                # Submit was withheld, and the cleanup message says the empty
-                # prompt was confirmed restored, so the target is provably back
-                # in its pre-write state and one more full attempt is safe. A
-                # "cleanup failed" result is not provable and still refuses.
-                if "composer cleared" not in str(err) or attempt == RETRY_ATTEMPTS:
+                # Submit was withheld, and the structured flag says guarded
+                # cleanup provably restored the confirmed empty pre-write
+                # state, so the target is provably back where it started and
+                # one more full attempt is safe. An unclearable composer is
+                # not provable and still refuses.
+                if not err.cleared or attempt == RETRY_ATTEMPTS:
                     raise
+                # The send never started, so the delivery state returns to
+                # its pre-write value for the retry.
+                delivery.phase = "not_started"
                 print(
                     f"peer-chat: attempt {attempt}/{RETRY_ATTEMPTS} failed to "
                     f"verify but the composer was restored; retrying in "
@@ -1728,6 +1952,681 @@ def send_with_retry(
                 "nothing was typed"
             ) from wait_err
         raise
+
+
+# --- deferred delivery queue -------------------------------------------------
+#
+# A deferred send is stored in a private SQLite database and delivered by a
+# short-lived worker process that is spawned on demand and exits once the
+# queue holds no pending records. The queue never answers permission dialogs
+# and never waits for a peer's reply: it only waits for the moment when the
+# pinned pane is confirmably ready for input, then runs the ordinary guarded
+# send. Records are pinned to the pane observed at enqueue time (window,
+# session, pane side, pane-id token, socket fingerprint); if any of those
+# stops matching, the record is cancelled instead of retargeted.
+
+QUEUE_DIR_ENV = "PEER_CHAT_QUEUE_DIR"
+DEFAULT_QUEUE_DIR = Path.home() / ".local" / "state" / "agterm" / "peer-chat"
+QUEUE_DB_NAME = "queue.sqlite3"
+COORD_LOCK_NAME = "coord.lock"
+WORKER_LOCK_NAME = "worker.lock"
+WORKER_LOCK_FD_ENV = "PEER_CHAT_WORKER_LOCK_FD"
+WORKER_FLAG = "--queue-worker-run"
+QUEUE_MAX_PENDING = 128
+DEFAULT_TTL_SECONDS = 30 * 60
+MAX_TTL_SECONDS = 24 * 3600
+METADATA_RETENTION_SECONDS = 24 * 3600.0
+PENDING_POLL_SECONDS = 2.0
+ACTIVE_STATUSES = frozenset({"pending", "delivering"})
+TERMINAL_STATUSES = frozenset({"sent", "cancelled", "expired", "failed", "uncertain"})
+PANE_ID_CAPABILITY = "session.type.pane-id"
+
+
+def queue_dir() -> Path:
+    raw = os.environ.get(QUEUE_DIR_ENV)
+    return Path(raw).expanduser() if raw else DEFAULT_QUEUE_DIR
+
+
+def default_socket_path() -> str:
+    """The control socket path, mirroring agtermctl's rendezvous order."""
+    state_dir = os.environ.get("AGTERM_STATE_DIR")
+    if state_dir:
+        return str(Path(state_dir) / "agterm.sock")
+    return str(
+        Path.home() / "Library" / "Application Support" / "agterm" / "agterm.sock"
+    )
+
+
+def guard_private_dir(path: Path, create: bool) -> None:
+    """The queue directory must be a private, unlinked-alias, owned dir."""
+    if create:
+        try:
+            path.mkdir(mode=0o700, parents=True)
+        except FileExistsError:
+            pass
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"queue directory must not be a symlink: {path}")
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError(f"queue directory must be owned by this user: {path}")
+    if info.st_mode & 0o077:
+        raise ValueError(
+            f"queue directory is accessible by other users; run chmod 700 {path}"
+        )
+
+
+def queue_connect(create: bool = False) -> sqlite3.Connection:
+    directory = queue_dir()
+    guard_private_dir(directory, create)
+    db_path = directory / QUEUE_DB_NAME
+    if db_path.exists():
+        db_info = os.lstat(db_path)
+        if stat.S_ISLNK(db_info.st_mode) or not stat.S_ISREG(db_info.st_mode):
+            raise ValueError(f"queue database must be a regular file: {db_path}")
+        if db_info.st_uid != os.getuid():
+            raise ValueError(f"queue database must be owned by this user: {db_path}")
+    old_mask = os.umask(0o077)
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=10.0)
+        os.chmod(str(db_path), 0o600)
+    finally:
+        os.umask(old_mask)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 10000")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS queue (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT UNIQUE NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            deadline REAL NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            source_bytes INTEGER NOT NULL,
+            body TEXT,
+            target_name TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            command TEXT NOT NULL,
+            label TEXT NOT NULL,
+            submit TEXT NOT NULL,
+            window TEXT NOT NULL,
+            session TEXT NOT NULL,
+            pane TEXT NOT NULL,
+            pane_id TEXT NOT NULL,
+            socket TEXT NOT NULL,
+            sock_dev INTEGER NOT NULL,
+            sock_ino INTEGER NOT NULL,
+            sock_ctime INTEGER NOT NULL,
+            agtermctl TEXT NOT NULL,
+            last_block TEXT
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def queue_coord_lock(conn_path: Path):
+    """Short advisory lock serialising enqueue/terminal/exit decisions."""
+
+    class _CoordLock:
+        def __enter__(self):
+            self.fd = os.open(
+                str(conn_path),
+                os.O_CREAT | os.O_RDWR | os.O_CLOEXEC,
+                0o600,
+            )
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            return self
+
+        def __exit__(self, *exc):
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            return False
+
+    return _CoordLock()
+
+
+def coord_lock_path(directory: Path) -> Path:
+    return directory / COORD_LOCK_NAME
+
+
+def purge_terminal_records(conn, now: float) -> None:
+    conn.execute(
+        f"DELETE FROM queue WHERE status IN ({','.join('?' * len(TERMINAL_STATUSES))}) "
+        "AND body IS NULL AND updated_at < ?",
+        (*TERMINAL_STATUSES, now - METADATA_RETENTION_SECONDS),
+    )
+    conn.commit()
+
+
+def queue_record_public(row) -> dict[str, Any]:
+    """Metadata only: never the message body."""
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "deadline": row["deadline"],
+        "attempts": row["attempts"],
+        "source_bytes": row["source_bytes"],
+        "target": row["target_name"],
+        "agent": row["agent"],
+        "pane": row["pane"],
+        "session": row["session"],
+        "last_block": row["last_block"],
+    }
+
+
+def count_active(conn) -> int:
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM queue WHERE status IN ({','.join('?' * len(ACTIVE_STATUSES))})",
+        tuple(ACTIVE_STATUSES),
+    ).fetchone()
+    return int(row["n"])
+
+
+def worker_alive(directory: Path, lock_fd: int | None = None) -> bool:
+    """Probe the worker lifetime lock without taking it for long."""
+    if lock_fd is not None:
+        return True
+    path = directory / WORKER_LOCK_NAME
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def enqueue_message(
+    conn,
+    directory: Path,
+    body: str,
+    profile: Profile,
+    target_name: str,
+    window: str,
+    sid: str,
+    pane_id: str,
+    socket_path: str,
+    fingerprint: tuple[int, int, int],
+    agtermctl_path: str,
+    ttl_seconds: int,
+    delivery_id: str | None,
+) -> tuple[dict[str, Any], str]:
+    """Insert one deferred record; returns (receipt, worker state)."""
+    now = time.time()
+    record_id = delivery_id or str(uuid_module.uuid4())
+    with queue_coord_lock(coord_lock_path(directory)):
+        purge_terminal_records(conn, now)
+        existing = conn.execute(
+            "SELECT * FROM queue WHERE id = ?", (record_id,)
+        ).fetchone()
+        if existing is not None:
+            same = (
+                existing["body"] == body
+                and existing["session"] == sid
+                and existing["pane"] == profile.pane
+            )
+            if not same:
+                raise ValueError(
+                    f"delivery id {record_id} is already used with different "
+                    "content or target"
+                )
+            worker = worker_alive(directory)
+            return queue_record_public(existing), ("running" if worker else "started")
+        if count_active(conn) >= QUEUE_MAX_PENDING:
+            raise RuntimeError(
+                f"deferred queue is full ({QUEUE_MAX_PENDING} active records); "
+                "cancel or wait before queueing more"
+            )
+        conn.execute(
+            """
+            INSERT INTO queue (
+                id, created_at, updated_at, deadline, status, attempts,
+                source_bytes, body, target_name, agent, command, label,
+                submit, window, session, pane, pane_id, socket,
+                sock_dev, sock_ino, sock_ctime, agtermctl, last_block
+            ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                record_id,
+                now,
+                now,
+                now + ttl_seconds,
+                len(body.encode("utf-8")),
+                body,
+                target_name,
+                profile.agent,
+                profile.command,
+                profile.label,
+                profile.submit,
+                window,
+                sid,
+                profile.pane,
+                pane_id,
+                socket_path,
+                fingerprint[0],
+                fingerprint[1],
+                fingerprint[2],
+                agtermctl_path,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM queue WHERE id = ?", (record_id,)
+        ).fetchone()
+        conn.commit()
+        try:
+            worker = ensure_queue_worker(directory)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            # The record is safely stored; delivery starts on a later
+            # enqueue or status call once the spawn problem is fixed.
+            worker = "spawn_failed"
+    return queue_record_public(row), worker
+
+
+def ensure_queue_worker(directory: Path) -> str:
+    """Spawn one detached worker unless the lifetime lock says one runs."""
+    lock_path = directory / WORKER_LOCK_NAME
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "running"
+        script = Path(__file__).resolve()
+        python = sys.executable or "python3"
+        # Forward the whole PEER_CHAT_* namespace (ours: queue dir, config,
+        # test harness hooks — never provider tokens) plus the pinned binary
+        # and socket; everything else starts clean, so session selectors and
+        # credentials from the sender cannot leak into delivery.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key.startswith("PEER_CHAT_")
+        }
+        env.update(
+            {
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "HOME": os.environ.get("HOME", str(Path.home())),
+                "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+                "AGTERMCTL": os.environ.get("AGTERMCTL", "agtermctl"),
+                QUEUE_DIR_ENV: str(directory),
+                WORKER_LOCK_FD_ENV: str(fd),
+            }
+        )
+        env = {key: value for key, value in env.items() if value != ""}
+        subprocess.Popen(
+            [python, str(script), WORKER_FLAG],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            pass_fds=(fd,),
+            cwd="/",
+        )
+        # The child shares the open file description, so the lock survives
+        # this close; a second spawn is refused until the worker exits.
+        return "started"
+    finally:
+        os.close(fd)
+
+
+def target_lock_path(directory: Path, sid: str, pane: str) -> Path:
+    digest = hashlib.sha1(f"{sid}:{pane}".encode()).hexdigest()[:16]
+    return directory / f"target-{digest}.lock"
+
+
+def acquire_target_lock(directory: Path, sid: str, pane: str, blocking: bool):
+    path = target_lock_path(directory, sid, pane)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        fcntl.flock(fd, flags)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def release_target_lock(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+
+
+def guard_sync_target(conn, sid: str, pane: str) -> None:
+    """A synchronous send must not start while deliveries are queued."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM queue WHERE status = 'pending' "
+        "AND session = ? AND pane = ?",
+        (sid, pane),
+    ).fetchone()
+    if int(row["n"]):
+        raise RuntimeError(
+            f"{row['n']} deferred message(s) are queued for this pane; "
+            "deliver them first (--queue-status) or send with --defer"
+        )
+
+
+def resolve_defer_target(
+    args: argparse.Namespace, profile: Profile
+) -> tuple[str, str, str, tuple[int, int, int], str]:
+    """Pin the destination observed right now: pane, token, socket, binary."""
+    window, sid = resolve_target(args.session, args.window, profile)
+    info = find_node(sid, window)
+    if profile.pane is None:
+        profile.pane = resolve_pane(info, profile)
+    token = (
+        info.get("paneID") if profile.pane == "left" else info.get("splitPaneID")
+    )
+    if not token:
+        raise RuntimeError(
+            "target pane has no stable pane-id token; --defer requires agterm "
+            f"with the {PANE_ID_CAPABILITY} capability"
+        )
+    socket_path = os.environ.get("PEER_CHAT_SOCKET") or default_socket_path()
+    fingerprint = socket_fingerprint(socket_path)
+    binary = os.environ.get("AGTERMCTL", "agtermctl")
+    resolved = shutil.which(binary)
+    if not resolved:
+        raise RuntimeError(f"agtermctl binary not found on PATH: {binary!r}")
+    return window, sid, token, fingerprint, resolved
+
+
+def check_defer_capability() -> None:
+    payload = tree()
+    app = (payload.get("result", {}).get("tree") or {}).get("app") or {}
+    capabilities = app.get("capabilities") or []
+    if PANE_ID_CAPABILITY not in capabilities:
+        raise RuntimeError(
+            f"--defer requires agterm with the {PANE_ID_CAPABILITY} capability"
+        )
+
+
+def classify_delivery_error(err: Exception) -> tuple[str, str]:
+    """Map a failed delivery to (status, last_block) without message text."""
+    if isinstance(err, PromptBlocked):
+        if err.reason in IDENTITY_BLOCK_REASONS:
+            return "failed", err.reason
+        return "pending", err.reason
+    if isinstance(err, DeliveryAmbiguous):
+        return "uncertain", "ambiguous_submit"
+    if isinstance(err, ComposerDirty):
+        return "failed", "cleanup_failed"
+    if isinstance(err, KeyboardInterrupt):
+        return "uncertain", "interrupted"
+    return "failed", "delivery_error"
+
+
+def deliver_pending_row(row) -> tuple[str, str]:
+    """One delivery attempt for a claimed row; returns (status, last_block)."""
+    profile = Profile(
+        agent=row["agent"],
+        command=row["command"],
+        label=row["label"],
+        submit=row["submit"],
+        pane=row["pane"],
+        window=row["window"],
+        session=row["session"],
+        pane_id=row["pane_id"],
+        socket=row["socket"],
+        socket_fingerprint=(row["sock_dev"], row["sock_ino"], row["sock_ctime"]),
+        agtermctl=row["agtermctl"],
+    )
+    os.environ["AGTERMCTL"] = row["agtermctl"]
+    os.environ["PEER_CHAT_SOCKET"] = row["socket"]
+    lock_fd = acquire_target_lock(queue_dir(), row["session"], row["pane"], True)
+    try:
+        send_with_retry(
+            row["session"], profile, row["body"], window=row["window"]
+        )
+    except Exception as err:  # classified below; never leaks message text
+        status, block = classify_delivery_error(err)
+        debug_log = os.environ.get("PEER_CHAT_DEBUG_DELIVERY")
+        if debug_log:
+            # Operator-enabled troubleshooting only; never on by default.
+            import traceback
+
+            with open(debug_log, "a", encoding="utf-8") as fh:
+                fh.write(f"--- delivery of {row['id']} -> {status}/{block}\n")
+                traceback.print_exc(file=fh)
+        return status, block
+    finally:
+        release_target_lock(lock_fd)
+    return "sent", ""
+
+
+def run_queue_worker() -> int:
+    """Deliver pending records until the queue holds none; then exit.
+
+    Started only by ensure_queue_worker, which holds the lifetime lock and
+    passes its file descriptor over. A `delivering` row found at startup
+    belonged to a dead worker whose send may have progressed past the submit
+    key: it becomes `uncertain` and is never retried.
+    """
+    directory = queue_dir()
+    guard_private_dir(directory, create=False)
+    lock_fd = int(os.environ[WORKER_LOCK_FD_ENV])
+    conn = queue_connect(create=True)
+    coord = queue_coord_lock(coord_lock_path(directory))
+    with coord:
+        conn.execute(
+            "UPDATE queue SET status = 'uncertain', body = NULL, "
+            "updated_at = ?, last_block = 'worker_died' WHERE status = 'delivering'",
+            (time.time(),),
+        )
+        conn.commit()
+    while True:
+        rows = conn.execute(
+            "SELECT * FROM queue WHERE status = 'pending' ORDER BY seq"
+        ).fetchall()
+        if rows:
+            seen_targets: set[tuple[str, str]] = set()
+            for row in rows:
+                key = (row["session"], row["pane"])
+                if key in seen_targets:
+                    continue
+                seen_targets.add(key)
+                now = time.time()
+                if row["deadline"] < now:
+                    with coord:
+                        conn.execute(
+                            "UPDATE queue SET status = 'expired', body = NULL, "
+                            "updated_at = ? WHERE id = ? AND status = 'pending'",
+                            (now, row["id"]),
+                        )
+                        conn.commit()
+                    continue
+                with coord:
+                    claimed = conn.execute(
+                        "UPDATE queue SET status = 'delivering', "
+                        "updated_at = ?, attempts = attempts + 1 "
+                        "WHERE id = ? AND status = 'pending' RETURNING id",
+                        (now, row["id"]),
+                    ).fetchall()
+                    # The claim must be durable BEFORE any typing starts:
+                    # a worker killed mid-delivery has to leave a `delivering`
+                    # record behind, which the next worker turns into
+                    # `uncertain` instead of typing the message a second time.
+                    conn.commit()
+                if not claimed:
+                    continue
+                status, last_block = deliver_pending_row(row)
+                with coord:
+                    purge_terminal_records(conn, time.time())
+                    if status in TERMINAL_STATUSES:
+                        conn.execute(
+                            "UPDATE queue SET status = ?, body = NULL, "
+                            "updated_at = ?, last_block = ? WHERE id = ?",
+                            (status, time.time(), last_block or None, row["id"]),
+                        )
+                    else:
+                        # A blocked head returns to pending with its body
+                        # intact: the next pass retries the delivery.
+                        conn.execute(
+                            "UPDATE queue SET status = 'pending', "
+                            "updated_at = ?, last_block = ? WHERE id = ?",
+                            (time.time(), last_block or None, row["id"]),
+                        )
+                    conn.commit()
+        # Re-check under the coordination lock so an enqueue racing this
+        # decision is never lost: it either sees the lifetime lock held and
+        # skips spawning, or it inserted before this final count. The
+        # lifetime lock is released inside the same critical section, so a
+        # waiting spawner can never observe a dying worker as "running".
+        exit_now = False
+        with coord:
+            conn.execute(
+                "UPDATE queue SET status = 'expired', body = NULL, "
+                "updated_at = ? WHERE status = 'pending' AND deadline < ?",
+                (time.time(), time.time()),
+            )
+            conn.commit()
+            remaining = conn.execute(
+                f"SELECT COUNT(*) AS n FROM queue WHERE status IN ({','.join('?' * len(ACTIVE_STATUSES))})",
+                tuple(ACTIVE_STATUSES),
+            ).fetchone()
+            if not int(remaining["n"]):
+                os.close(lock_fd)
+                exit_now = True
+        if exit_now:
+            break
+        time.sleep(PENDING_POLL_SECONDS)
+    return 0
+
+
+def queue_status(conn, record_id: str | None) -> Any:
+    directory = queue_dir()
+    now = time.time()
+    with queue_coord_lock(coord_lock_path(directory)):
+        purge_terminal_records(conn, now)
+        conn.commit()
+        if record_id:
+            row = conn.execute(
+                "SELECT * FROM queue WHERE id = ?", (record_id,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"no queued record with id {record_id!r}")
+            result: Any = queue_record_public(row)
+        else:
+            rows = conn.execute(
+                "SELECT * FROM queue ORDER BY status = 'pending' DESC, "
+                "status = 'delivering' DESC, seq"
+            ).fetchall()
+            result = [queue_record_public(row) for row in rows]
+    return {
+        "records": result,
+        "worker": "running" if worker_alive(directory) else "stopped",
+    }
+
+
+def queue_cancel(conn, record_id: str) -> dict[str, Any]:
+    directory = queue_dir()
+    with queue_coord_lock(coord_lock_path(directory)):
+        row = conn.execute(
+            "SELECT * FROM queue WHERE id = ?", (record_id,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"no queued record with id {record_id!r}")
+        if row["status"] != "pending":
+            raise RuntimeError(
+                f"record {record_id} is {row['status']!r}; only pending "
+                "records can be cancelled"
+            )
+        conn.execute(
+            "UPDATE queue SET status = 'cancelled', body = NULL, "
+            "updated_at = ? WHERE id = ?",
+            (time.time(), record_id),
+        )
+        conn.commit()
+    return {"cancelled": record_id}
+
+
+def defer_message(args: argparse.Namespace, profile: Profile) -> int:
+    """Store one message for later delivery and print the queue receipt."""
+    check_defer_capability()
+    window, sid, pane_id, fingerprint, agtermctl_path = resolve_defer_target(
+        args, profile
+    )
+    message = read_message(args.stdin, args.message_file)
+    try:
+        body = normalize(profile, message)
+    except KeyboardInterrupt as err:
+        raise KeyboardInterrupt(
+            "interrupted during message normalisation; nothing was queued"
+        ) from err
+    conn = queue_connect(create=True)
+    try:
+        record, worker = enqueue_message(
+            conn,
+            queue_dir(),
+            body,
+            profile,
+            args.to,
+            window,
+            sid,
+            pane_id,
+            os.environ.get("PEER_CHAT_SOCKET") or default_socket_path(),
+            fingerprint,
+            agtermctl_path,
+            args.ttl,
+            args.delivery_id,
+        )
+    finally:
+        conn.close()
+    if worker == "spawn_failed":
+        print(
+            "peer-chat: queue worker could not be started; the record is "
+            f"stored ({record['id']}) and will be delivered by a later "
+            "enqueue once the spawn problem is fixed",
+            file=sys.stderr,
+            flush=True,
+        )
+    print(
+        json.dumps(
+            {
+                "queued": len(body),
+                "id": record["id"],
+                "deadline": record["deadline"],
+                "worker": worker,
+            }
+        ),
+        flush=True,
+    )
+    return 0
+
+
+def ttl_argument(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError("TTL must be an integer") from err
+    if seconds <= 0 or seconds > MAX_TTL_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"TTL must be between 1 and {MAX_TTL_SECONDS} seconds"
+        )
+    return seconds
+
+
+def delivery_id_argument(value: str) -> str:
+    try:
+        uuid_module.UUID(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError("delivery id must be a UUID") from err
+    return value
 
 
 def message_name(value: str) -> str:
@@ -1873,7 +2772,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="queue a Codex message with Tab instead of steering with Return",
     )
-    source = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument(
+        "--defer",
+        action="store_true",
+        help="store the message in the delivery queue; a short-lived worker "
+        "delivers it when the pinned target pane is ready for input",
+    )
+    parser.add_argument(
+        "--ttl",
+        type=ttl_argument,
+        metavar="SECONDS",
+        help=f"give up deferred delivery after this long (default {DEFAULT_TTL_SECONDS})",
+    )
+    parser.add_argument(
+        "--delivery-id",
+        type=delivery_id_argument,
+        metavar="UUID",
+        help="idempotency key for --defer: repeating the same id with the "
+        "same message returns the original record",
+    )
+    parser.add_argument(
+        "--queue-status",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="ID",
+        help="list queued records, or show one by id",
+    )
+    parser.add_argument(
+        "--queue-cancel",
+        type=selector_argument,
+        metavar="ID",
+        help="cancel one pending queued record by id",
+    )
+    parser.add_argument(
+        WORKER_FLAG,
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    source = parser.add_mutually_exclusive_group(required=False)
     source.add_argument("--stdin", action="store_true")
     source.add_argument(
         "--message-file",
@@ -1888,6 +2825,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="create a private one-shot message file and print its path",
     )
     args = parser.parse_args(argv)
+    queue_read_modes = [
+        bool(args.prepare_message),
+        args.queue_status is not None,
+        bool(args.queue_cancel),
+        args.queue_worker_run,
+    ]
+    if sum(queue_read_modes) > 1:
+        parser.error(
+            "--prepare-message, --queue-status, --queue-cancel and the "
+            "worker mode are mutually exclusive"
+        )
     if args.prepare_message:
         if (
             args.to
@@ -1896,11 +2844,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             or args.target_command
             or args.pane
             or args.queue
+            or args.defer
+            or args.ttl is not None
+            or args.delivery_id
         ):
             parser.error("--prepare-message does not accept target options")
-    elif not args.to:
+        return args
+    if args.queue_worker_run:
+        return args
+    if args.queue_status is not None or args.queue_cancel:
+        if (
+            args.to
+            or args.session
+            or args.window
+            or args.target_command
+            or args.pane
+            or args.queue
+            or args.defer
+            or args.ttl is not None
+            or args.delivery_id
+            or args.stdin
+            or args.message_file
+        ):
+            parser.error(
+                "--queue-status/--queue-cancel do not accept sending options"
+            )
+        return args
+    if args.ttl is not None and not args.defer:
+        parser.error("--ttl is only valid with --defer")
+    if args.delivery_id and not args.defer:
+        parser.error("--delivery-id is only valid with --defer")
+    if args.defer and args.ttl is None:
+        args.ttl = DEFAULT_TTL_SECONDS
+    if not args.to:
         parser.error("--to is required when sending")
-    elif args.queue:
+    if not args.stdin and not args.message_file:
+        parser.error("provide --stdin or --message-file")
+    if args.queue:
         spec = load_agents().get(args.to)
         if spec is not None and spec["kind"] != "codex":
             parser.error("--queue is available only for a codex target")
@@ -1919,12 +2899,47 @@ def run_main(progress: DeliveryProgress) -> int:
         path = prepare_message(args.prepare_message)
         print(json.dumps({"messageFile": str(path)}))
         return 0
+    if args.queue_worker_run:
+        return run_queue_worker()
+    if args.queue_status is not None:
+        conn = queue_connect(create=True)
+        try:
+            print(json.dumps(queue_status(conn, args.queue_status or None)))
+        finally:
+            conn.close()
+        return 0
+    if args.queue_cancel:
+        conn = queue_connect(create=True)
+        try:
+            print(json.dumps(queue_cancel(conn, args.queue_cancel)))
+        finally:
+            conn.close()
+        return 0
     profile = target_profile(
         args.to, args.target_command, args.queue, args.pane
     )
+    if args.defer:
+        return defer_message(args, profile)
     window, sid = resolve_target(args.session, args.window, profile)
-    message = read_message(args.stdin, args.message_file)
-    sent = send_with_retry(sid, profile, message, window, progress)
+    directory = queue_dir()
+    # The target lock needs a private home; the first synchronous send in a
+    # checkout creates it.
+    guard_private_dir(directory, create=True)
+    conn = queue_connect(create=True)
+    try:
+        guard_sync_target(conn, sid, profile.pane)
+    finally:
+        conn.close()
+    lock_fd = acquire_target_lock(directory, sid, profile.pane, blocking=False)
+    if lock_fd is None:
+        raise RuntimeError(
+            "another delivery is in progress for this pane; nothing was typed"
+        )
+    try:
+        message = read_message(args.stdin, args.message_file)
+        sent = send_with_retry(sid, profile, message, window, progress)
+    finally:
+        release_target_lock(lock_fd)
     progress.phase = "confirmed"
     report_success(sent)
     return 0

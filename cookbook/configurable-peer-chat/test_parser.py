@@ -84,6 +84,48 @@ dialog = fixture("opencode-permission-dialog.txt")
 assert pc.OPENCODE_DIALOG_RE.search(dialog) is not None
 assert pc.opencode_live_prompt_text(dialog) is None
 
+# the live-modal detector: signal phrase AND choice row together, judged
+# structurally so transcript quotes above a live box never block a send
+assert pc.opencode_permission_dialog(dialog) is True, (
+    "the captured dialog replaces the composer (no bottom border) and must count"
+)
+bordered_dialog = dialog + (
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+)
+assert pc.opencode_permission_dialog(bordered_dialog) is True
+# a full bordered dialog quote typed INTO the draft is indistinguishable from
+# a live modal, so it fails closed: the send refuses and the pane is read
+draft_quoting_full_dialog = dialog + (
+    "  ┃\n"
+    "  ┃  Build · GPT-6 Astra\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+)
+assert pc.opencode_permission_dialog(draft_quoting_full_dialog) is True
+# transcript rendering is unbordered, so a quoted dialog in an old answer sits
+# outside the box walk and never blocks a live composer
+plain_transcript_quote = (
+    "Previous answer: target showed △ Permission required yesterday.\n"
+    "\n"
+    "  ┃\n"
+    "  ┃  Build · Test · high\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+)
+assert pc.opencode_permission_dialog(plain_transcript_quote) is False
+phrase_only_draft = (
+    "  ┃  the peer wrote: △ Permission required appeared\n"
+    "  ┃\n"
+    "  ┃  Build · GPT-6 Astra\n"
+    "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+)
+assert pc.opencode_permission_dialog(phrase_only_draft) is False, (
+    "the phrase without a choice row is a quote, not a modal"
+)
+# a live dialog stays detected through the modal gate used by composer reads
+oc_prof = pc.Profile(
+    agent="opencode", command="opencode", label="", submit="\n", pane="left"
+)
+assert pc.active_modal(oc_prof, dialog) is True
+
 # collapsed busy: transcript row directly above the status row, no input area
 collapsed = (
     "                                         Thought: Planning the next step\n"
@@ -172,6 +214,27 @@ claude_screen = (
     "  ? for shortcuts"
 )
 expect("claude prompt is read", pc.claude_live_prompt_text(claude_screen), "hello there")
+
+# claude modal detection: numbered transcript rows coexist with the prompt and
+# stay harmless; a chooser with numbered options and no prompt row is a modal
+claude_numbered_transcript = (
+    "1. The 747/3603 error rate is unchanged since the fix\n"
+    "2. Latency improved by 12%\n"
+    "❯ \n"
+    "  ──────────\n"
+    "  ? for shortcuts"
+)
+assert pc.claude_permission_dialog(claude_numbered_transcript) is False
+claude_chooser = (
+    "Needs permission to run Bash\n"
+    "❯ 1. Yes\n"
+    "  2. Yes, and don't ask again this session\n"
+    "  3. No (esc)"
+)
+assert pc.claude_permission_dialog(claude_chooser) is True
+cl_prof = pc.Profile(agent="claude", command="claude", label="", submit="\n")
+assert pc.active_modal(cl_prof, claude_chooser) is True
+assert pc.active_modal(cl_prof, claude_numbered_transcript) is False
 
 claude_profile = pc.Profile(agent="claude", command="claude", label="", submit="\n")
 assert pc.composer_is_empty(claude_profile, "") is True

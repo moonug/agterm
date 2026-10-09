@@ -10,13 +10,14 @@ What this fork adds over the original recipe:
 
 - **Config-driven agents.** `~/.config/agterm/peer-chat.json` maps a name to a composer kind (`claude`, `codex`, `opencode`) and the process name agterm should look for. Wrapper scripts and zsh functions that exec the same binary (claude-zai/claude-minimax all show `claude`) work out of the box.
 - **Any pane layout.** The original pins Claude left and Codex right. Here the target pane is resolved live: the split pane whose foreground runs the peer's command; when both panes run the same command, the pane opposite to the sender (via `AGTERM_PANE`), with `--pane left|right` as an explicit override.
+- **Deferred delivery.** `--defer` stores the message in a private SQLite queue (`~/.local/state/agterm/peer-chat/`) and a short-lived worker types it in when the pinned target pane is confirmably ready — including right after the user answers a permission dialog there. Records are pinned to the observed pane (window, session, pane side, pane-id token, socket fingerprint) and are cancelled instead of retargeted when that pane disappears; a submit that cannot be proven becomes `uncertain` and is never repeated. See `--queue-status`, `--queue-cancel`, `--ttl` (default 30 minutes) and `--delivery-id` for idempotent retries. Requires agterm with the `session.type.pane-id` capability (0.28.0 or later).
 - **opencode support.** A composer parser for opencode's boxed TUI (light/heavy borders, splash and conversation states, status rows, cursor-glyph and cwd decorations). Typing into a redrawing opencode is paced in small slices because single large writes occasionally drop a character; verification catches any loss and refuses to submit.
 - **Recovery.** When verification fails, cleanup restores the empty composer even if the typed text got corrupted (bounded blind backspacing, proven safe because the pre-write composer was confirmed empty), and the send retries — but only after cleanup is confirmed.
 - **Robust long messages.** The suffix check stops as soon as the expected text is fully consumed by the rows below, so drafts taller than the composer (internal scroll) and busy targets with live tool rows above the composer verify correctly.
 
 ## Requirements
 
-- agterm 0.24.0 or later (`surface cursor`). The script refuses to type without it.
+- agterm 0.24.0 or later (`surface cursor`); `--defer` additionally needs the `session.type.pane-id` capability (0.28.0+). The script refuses to type without the former and refuses to defer without the latter.
 - Python 3.10+.
 - At least two agents installed and runnable: Claude Code (or a flavour launched through a wrapper), Codex CLI, and/or opencode.
 - `agtermctl` on your PATH.
@@ -46,21 +47,23 @@ What this fork adds over the original recipe:
 
    Without the injection a replying Codex falls back to matching the git checkout, which refuses when several sessions share it.
 
-5. Self-check: `python3 test_parser.py` in this directory (loads the local `peer-chat.py`, falls back to `~/bin`).
+5. Self-check: `python3 test_parser.py`, `python3 test_transport.py` and `python3 test_queue.py` in this directory (all load the local `peer-chat.py`, falling back to `~/bin`; the queue tests drive a fake `agtermctl` and never touch live panes).
 
 ## Usage
 
 Open a split, start one agent in each pane yourself — the recipe never starts agents, by design. Ask either one to talk to the other ("chat with codex", "work with opencode on this"); the skill fires and the first message goes through the script:
 
 ```sh
-peer-chat.py --to opencode --stdin <<'CHAT'
+peer-chat.py --to opencode --defer --stdin <<'CHAT'
 the message goes here, as one paragraph
 CHAT
 ```
 
-`--to` takes any name from the config. Labels (`Chat from Claude: `, `Chat from Codex: `, `Chat from OpenCode: `) are derived from the sending pane's kind and added by the script; any peer self-label (`Chat from opencode-lead: …`) is stripped first. `--queue` (Tab submit) remains Codex-only. `--prepare-message` / `--message-file` work as in the original recipe.
+A deferred send answers with `{"queued": .., "id": "..", ..}` — stored, to be delivered when the pane is ready, not yet read by the peer. The worker process is spawned on demand and exits once the queue is empty; if it dies mid-send, the affected record becomes `uncertain` and is reported by `--queue-status` instead of being retyped. Without `--defer` the message is delivered synchronously, exactly as before.
 
-The first exchange in each pair stops on an approval prompt in one of the panes — answer it yourself; agents are never allowed to.
+`--to` takes any name from the config. Labels (`Chat from Claude: `, `Chat from Codex: `, `Chat from OpenCode: `) are derived from the sending pane's kind and added by the script; any peer self-label (`Chat from opencode-lead: …`) is stripped first. `--queue` (Tab submit) remains Codex-only and composes with `--defer`. `--prepare-message` / `--message-file` work as in the original recipe.
+
+The first exchange in each pair stops on an approval prompt in one of the panes — answer it yourself; agents are never allowed to. With `--defer` the queued message is delivered right after you do.
 
 ## How it works
 
@@ -76,3 +79,5 @@ When a chunk cannot be verified, the script withholds the submit, restores the e
 - A message that is a lone path (`~/foo`) is indistinguishable from opencode's empty-composer cwd hint and gets filtered; avoid such one-token messages.
 - No transcript: the conversation lives in the two panes. A reply is never promised.
 - Same-kind pairs share one label (`Chat from Claude: ` for claude-zai ↔ claude-minimax); the peer is identified by pane position, not by label.
+- The delivery pin is a terminal pane, not a conversation: a peer that starts a new conversation in the same pane is not detected. Cancel queued records (`--queue-cancel`) before switching the topic in the target pane, and rely on the TTL (default 30 minutes) to retire stale ones.
+- The queue never answers permission dialogs or waits for a peer's reply — it only waits for a confirmably ready composer. A crashed worker's in-flight record becomes `uncertain` and must be resolved by reading the pane; recovery from a crash happens on the next enqueue, not automatically.
