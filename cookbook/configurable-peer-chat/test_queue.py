@@ -122,6 +122,7 @@ class QueueWorld:
             timeout=timeout,
             input=stdin_text,
             env=env or self.base_env(),
+            check=False,
         )
 
     def connect(self):
@@ -203,17 +204,17 @@ class QueueStoreTests(unittest.TestCase):
         )
 
     def enqueue(self, body="hello", **kwargs):
-        defaults = dict(
-            target_name="opencode",
-            window="win",
-            sid="sid",
-            pane_id=PANE_TOKEN,
-            socket_path=str(self.world.socket_path),
-            fingerprint=(1, 2, 3),
-            agtermctl_path="/usr/bin/agtermctl",
-            ttl_seconds=1800,
-            delivery_id=None,
-        )
+        defaults = {
+            "target_name": "opencode",
+            "window": "win",
+            "sid": "sid",
+            "pane_id": PANE_TOKEN,
+            "socket_path": str(self.world.socket_path),
+            "fingerprint": (1, 2, 3),
+            "agtermctl_path": "/usr/bin/agtermctl",
+            "ttl_seconds": 1800,
+            "delivery_id": None,
+        }
         defaults.update(kwargs)
         record, worker = pc.enqueue_message(
             self.conn, self.world.queue_dir, body, self.profile(), **defaults
@@ -400,17 +401,16 @@ class WorkerDeliveryTests(unittest.TestCase):
             return None
         env = self.world.base_env()
         env["PEER_CHAT_WORKER_LOCK_FD"] = str(fd)
-        err_file = open(self.world.root / "bare-worker-stderr.txt", "a")
-        proc = subprocess.Popen(
-            [sys.executable, SCRIPT, pc.WORKER_FLAG],
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=err_file,
-            start_new_session=True,
-            pass_fds=(fd,),
-        )
-        err_file.close()
+        with open(self.world.root / "bare-worker-stderr.txt", "a") as err_file:
+            proc = subprocess.Popen(
+                [sys.executable, SCRIPT, pc.WORKER_FLAG],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=err_file,
+                start_new_session=True,
+                pass_fds=(fd,),
+            )
         os.close(fd)
         self.bare_workers.append(proc)
         return proc
@@ -670,7 +670,7 @@ class WorkerDeliveryTests(unittest.TestCase):
     def test_sync_send_refused_while_queue_holds_pending(self):
         # the row exists without any worker: the refusal must come from the
         # pending guard, never from racing a live worker's target lock
-        record = self.insert_pending_row("queued first")
+        self.insert_pending_row("queued first")
         sync = self.world.run_cli(
             ["--to", "opencode", "--stdin"], stdin_text="direct second"
         )

@@ -2393,7 +2393,7 @@ def deliver_pending_row(row) -> tuple[str, str]:
         send_with_retry(
             row["session"], profile, row["body"], window=row["window"]
         )
-    except Exception as err:  # classified below; never leaks message text
+    except Exception as err:  # noqa: BLE001 - classified below, never leaks message text
         status, block = classify_delivery_error(err)
         debug_log = os.environ.get("PEER_CHAT_DEBUG_DELIVERY")
         if debug_log:
