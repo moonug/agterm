@@ -94,9 +94,13 @@ public enum LinkPolicy {
     /// handling; a `file://` with a non-local host, an empty/relative path, a UNC-style `//`-path, an
     /// auto-mount path (`/net`, `/Network`, `/home`, checked AFTER `..` normalization so `/tmp/../net/x`
     /// can't sneak through), or any other scheme / schemeless / unparseable input → `.ignore`. `localHosts`
-    /// is injected (default: this machine's names) so the decision stays host-free and unit-testable.
+    /// is injected (default: this machine's names) so the decision stays host-free and unit-testable. The
+    /// raw link first sheds trailing sentence punctuation (`):`, `.,`, quotes) — BOTH click paths (OSC-8
+    /// hyperlinks and implicit regex matches) route through here, so a sloppy emitter's `…/review/123).`
+    /// opens clean while a balanced `…/Foo_(bar)` keeps its `)`.
     public static func disposition(for raw: String, localHosts: Set<String> = localHostNames) -> LinkDisposition {
-        guard let url = URL(string: raw), let scheme = url.scheme?.lowercased() else { return .ignore }
+        let trimmed = LinkRules.trimmedTrailingPunctuation(raw)
+        guard let url = URL(string: trimmed), let scheme = url.scheme?.lowercased() else { return .ignore }
         if permittedSchemes.contains(scheme) { return .open(url) }
         guard scheme == "file" else { return .ignore }
         let host = normalizedHost(url.host(percentEncoded: false) ?? "")

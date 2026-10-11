@@ -12,6 +12,16 @@ struct LinkPolicyTests {
         #expect(LinkPolicy.disposition(for: "https://example.com extra junk", localHosts: Self.localHosts) == .ignore)
     }
 
+    @Test func sentencePunctuationShedsAtTheGate() {
+        // the opencode PR-link case: the emitted URI carries the sentence's closing paren and dot
+        #expect(LinkPolicy.disposition(for: "https://a.yandex-team.ru/review/16406334).", localHosts: Self.localHosts)
+            == .open(URL(string: "https://a.yandex-team.ru/review/16406334")!))
+        #expect(LinkPolicy.disposition(for: "https://en.wikipedia.org/wiki/Foo_(bar).)", localHosts: Self.localHosts)
+            == .open(URL(string: "https://en.wikipedia.org/wiki/Foo_(bar)")!))
+        #expect(LinkPolicy.disposition(for: "mailto:a@b.c.", localHosts: Self.localHosts)
+            == .open(URL(string: "mailto:a@b.c")!))
+    }
+
     /// A fixed injected set so host matching is deterministic in tests (independent of the real machine).
     static let localHosts: Set<String> = ["myhost", "localhost"]
 

@@ -116,31 +116,31 @@ struct LinkRulesTests {
         #expect(url == nil)
     }
 
-    // MARK: trailing punctuation
+    // MARK: trailing punctuation (shedding lives at the LinkPolicy gate)
 
-    @Test func sentencePunctuationShedsFromMatch() {
+    @Test func firstMatchReturnsRawMatchWithSentencePunctuation() {
         let url = LinkRules.firstMatch(rules: LinkRules.defaultRules(),
                                        cellText: "see https://example.com/a): end", offset: 5)
-        #expect(url == "https://example.com/a")
+        #expect(url == "https://example.com/a):")
     }
 
-    @Test func clickOnShedTailStillOpens() {
+    @Test func clickOnSentenceTailStillMatches() {
         let text = "see https://example.com/a):"
         let url = LinkRules.firstMatch(rules: LinkRules.defaultRules(), cellText: text, offset: text.count - 2)
-        #expect(url == "https://example.com/a")
+        #expect(url == "https://example.com/a):")
     }
 
-    @Test func balancedCloserKept() {
+    @Test func balancedCloserStaysInsideTheRawMatch() {
         let url = LinkRules.firstMatch(rules: LinkRules.defaultRules(),
                                        cellText: "(see https://en.wikipedia.org/wiki/Foo_(bar).)", offset: 6)
-        #expect(url == "https://en.wikipedia.org/wiki/Foo_(bar)")
+        #expect(url == "https://en.wikipedia.org/wiki/Foo_(bar).)")
     }
 
-    @Test func formatExpansionShedsToo() throws {
+    @Test func formatExpansionReturnsRawExpansion() throws {
         let rule = try #require(try NSRegularExpression(pattern: "https?://[^[:space:]]+"))
         let rules = [LinkRules.Rule(regex: rule, format: "$0", sourceLine: nil)]
         let url = LinkRules.firstMatch(rules: rules, cellText: "go https://x.com/a). b", offset: 4)
-        #expect(url == "https://x.com/a")
+        #expect(url == "https://x.com/a).")
     }
 
     @Test func trailingTrimCases() {

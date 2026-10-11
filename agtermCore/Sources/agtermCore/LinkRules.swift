@@ -118,9 +118,9 @@ public struct LinkRules {
     }
 
     /// The first rule whose match at or straddling `offset` yields a URL, in rule order (defaults first).
-    /// The resolved URL sheds trailing punctuation (`):`, `.,`, quotes) so a URL ending a sentence opens
-    /// clean; a click on that shed tail still counts as inside the match. Nil when nothing matches —
-    /// the caller reports "no link under cursor".
+    /// Returns the raw resolved match; trailing-punctuation shedding happens once, at the
+    /// `LinkPolicy.disposition` gate every click path crosses. Nil when nothing matches — the caller
+    /// reports "no link under cursor".
     public static func firstMatch(rules: [Rule], cellText: String, offset: Int) -> String? {
         guard offset >= 0, offset < cellText.utf16.count else { return nil }
         let nsText = cellText as NSString
@@ -128,9 +128,7 @@ public struct LinkRules {
         for rule in rules {
             for match in rule.regex.matches(in: cellText, range: full) where match.range.length > 0 {
                 guard match.range.contains(offset), let range = Range(match.range, in: cellText) else { continue }
-                let resolved = resolvedURL(match: match, in: cellText, format: rule.format, range: range)
-                let trimmed = trimmedTrailingPunctuation(resolved)
-                if !trimmed.isEmpty { return trimmed }
+                return resolvedURL(match: match, in: cellText, format: rule.format, range: range)
             }
         }
         return nil
