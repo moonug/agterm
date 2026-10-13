@@ -33,12 +33,11 @@ extension GhosttySurfaceView {
         guard let grid = surfaceGrid else { return nil }
         guard let mouse = lastReportedMousePoint, mouse.x >= 0, mouse.y >= 0 else { return nil }
         // the reported mouse point is in view POINTS (flipped); cell sizes are PHYSICAL pixels, so scale.
-        // ghostty draws window-padding inside the surface, so the viewport origin comes off before the
-        // division — without it a click resolves about a cell right/below the glyph under it.
+        // window-padding stays UNSUBTRACTED — measuring it proved untrustworthy (tl_px_y ≠ grid offset),
+        // and `firstMatch`'s one-cell tolerance absorbs the shift instead.
         let scale = window?.backingScaleFactor ?? 2.0
-        let pad = viewportPaddingPoints()
-        let col = max(0, Int(((mouse.x - pad.x) * scale) / CGFloat(grid.cellW)))
-        let row = max(0, Int(((mouse.y - pad.y) * scale) / CGFloat(grid.cellH)))
+        let col = Int((mouse.x * scale) / CGFloat(grid.cellW))
+        let row = Int((mouse.y * scale) / CGFloat(grid.cellH))
         guard col < grid.cols, row < grid.rows else { return nil }
         guard let text = readScreenText(all: false, lines: nil) else { return nil }
         let lines = text.components(separatedBy: "\n")
@@ -52,22 +51,5 @@ extension GhosttySurfaceView {
         guard LinkPolicy.disposition(for: raw) != .ignore else { return nil }
         openLink(raw)
         return raw
-    }
-
-    /// The viewport's left/top window-padding in POINTS, measured the way `readCursorColumn` measures it:
-    /// at viewport cell (0,0) `tl_px_x`/`tl_px_y` are exactly the padding terms. Zeros when the probe
-    /// fails — a degraded measurement costs edge accuracy, not correctness.
-    private func viewportPaddingPoints() -> (x: Double, y: Double) {
-        guard let surface else { return (0, 0) }
-        var sel = ghostty_selection_s()
-        let origin = ghostty_point_s(tag: GHOSTTY_POINT_VIEWPORT, coord: GHOSTTY_POINT_COORD_EXACT, x: 0, y: 0)
-        sel.top_left = origin
-        sel.bottom_right = origin
-        sel.rectangle = false
-        var probe = ghostty_text_s()
-        guard ghostty_surface_read_text(surface, sel, &probe) else { return (0, 0) }
-        defer { ghostty_surface_free_text(surface, &probe) }
-        guard probe.tl_px_x >= 0, probe.tl_px_y >= 0 else { return (0, 0) }
-        return (probe.tl_px_x, probe.tl_px_y)
     }
 }

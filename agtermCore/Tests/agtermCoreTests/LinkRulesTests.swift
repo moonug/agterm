@@ -152,6 +152,26 @@ struct LinkRulesTests {
         #expect(LinkRules.trimmedTrailingPunctuation("https://x/a%3A") == "https://x/a%3A")
     }
 
+    // MARK: one-cell tolerance (un-subtracted window padding)
+
+    @Test func offsetOneBeforeMatchStartStillMatches() {
+        let text = "see https://example.com/a end"
+        let url = LinkRules.firstMatch(rules: LinkRules.defaultRules(), cellText: text, offset: 3)
+        #expect(url == "https://example.com/a")
+    }
+
+    @Test func offsetOnePastMatchEndStillMatches() {
+        let text = "see https://example.com/a end"
+        let url = LinkRules.firstMatch(rules: LinkRules.defaultRules(), cellText: text, offset: 25)
+        #expect(url == "https://example.com/a")
+    }
+
+    @Test func offsetTwoPastMatchEndReturnsNil() {
+        let text = "see https://example.com/a end"
+        let url = LinkRules.firstMatch(rules: LinkRules.defaultRules(), cellText: text, offset: 26)
+        #expect(url == nil)
+    }
+
     // MARK: urlAtCursor (physical rows → logical lines)
 
     @Test func wrappedUrlMatchesFromAnyPhysicalRow() {

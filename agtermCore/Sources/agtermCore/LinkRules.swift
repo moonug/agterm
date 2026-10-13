@@ -117,8 +117,10 @@ public struct LinkRules {
         return expandFormat(format, match: match, in: nsText)
     }
 
-    /// The first rule whose match at or straddling `offset` yields a URL, in rule order (defaults first).
-    /// Returns the raw resolved match; trailing-punctuation shedding happens once, at the
+    /// The first rule whose match covers `offset` within ONE CELL of slack on either side, in rule order
+    /// (defaults first). The slack is deliberate: the cursor cell cannot subtract window-padding from the
+    /// mouse point (measuring it proved untrustworthy), so a click may resolve one cell before or past the
+    /// match. Returns the raw resolved match; trailing-punctuation shedding happens once, at the
     /// `LinkPolicy.disposition` gate every click path crosses. Nil when nothing matches — the caller
     /// reports "no link under cursor".
     public static func firstMatch(rules: [Rule], cellText: String, offset: Int) -> String? {
@@ -127,7 +129,8 @@ public struct LinkRules {
         let full = NSRange(location: 0, length: nsText.length)
         for rule in rules {
             for match in rule.regex.matches(in: cellText, range: full) where match.range.length > 0 {
-                guard match.range.contains(offset), let range = Range(match.range, in: cellText) else { continue }
+                guard offset + 1 >= match.range.location, offset <= match.range.upperBound,
+                      let range = Range(match.range, in: cellText) else { continue }
                 return resolvedURL(match: match, in: cellText, format: rule.format, range: range)
             }
         }
