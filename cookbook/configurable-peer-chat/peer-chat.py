@@ -1052,7 +1052,7 @@ def opencode_hint_is_cwd(hint: str, prefix: str) -> bool:
     tail = hint[1:].lstrip("/")
     if not tail:
         return False
-    return prefix.endswith("/" + tail) or prefix.endswith(tail)
+    return prefix.endswith(("/" + tail, tail))
 
 
 def opencode_split_cwd_hint(
