@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "peer-chat.py")
@@ -92,7 +93,7 @@ class QueueWorld:
                 "PEER_CHAT_QUEUE_DIR": str(self.queue_dir),
                 "PEER_CHAT_CONFIG": FAKE_CONFIG,
                 "AGTERM_SESSION_ID": "sid",
-                "AGTERM_PANE": "left",
+                "AGTERM_PANE": "right",
                 "AGTERM_WINDOW_ID": "win",
                 "PEER_CHAT_FAKE_STATE": str(self.state_path),
                 "PEER_CHAT_DEBUG_DELIVERY": str(self.root / "delivery-debug.log"),
@@ -306,6 +307,52 @@ class QueueStoreTests(unittest.TestCase):
         ]
         for err, wanted in cases:
             self.assertEqual(pc.classify_delivery_error(err), wanted)
+
+    def test_delivery_diagnostics_do_not_expose_exception_payloads(self):
+        record, _ = self.enqueue(body="PRIVATE_MESSAGE")
+        row = self.conn.execute(
+            "SELECT * FROM queue WHERE id = ?", (record["id"],)
+        ).fetchone()
+        pre_write = RuntimeError("PRIVATE_MESSAGE")
+        pre_write.__cause__ = ValueError("PRIVATE_MESSAGE")
+        cases = [
+            (pre_write, "not_started", "delivery_error", None),
+            (pc.ComposerDirty("PRIVATE_MESSAGE", "PRIVATE_MESSAGE", cleared=True),
+             "body", "body_failed", True),
+            (pc.ComposerDirty("PRIVATE_MESSAGE", "PRIVATE_MESSAGE"),
+             "body", "cleanup_failed", False),
+            (pc.DeliveryAmbiguous("PRIVATE_MESSAGE"), "accept", "ambiguous_submit", None),
+        ]
+        for err, phase, reason, cleared in cases:
+            def fail(*args, progress, phase=phase, err=err, **kwargs):
+                progress.phase = phase
+                progress.attempt = 2
+                raise err
+
+            with self.subTest(phase=phase, cleared=cleared), patch.object(
+                pc, "send_with_retry", side_effect=fail
+            ):
+                status, block, diagnostic = pc.deliver_pending_row(row)
+                self.assertEqual(block, reason)
+                self.assertEqual(diagnostic["phase"], phase)
+                self.assertEqual(diagnostic["exception"], type(err).__name__)
+                self.assertEqual(diagnostic["causes"], ["ValueError"] if err is pre_write else [])
+                self.assertEqual(diagnostic["attempt"], 2)
+                self.assertEqual(diagnostic["cleanup_cleared"], cleared)
+                self.assertNotIn("PRIVATE_MESSAGE", json.dumps(diagnostic))
+                self.assertIn(status, ("failed", "uncertain"))
+
+    def test_existing_queue_gains_diagnostic_column_without_losing_records(self):
+        record, _ = self.enqueue()
+        self.conn.execute("ALTER TABLE queue DROP COLUMN diagnostic")
+        self.conn.commit()
+        conn = pc.queue_connect()
+        try:
+            row = conn.execute("SELECT * FROM queue WHERE id = ?", (record["id"],)).fetchone()
+            self.assertIsNone(row["diagnostic"])
+            self.assertIn("hello", row["body"])
+        finally:
+            conn.close()
 
     def test_sync_guard_refuses_when_pending_records_exist(self):
         self.enqueue()
@@ -542,6 +589,73 @@ class WorkerDeliveryTests(unittest.TestCase):
         self.assertIn("session.type.pane-id", sent.stderr)
         self.assertEqual(self.world.events(), [])
         self.assertNotIn("queued", sent.stdout)
+
+    def test_self_target_and_missing_sender_refuse_before_queueing_or_typing(self):
+        for defer, pane in ((False, "left"), (True, "left"), (True, None)):
+            env = self.world.base_env()
+            env["AGTERM_PANE"] = "left"
+            args = ["--to", "opencode", "--stdin"]
+            if defer:
+                args.append("--defer")
+            if pane:
+                args.extend(("--pane", pane))
+            with self.subTest(defer=defer, pane=pane):
+                result = self.world.run_cli(args, stdin_text="do not echo", env=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("target is the sending pane", result.stderr)
+                self.assertEqual(self.world.events(), [])
+                self.assertEqual(self.world.submitted(), 0)
+                self.assertNotIn('"queued"', result.stdout)
+
+        env = self.world.base_env()
+        env.pop("AGTERM_SESSION_ID")
+        result = self.world.run_cli(
+            ["--to", "opencode", "--stdin"], stdin_text="unknown sender", env=env
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sending pane identity is unavailable", result.stderr)
+        self.assertEqual(self.world.events(), [])
+
+    def test_ambiguous_delivery_retains_safe_diagnostics_without_retry(self):
+        self.world.state["submit_ok"] = False
+        self.world.write_state()
+        receipt = self.defer("PRIVATE_MESSAGE")
+        self.assertTrue(wait_until(
+            lambda: self.queue_row(receipt["id"])["status"] == "uncertain", timeout=20
+        ))
+        row = self.queue_row(receipt["id"])
+        diagnostic = json.loads(row["diagnostic"])
+        self.assertEqual(diagnostic["phase"], "accept")
+        self.assertEqual(diagnostic["exception"], "DeliveryAmbiguous")
+        self.assertEqual(diagnostic["attempt"], 1)
+        self.assertEqual(self.world.submitted(), 1)
+        self.assertIsNone(row["body"])
+        conn = self.world.connect()
+        try:
+            public = pc.queue_status(conn, receipt["id"])
+            self.assertEqual(public["records"]["diagnostic"], diagnostic)
+            self.assertNotIn("PRIVATE_MESSAGE", json.dumps(public))
+        finally:
+            conn.close()
+
+    def test_busy_composer_then_two_deferred_messages_preserve_order(self):
+        self.world.set_composer("collapsed")
+        first = self.insert_pending_row("first synthetic message")
+        second = self.insert_pending_row("second synthetic message")
+        self.assertIsNotNone(self.start_bare_worker())
+        self.assertTrue(wait_until(
+            lambda: self.queue_row(first["id"])["attempts"] >= 1, timeout=10
+        ))
+        self.assertEqual(self.world.events(), [])
+        self.world.set_composer("empty")
+        self.assertTrue(wait_until(
+            lambda: self.queue_row(second["id"])["status"] == "sent", timeout=30
+        ), self.world.debug_text())
+        self.assertEqual(self.queue_row(first["id"])["status"], "sent")
+        self.assertEqual(self.world.read_state()["submitted_texts"], [
+            "Chat from Claude: first synthetic message",
+            "Chat from Claude: second synthetic message",
+        ])
 
     def test_defer_without_ttl_uses_the_default(self):
         self.world.set_composer("dialog")  # the worker only probes

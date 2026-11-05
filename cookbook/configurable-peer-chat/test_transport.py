@@ -184,9 +184,21 @@ class ClearComposerBoundary(unittest.TestCase):
 class SendScenarios(unittest.TestCase):
     """Full send/send_with_retry paths over the in-memory terminal."""
 
-    def test_unconfirmable_last_chunk_cleans_and_refuses(self):
+    def test_over_long_message_is_refused_before_anything_is_typed(self):
+        # The composer cannot show a message this long in full, so the send
+        # stops before the first character reaches the pane.
         message = long_message(4000)
-        pane = FakePane(cap=3900)  # the true tail can never land
+        pane = FakePane()
+        with Harness(pane), self.assertRaises(pc.PromptBlocked) as ctx:
+            pc.send_with_retry("sid", opencode_profile(), message)
+        self.assertEqual(ctx.exception.reason, "message_too_long")
+        self.assertIn("at most", str(ctx.exception))
+        self.assertEqual(pane.text, "")
+        self.assertEqual(pane.submit_count, 0)
+
+    def test_unconfirmable_last_chunk_cleans_and_refuses(self):
+        message = long_message(600)
+        pane = FakePane(cap=520)  # the true tail can never land
         with Harness(pane), self.assertRaises(pc.ComposerDirty) as ctx:
             pc.send_with_retry("sid", opencode_profile(), message)
         err = str(ctx.exception)
@@ -198,7 +210,7 @@ class SendScenarios(unittest.TestCase):
         self.assertEqual(pane.text, "")
 
     def test_retry_after_confirmed_cleanup_succeeds_once(self):
-        message = long_message(4000)
+        message = long_message(600)
         pane = FakePane()
 
         original_type = pane.type
@@ -206,8 +218,8 @@ class SendScenarios(unittest.TestCase):
         def flaky_type(profile, text):
             if set(text) != {"\x7f"} and text != profile.submit and pane.loss_armed:
                 original_type(profile, text)
-                if len(pane.text) > 3900:
-                    pane.text = pane.text[:3900]
+                if len(pane.text) > 520:
+                    pane.text = pane.text[:520]
                     pane.loss_armed = False
                 return
             original_type(profile, text)
@@ -222,7 +234,7 @@ class SendScenarios(unittest.TestCase):
         self.assertEqual(pane.submitted_text, message)
 
     def test_foreign_text_blocks_cleanup_and_retry(self):
-        message = long_message(3000)
+        message = long_message(300)
         foreign = " ПОЛЬЗОВАТЕЛЬ_ПИШЕТ_СЮДА"
         pane = FakePane()
         original_type = pane.type
@@ -234,7 +246,7 @@ class SendScenarios(unittest.TestCase):
                 not injected
                 and set(text) != {"\x7f"}
                 and text != profile.submit
-                and len(pane.text) > 1000
+                and len(pane.text) > 200
             ):
                 injected.append(True)
                 pane.text += foreign
@@ -262,8 +274,8 @@ class SendScenarios(unittest.TestCase):
         self.assertEqual(pane.submit_count, 1)
 
     def test_diag_reports_sizes_without_message_text(self):
-        message = long_message(4000)
-        pane = FakePane(cap=3900)
+        message = long_message(600)
+        pane = FakePane(cap=520)
         with Harness(pane), self.assertRaises(pc.ComposerDirty) as ctx:
             pc.send_with_retry("sid", opencode_profile(), message)
         err = str(ctx.exception)

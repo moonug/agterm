@@ -4,6 +4,7 @@
 import importlib.util
 import os
 import sys
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ["PEER_CHAT_CONFIG"] = os.path.join(HERE, "fixtures", "peer-chat.json")
@@ -300,7 +301,14 @@ except RuntimeError:
     pass
 
 assert pc.has_target(info_left, claude_target) is True
-assert pc.has_target(info_nosplit, claude_target) is False
+# A peer in the primary pane of a full-pane session is addressable too: the
+# split is not required, only a pane that runs the peer.
+assert pc.has_target(info_nosplit, claude_target) is True
+expect(
+    "full-pane session resolves its primary pane",
+    pc.resolve_pane(info_nosplit, claude_target),
+    "left",
+)
 
 # explicit --pane override verified against candidates
 explicit = pc.Profile(
@@ -309,6 +317,28 @@ explicit = pc.Profile(
 info = dict(info_both)
 assert "left" in pc.pane_candidates(info, explicit)
 assert "right" in pc.pane_candidates(info, explicit)
+
+same_session = {"id": "sid", **info_left}
+with patch.dict(os.environ, {"AGTERM_SESSION_ID": "sid", "AGTERM_PANE": "left"}):
+    for pane in (None, "left"):
+        target = pc.Profile(agent="claude", command="claude", label="", submit="\n", pane=pane)
+        with patch.object(pc, "find_node", return_value=same_session):
+            try:
+                pc.require_target("sid", target)
+                raise AssertionError("sending to own pane must refuse")
+            except RuntimeError as err:
+                assert "sending pane" in str(err)
+    other_session = {"id": "other", **info_left}
+    assert pc.resolve_pane(other_session, claude_target) == "left"
+
+with patch.dict(os.environ, {"AGTERM_SESSION_ID": "sid", "AGTERM_PANE": "scratch"}), patch.object(
+    pc, "find_node", return_value=same_session
+):
+    try:
+        pc.require_target("sid", explicit)
+        raise AssertionError("unknown sending pane must refuse")
+    except RuntimeError as err:
+        assert "sending pane is unknown" in str(err)
 
 # --- config loading ---------------------------------------------------------------------
 agents = pc.load_agents()
@@ -353,5 +383,77 @@ try:
     raise AssertionError("empty message must refuse")
 except ValueError:
     pass
+
+# --- opencode v2: two-part status row, cwd under the box ----------------------------
+v2_split = fixture("opencode-v2-split.txt")
+v2_wide = fixture("opencode-v2-wide.txt")
+expect("v2 split pane parses to empty", pc.opencode_live_prompt_text(v2_split), "")
+expect("v2 wide pane parses to empty", pc.opencode_live_prompt_text(v2_wide), "")
+expect(
+    "v2 split pane has an input area",
+    pc.opencode_composer_has_input_area(v2_split),
+    True,
+)
+expect(
+    "v2 wide pane has an input area",
+    pc.opencode_composer_has_input_area(v2_wide),
+    True,
+)
+expect("v2 split pane row width", pc.opencode_row_width(v2_split), 107)
+expect("v2 wide pane row width", pc.opencode_row_width(v2_wide), 215)
+
+# --- cleanup: what the visible composer text is -------------------------------------
+DRAFT = "Chat from Claude: hello"
+expect("an empty composer holds nothing", pc.composer_owned_mode("", DRAFT)[0], "empty")
+expect("a foreign row is not ours", pc.composer_owned_mode("someone typed", DRAFT)[0], "foreign")
+expect("the end of our text is a tail", pc.composer_owned_mode(DRAFT, DRAFT)[0], "tail")
+expect("the beginning of our text is a head", pc.composer_owned_mode("Chat from", DRAFT)[0], "head")
+expect("the middle of our text is a middle", pc.composer_owned_mode("from Claude:", DRAFT)[0], "middle")
+
+# --- cleanup: what may be erased -----------------------------------------------------
+expect(
+    "an empty composer needs no erasing",
+    pc.composer_cleanup_decision("", DRAFT, True)[0],
+    "done",
+)
+expect(
+    "foreign text is never erased",
+    pc.composer_cleanup_decision("someone typed", DRAFT, True)[0],
+    "refuse",
+)
+expect(
+    "a confirmed tail is erased exactly",
+    pc.composer_cleanup_decision(DRAFT, DRAFT, True)[0],
+    "delete_exact",
+)
+decision, count = pc.composer_cleanup_decision("Chat from", DRAFT, True)
+expect("a visible head is erased as a whole", decision, "delete_all")
+assert count == len(DRAFT), "the whole owned draft goes at once"
+expect(
+    "a head is not erased blind from a busy composer",
+    pc.composer_cleanup_decision("Chat from", DRAFT, False)[0],
+    "refuse",
+)
+
+# --- the build of the peer and the message length it accepts ------------------------
+expect("v1 prints a bare version", pc.opencode_version_major("1.18.29+moonug"), 1)
+expect("v2 prints a prefixed version", pc.opencode_version_major("opencode v2.2.1"), 2)
+expect("no version at all", pc.opencode_version_major(""), None)
+expect("v1 keeps the head, so the limit is the visible window", pc.OPENCODE_V1_MESSAGE_LIMIT, 1000)
+expect("v2 scrolls to the caret, so the limit is a rule of thumb", pc.OPENCODE_V2_MESSAGE_LIMIT, 1600)
+
+# --- a v2 permission dialog must never be typed into ---------------------------------
+v2_dialog = """╭─ Permission required ─
+│ △ Permission required
+│ ❯ 1. Allow once
+│   2. Allow always
+│   3. Reject
+╰─"""
+expect("a v2 permission dialog is recognised", pc.opencode_permission_dialog(v2_dialog), True)
+expect(
+    "a dialog without a reject option is not one",
+    pc.opencode_permission_dialog(v2_dialog.replace("3. Reject", "3. Later")),
+    False,
+)
 
 print("all parser and pane-rule checks passed")

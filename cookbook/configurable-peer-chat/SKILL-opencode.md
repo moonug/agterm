@@ -15,6 +15,8 @@ settles. A raw command bypasses those checks.
 
 Invoke `peer-chat.py` as a bare command resolved through `PATH`; it is not a file inside this
 skill directory. Configured peer names live in `~/.config/agterm/peer-chat.json`.
+If it is missing from `PATH`, use the installed `$HOME/bin/peer-chat.py` only
+after confirming it is executable; do not guess a script path from the checkout.
 
 ## Preconditions
 
@@ -23,6 +25,11 @@ user. This skill never starts an agent and never opens a pane. If the split is m
 other pane does not run the peer, say so and stop.
 
 ## Sending
+
+An incoming `Chat from ...` that needs an answer activates this skill now:
+reply with `peer-chat.py` in the same turn, not only in your own pane. Never
+target your own pane. If the script refuses, report that the peer did not
+receive the message; do not silently wait or resend blindly.
 
 ```bash
 peer-chat.py --to claude-zai --defer --stdin <<'CHAT'
@@ -38,6 +45,10 @@ does not mean the peer has read the message or will answer. Report that the
 message is queued, then move on; do not watch the pane and do not poll — run
 `peer-chat.py --queue-status <id>` once if a status is genuinely needed, and
 `--queue-cancel <id>` if the message must not be delivered after all.
+Distinguish `queued` (stored), `sent` (composer submission confirmed),
+`failed` (not delivered) and `uncertain` (may have been submitted). An incoming
+prompt identical to the body you sent may be your own echo rather than a peer
+reply; do not treat it as proof that the peer answered.
 
 If the command refuses because this agterm lacks the pane-id capability
 (`--defer requires agterm with the session.type.pane-id capability`), repeat
@@ -47,6 +58,12 @@ the same send without `--defer`: the direct path below is unchanged.
 Pass the message on stdin through a quoted heredoc, never as an argument. The script collapses all
 whitespace to single spaces before typing, because typing a newline submits the fragment before it,
 so write for one paragraph.
+Prefer messages under 400 characters; for longer content, provide a readable
+file path in a short message instead of overflowing the peer's composer.
+The script refuses a message that is too long before typing anything, and the
+refusal names the limit: 1000 characters for opencode v1, whose composer keeps
+only the head of a draft that overflows its box, and 1600 for v2, whose
+composer scrolls to the caret and keeps the tail on screen.
 
 The script finds the peer pane on its own; the pane side (left or right) does not matter. When
 both panes run the same command it targets the pane opposite to yours. If it still asks for a

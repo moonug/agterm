@@ -11,9 +11,9 @@ What this fork adds over the original recipe:
 - **Config-driven agents.** `~/.config/agterm/peer-chat.json` maps a name to a composer kind (`claude`, `codex`, `opencode`) and the process name agterm should look for. Wrapper scripts and zsh functions that exec the same binary (claude-zai/claude-minimax all show `claude`) work out of the box.
 - **Any pane layout.** The original pins Claude left and Codex right. Here the target pane is resolved live: the split pane whose foreground runs the peer's command; when both panes run the same command, the pane opposite to the sender (via `AGTERM_PANE`), with `--pane left|right` as an explicit override.
 - **Deferred delivery.** `--defer` stores the message in a private SQLite queue (`~/.local/state/agterm/peer-chat/`) and a short-lived worker types it in when the pinned target pane is confirmably ready — including right after the user answers a permission dialog there. Records are pinned to the observed pane (window, session, pane side, pane-id token, socket fingerprint) and are cancelled instead of retargeted when that pane disappears; a submit that cannot be proven becomes `uncertain` and is never repeated. See `--queue-status`, `--queue-cancel`, `--ttl` (default 30 minutes) and `--delivery-id` for idempotent retries. Requires agterm with the `session.type.pane-id` capability (0.28.0 or later).
-- **opencode support.** A composer parser for opencode's boxed TUI (light/heavy borders, splash and conversation states, status rows, cursor-glyph and cwd decorations). Typing into a redrawing opencode is paced in small slices because single large writes occasionally drop a character; verification catches any loss and refuses to submit.
+- **opencode support.** A composer parser for opencode's boxed TUI (light/heavy borders, splash and conversation states, status rows, cursor-glyph and cwd decorations). Both opencode layouts are read: v1, whose status row names the agent, the model and the effort and whose cwd sits flush right inside the box, and v2, whose status row names the agent and the model with its provider and whose cwd sits under the box. Typing into a redrawing opencode is paced in small slices because single large writes occasionally drop a character; verification catches any loss and refuses to submit.
 - **Recovery.** When verification fails, cleanup restores the empty composer even if the typed text got corrupted (bounded blind backspacing, proven safe because the pre-write composer was confirmed empty), and the send retries — but only after cleanup is confirmed.
-- **Robust long messages.** The suffix check stops as soon as the expected text is fully consumed by the rows below, so drafts taller than the composer (internal scroll) and busy targets with live tool rows above the composer verify correctly.
+- **Robust long messages.** The suffix check stops as soon as the expected text is fully consumed by the rows below, so drafts taller than the composer (internal scroll) and busy targets with live tool rows above the composer verify correctly. A message that cannot be confirmed in full is refused before anything is typed: opencode v1 keeps only the head of a draft that overflows its box (limit 1000 characters), v2 scrolls the composer to the caret and keeps the tail on screen (limit 1600 characters). The limit follows the build running in the target pane, and the refusal names it.
 
 ## Requirements
 
@@ -59,24 +59,33 @@ the message goes here, as one paragraph
 CHAT
 ```
 
-A deferred send answers with `{"queued": .., "id": "..", ..}` — stored, to be delivered when the pane is ready, not yet read by the peer. The worker process is spawned on demand and exits once the queue is empty; if it dies mid-send, the affected record becomes `uncertain` and is reported by `--queue-status` instead of being retyped. Without `--defer` the message is delivered synchronously, exactly as before.
+A deferred send answers with `{"queued": .., "id": "..", ..}` — stored, not delivered or read. `--queue-status <id>` reports the outcome; a failed delivery includes payload-free `diagnostic` metadata (phase, exception/cause classes, reason, cleanup result and attempt). Historical failures have no such detail. The worker process is spawned on demand and exits once the queue is empty; if it dies mid-send, the affected record becomes `uncertain` and is reported by `--queue-status` instead of being retyped. Without `--defer` the message is delivered synchronously, exactly as before.
 
 `--to` takes any name from the config. Labels (`Chat from Claude: `, `Chat from Codex: `, `Chat from OpenCode: `) are derived from the sending pane's kind and added by the script; any peer self-label (`Chat from opencode-lead: …`) is stripped first. `--queue` (Tab submit) remains Codex-only and composes with `--defer`. `--prepare-message` / `--message-file` work as in the original recipe.
+
+When the peer runs in a full-pane session — no split — the script cannot infer it from the current checkout, so name that session: `agtermctl tree` lists the ids and their titles, and any unambiguous prefix of an id works. `--session <id>` also pins the pane, so a deferred delivery and a direct send to the same pane cannot interleave; `--window <id>` pins the agterm window when a session id is ambiguous across windows.
+
+```sh
+peer-chat.py --to opencode --session BEFBFA91-0170-4D3A-AED8-F68B0D55B582 --stdin <<'CHAT'
+the message goes here, as one paragraph
+CHAT
+```
 
 The first exchange in each pair stops on an approval prompt in one of the panes — answer it yourself; agents are never allowed to. With `--defer` the queued message is delivered right after you do.
 
 ## How it works
 
-Before typing, the script resolves the session (from `AGTERM_SESSION_ID`, or a single checkout match), finds which split pane runs the target command (opposite of the sender when both match), and confirms the target composer is in a recognized empty state: kind-specific parsers (claude `❯` prompt, codex `›` prompt with placeholder or tip, opencode bordered box with its status row and decorations filtered out). The body is typed as bounded, separately observed events — paced for opencode — with a probe marker that must be confirmed removed before the submit key is sent. Acceptance requires the composer to return to its empty state.
+Before typing, the script resolves the session (from `AGTERM_SESSION_ID`, from `--session <id>`, or a single checkout match), finds which pane runs the target command (the split pane, or the primary pane of a full-pane session; opposite of the sender when both match), and confirms the target composer is in a recognized empty state: kind-specific parsers (claude `❯` prompt, codex `›` prompt with placeholder or tip, opencode bordered box with its status row and decorations filtered out). The body is typed as bounded, separately observed events — paced for opencode — with a probe marker that must be confirmed removed before the submit key is sent. Acceptance requires the composer to return to its empty state.
 
-When a chunk cannot be verified, the script withholds the submit, restores the empty composer (exact owned-text backspacing, or bounded blind backspacing for kinds whose pre-write emptiness was proven), and retries the whole send — up to five attempts. Failures after the submit request stay ambiguous and are never retried.
+When a chunk cannot be verified, the script withholds the submit, restores the empty composer (exact owned-text backspacing, or bounded blind backspacing for kinds whose pre-write emptiness was proven), and retries the whole send — up to five attempts, each retry with a halved chunk budget. Failures after the submit request stay ambiguous and are never retried.
 
 ## Limits
 
 - The script types into another pane's composer. Do not type in the receiving pane during a send.
 - An opencode pane that started together with the split may not repaint (blank screen above the status bar — a TUI renderer desync). The send refuses; fix the pane with a geometry nudge: `agtermctl surface zoom show --target surface:<SID>:right; agtermctl surface zoom hide`.
 - A fresh opencode session (splash box) or any chooser makes the send refuse. Write something in that pane first; never answer choosers for the user.
-- A message that is a lone path (`~/foo`) is indistinguishable from opencode's empty-composer cwd hint and gets filtered; avoid such one-token messages.
+- A message that is a lone path (`~/foo`) is taken for opencode's empty-composer cwd hint when the session's cwd is not visible in the capture and the composer shows no input row; avoid such one-token messages.
+- A message longer than the target composer can show in full is refused before anything is typed — 1000 characters for opencode v1, 1600 for v2. Put long content in a file and send its path.
 - No transcript: the conversation lives in the two panes. A reply is never promised.
 - Same-kind pairs share one label (`Chat from Claude: ` for claude-zai ↔ claude-minimax); the peer is identified by pane position, not by label.
 - The delivery pin is a terminal pane, not a conversation: a peer that starts a new conversation in the same pane is not detected. Cancel queued records (`--queue-cancel`) before switching the topic in the target pane, and rely on the TTL (default 30 minutes) to retire stale ones.

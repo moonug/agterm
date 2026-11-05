@@ -137,6 +137,7 @@ def apply_type_event(state, options, text):
         time.sleep(delay)
     if text == "\n":
         state["submitted"] = int(state.get("submitted", 0)) + 1
+        state.setdefault("submitted_texts", []).append(state.get("buffer", ""))
         if state.get("submit_ok", True):
             state["buffer"] = ""
     elif text and set(text) == {"\x7f"}:

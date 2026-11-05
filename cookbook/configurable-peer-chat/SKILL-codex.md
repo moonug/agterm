@@ -48,6 +48,11 @@ message is queued, then move on; do not watch the pane and do not poll — run
 `peer-chat.py --queue-status <id>` once if a status is genuinely needed, and
 `--queue-cancel <id>` if the message must not be delivered after all. If the command refuses
 because this agterm lacks the pane-id capability, repeat the same send without `--defer`.
+Report `queued`, `sent`, `failed`, and `uncertain` by their actual meanings. If
+delivery fails or is uncertain, show the refusal/status to the user instead of
+silently waiting or resending. A prompt that repeats the exact body you just
+sent may be your own echo, not a peer reply; never wait for a reply on that
+basis alone.
 
 `--to` takes the peer name the user used: `claude`, `claude-zai`, `claude-minimax`, or `opencode`.
 Choose a fresh literal suffix for every send. Do not use stdin, a heredoc, shell redirection,
