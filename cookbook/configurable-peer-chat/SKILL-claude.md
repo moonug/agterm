@@ -40,7 +40,7 @@ CHAT
 ```
 
 A successful send prints a JSON receipt with `"queued"`, a message `id` and a
-deadline. `queued` is the length of the queued body in bytes — the receipt
+deadline. `queued` is the length of the queued body in characters — the receipt
 means the message is stored and a short-lived worker will type it into the
 peer's composer as soon as that pane is confirmably ready for input —
 including right after the user answers a permission dialog there. It
