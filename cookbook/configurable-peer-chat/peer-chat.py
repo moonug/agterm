@@ -1036,6 +1036,25 @@ def opencode_cwd_prefixes(lines: list[str], start: int = 0) -> list[str]:
     return []
 
 
+def opencode_hint_is_cwd(hint: str, prefix: str) -> bool:
+    """Whether a composer hint names the session cwd.
+
+    The hint is the cwd rendered home-relative (`~/dir`), while the footer
+    that proves it names the same directory by its absolute path. The home
+    directory of the machine that reads the capture is not necessarily the
+    home the capture was taken on, so a `~` hint is matched by the tail of
+    the known path instead of by a prefix.
+    """
+    if hint.startswith(prefix):
+        return True
+    if not hint.startswith("~"):
+        return False
+    tail = hint[1:].lstrip("/")
+    if not tail:
+        return False
+    return prefix.endswith("/" + tail) or prefix.endswith(tail)
+
+
 def opencode_split_cwd_hint(
     block: list[str], prefixes: list[str], has_input: bool = True
 ) -> tuple[list[str], str]:
@@ -1081,7 +1100,7 @@ def opencode_split_cwd_hint(
         if not OPENCODE_PATH_HINT_RE.match(block[-1]):
             return block, ""
         return list(block[:-1]), block[-1]
-    if not any(hint.startswith(prefix) for prefix in prefixes):
+    if not any(opencode_hint_is_cwd(hint, prefix) for prefix in prefixes):
         return block, ""
     kept = list(block[: index + 1])
     if head:
