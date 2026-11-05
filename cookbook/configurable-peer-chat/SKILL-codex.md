@@ -44,9 +44,13 @@ A successful send prints a JSON receipt with `"queued"`, a message `id` and a de
 means the message is stored and a short-lived worker will type it into the peer's composer as soon
 as that pane is confirmably ready for input — including right after the user answers a permission
 dialog there. It does not mean the peer has read the message or will answer. Report that the
-message is queued, then move on; do not watch the pane and do not poll — run
+message is queued, then move on; do not watch the pane or poll for a peer reply. Run
 `peer-chat.py --queue-status <id>` once if a status is genuinely needed, and
-`--queue-cancel <id>` if the message must not be delivered after all. If the command refuses
+`--queue-cancel <id>` if the message must not be delivered after all. Never say
+"sent" based on the receipt alone; if claiming submission, check
+`--queue-status <id>` once and report the actual status. Keep your original text
+until delivery is confirmed: on `failed`, the queue deletes the body, so resolve
+the cause before retrying from your copy. If the command refuses
 because this agterm lacks the pane-id capability, repeat the same send without `--defer`.
 Report `queued`, `sent`, `failed`, and `uncertain` by their actual meanings. If
 delivery fails or is uncertain, show the refusal/status to the user instead of
@@ -60,6 +64,10 @@ variables or substitutions in either invocation: Codex then evaluates the reques
 wrapper, so the two command-prefix rules from *Setup* cannot match it. Never put the message text
 directly in an argument. The send consumes the file, and the script collapses whitespace before
 typing.
+An overlong `--defer` send refuses before queueing, with character and UTF-8
+byte counts of the normalized message, including the sender label added by the
+script. Prepare a separate readable file containing the long answer and send a
+short path; do not resend the same overlong message.
 
 A deferred message is pinned to the exact pane observed at send time. If that pane is replaced,
 the split is closed, or agterm restarts before delivery, the record is cancelled or fails — it is

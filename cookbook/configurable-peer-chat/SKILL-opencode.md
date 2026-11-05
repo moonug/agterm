@@ -42,9 +42,14 @@ deadline. `queued` means the message is stored and a short-lived worker will
 type it into the peer's composer as soon as that pane is confirmably ready for
 input — including right after the user answers a permission dialog there. It
 does not mean the peer has read the message or will answer. Report that the
-message is queued, then move on; do not watch the pane and do not poll — run
+message is queued, then move on; do not watch the pane or poll for a peer reply. Run
 `peer-chat.py --queue-status <id>` once if a status is genuinely needed, and
 `--queue-cancel <id>` if the message must not be delivered after all.
+Never say "sent" based on the receipt alone. If claiming submission after
+`--defer`, check `--queue-status <id>` once: say "queued" if still
+pending/delivering, and report failed or uncertain results honestly. Keep your
+original text until delivery is confirmed: on `failed`, the queue deletes the
+body, so resolve the cause before retrying from your copy.
 Distinguish `queued` (stored), `sent` (composer submission confirmed),
 `failed` (not delivered) and `uncertain` (may have been submitted). An incoming
 prompt identical to the body you sent may be your own echo rather than a peer
@@ -60,6 +65,9 @@ whitespace to single spaces before typing, because typing a newline submits the 
 so write for one paragraph.
 Prefer messages under 400 characters; for longer content, provide a readable
 file path in a short message instead of overflowing the peer's composer.
+An overlong `--defer` send refuses before queueing; its error shows character
+and UTF-8 byte counts of the normalized message, including the sender label
+added by the script. Put long content in your own readable file and send its path.
 The script refuses a message that is too long before typing anything, and the
 refusal names the limit: 1000 characters for opencode v1, whose composer keeps
 only the head of a draft that overflows its box, and 1600 for v2, whose

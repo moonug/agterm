@@ -1186,6 +1186,26 @@ def opencode_message_limit(profile: Profile) -> tuple[int, int | None]:
     return OPENCODE_V1_MESSAGE_LIMIT, major
 
 
+def check_message_length(profile: Profile, body: str) -> None:
+    if profile.agent != "opencode" or not body:
+        return
+    limit, major = opencode_message_limit(profile)
+    if len(body) > limit:
+        because = (
+            " (it keeps only the head of a draft that overflows its box)"
+            if major is None or major < 2
+            else ""
+        )
+        raise PromptBlocked(
+            f"target composer takes a message of at most {limit} characters "
+            f"and this message has {len(body)} characters including the sender label "
+            f"({len(body.encode('utf-8'))} UTF-8 bytes){because}; "
+            "write the message to a file and send its path instead; "
+            "nothing was typed",
+            "message_too_long",
+        )
+
+
 def opencode_composer_walk(text: str) -> tuple[str | None, bool]:
     """Walk the composer box upward from the bottom border.
 
@@ -2248,7 +2268,7 @@ def check_composer_ready(
     sid: str,
     profile: Profile,
     window: str | None = None,
-    message_length: int = 0,
+    message: str = "",
 ) -> tuple[str, int]:
     """Pre-write readiness gates; returns the confirmed initial state.
 
@@ -2293,23 +2313,7 @@ def check_composer_ready(
             "target composer contains text; nothing was typed",
             "composer_not_empty",
         )
-    if profile.agent == "opencode" and message_length > 0:
-        # The composer shows a bounded window of the draft; a message longer
-        # than that can never have its tail confirmed. Refuse before typing.
-        limit, major = opencode_message_limit(profile)
-        if message_length > limit:
-            because = (
-                " (it keeps only the head of a draft that overflows its box)"
-                if major is None or major < 2
-                else ""
-            )
-            raise PromptBlocked(
-                f"target composer takes a message of at most {limit} characters "
-                f"and this message has {message_length} characters{because}; "
-                "write the message to a file and send its path instead; "
-                "nothing was typed",
-                "message_too_long",
-            )
+    check_message_length(profile, message)
     column = (
         EMPTY_CURSOR_COLUMN
         if profile.agent == "opencode"
@@ -2343,7 +2347,7 @@ def send(
         typed = prepared
     try:
         verify_pinned_identity(sid, profile, window)
-        initial = check_composer_ready(sid, profile, window, len(typed))
+        initial = check_composer_ready(sid, profile, window, typed)
     except PromptBlocked:
         raise
     except KeyboardInterrupt as err:
@@ -2907,6 +2911,7 @@ def resolve_defer_target(
 ) -> tuple[str, str, str, tuple[int, int, int], str]:
     """Pin the destination observed right now: pane, token, socket, binary."""
     window, sid = resolve_target(args.session, args.window, profile)
+    require_target(sid, profile, window)
     info = find_node(sid, window)
     if profile.pane is None:
         profile.pane = resolve_pane(info, profile)
@@ -2942,8 +2947,8 @@ def classify_delivery_error(err: Exception) -> tuple[str, str]:
     if isinstance(err, PromptBlocked):
         if err.reason in IDENTITY_BLOCK_REASONS:
             return "failed", err.reason
-        if err.reason == "message_too_long":
-            # Waiting cannot make the composer show more of the message.
+        if err.reason in ("message_too_long", "composer_not_recognisable"):
+            # Waiting cannot fix an overlong message or unrecognised composer.
             return "failed", err.reason
         # A dialog is answered by the user in that pane, so the record stays
         # queued and goes out once the pane is ready again.
@@ -3171,6 +3176,7 @@ def defer_message(args: argparse.Namespace, profile: Profile) -> int:
         raise KeyboardInterrupt(
             "interrupted during message normalisation; nothing was queued"
         ) from err
+    check_message_length(profile, body)
     conn = queue_connect(create=True)
     try:
         record, worker = enqueue_message(

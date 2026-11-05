@@ -40,14 +40,19 @@ CHAT
 ```
 
 A successful send prints a JSON receipt with `"queued"`, a message `id` and a
-deadline. `queued` is the length of the queued body in characters — the receipt
+deadline. `queued` is the length of the normalized body in characters — the receipt
 means the message is stored and a short-lived worker will type it into the
 peer's composer as soon as that pane is confirmably ready for input —
 including right after the user answers a permission dialog there. It
 does not mean the peer has read the message or will answer. Report that the
-message is queued, then move on; do not watch the pane and do not poll — run
+message is queued, then move on; do not watch the pane or poll for a peer reply. Run
 `peer-chat.py --queue-status <id>` once if a status is genuinely needed, and
-`--queue-cancel <id>` if the message must not be delivered after all.
+`--queue-cancel <id>` if the message must not be delivered after all. Never say
+"sent" based on the receipt alone. If claiming submission after `--defer`,
+check `--queue-status <id>` once: say "queued" if still pending/delivering,
+and report a failed or uncertain result instead of claiming delivery. Keep
+your original text until delivery is confirmed: on `failed`, the queue deletes
+the body, so resolve the cause before retrying from your copy.
 Report `queued`, `sent`, `failed`, and `uncertain` by their actual meanings. If
 delivery fails or is uncertain, show the refusal/status to the user instead of
 silently waiting or resending. A prompt that repeats the exact body you just
@@ -65,6 +70,9 @@ fragment before it, so write for one paragraph.
 Keep messages to opencode short (prefer under 400 characters). Put longer
 content in a file the peer can read and send a short sentence containing its
 path; do not try to force an overflowing draft through the composer.
+An overlong `--defer` send refuses before queueing; its error shows character
+and UTF-8 byte counts of the normalized message, including the sender label
+added by the script. Put long content in your own readable file and send its path.
 
 The script finds the peer pane on its own; the pane side (left or right) does not matter. When
 both panes run the same command it targets the pane opposite to yours. If it still asks for a

@@ -6,6 +6,7 @@ conditions live in a state file, and against a private queue directory. No
 test touches a live agterm pane; the real ctl binary is never invoked.
 """
 
+import argparse
 import fcntl
 import importlib.util
 import json
@@ -295,6 +296,10 @@ class QueueStoreTests(unittest.TestCase):
             ),
             (pc.PromptBlocked("gone", "pane_gone"), ("failed", "pane_gone")),
             (
+                pc.PromptBlocked("unrecognised", "composer_not_recognisable"),
+                ("failed", "composer_not_recognisable"),
+            ),
+            (
                 pc.DeliveryAmbiguous("ambiguous"),
                 ("uncertain", "ambiguous_submit"),
             ),
@@ -307,6 +312,36 @@ class QueueStoreTests(unittest.TestCase):
         ]
         for err, wanted in cases:
             self.assertEqual(pc.classify_delivery_error(err), wanted)
+
+    def test_auto_target_and_worker_use_the_same_opencode_limit(self):
+        info = dict(self.world.state["sessions"][0])
+        info["foreground"] = ["/fake/opencode"]
+        sender = {"AGTERM_SESSION_ID": "sid", "AGTERM_PANE": "right"}
+        profile = pc.Profile(
+            agent="opencode", command="opencode", label="", submit="\n"
+        )
+        with patch.dict(os.environ, sender), patch.object(
+            pc, "resolve_target", return_value=("win", "sid")
+        ), patch.object(pc, "find_node", return_value=info), patch.object(
+            pc, "socket_fingerprint", return_value=(1, 2, 3)
+        ), patch.object(pc.shutil, "which", return_value="/fake/agtermctl"), patch.object(
+            pc, "opencode_build_major", return_value=2
+        ), patch.object(pc, "_pane_text_unchecked", return_value=""):
+            args = argparse.Namespace(session=None, window=None)
+            pc.resolve_defer_target(args, profile)
+            self.assertEqual(pc.opencode_binary_path(profile), "/fake/opencode")
+            pc.check_message_length(profile, "x" * 1500)
+            worker_profile = pc.Profile(
+                agent="opencode", command="opencode", label="", submit="\n", pane="left"
+            )
+            pc.pane_text("sid", worker_profile, "win")
+            self.assertEqual(pc.opencode_binary_path(worker_profile), "/fake/opencode")
+            pc.check_message_length(worker_profile, "x" * 1500)
+            with self.assertRaisesRegex(pc.PromptBlocked, "1600 characters"):
+                pc.check_message_length(worker_profile, "x" * 1601)
+            info["foreground"] = ["zsh"]
+            with self.assertRaisesRegex(RuntimeError, "not running"):
+                pc.resolve_defer_target(args, profile)
 
     def test_delivery_diagnostics_do_not_expose_exception_payloads(self):
         record, _ = self.enqueue(body="PRIVATE_MESSAGE")
@@ -589,6 +624,42 @@ class WorkerDeliveryTests(unittest.TestCase):
         self.assertIn("session.type.pane-id", sent.stderr)
         self.assertEqual(self.world.events(), [])
         self.assertNotIn("queued", sent.stdout)
+
+    def test_overlong_message_refuses_before_enqueue(self):
+        body = "ж" * 1100
+        sent = self.world.run_cli(
+            ["--to", "opencode", "--defer", "--stdin"], stdin_text=body
+        )
+        self.assertNotEqual(sent.returncode, 0)
+        self.assertIn("message has 1118 characters", sent.stderr)
+        self.assertIn("including the sender label", sent.stderr)
+        self.assertIn("2218 UTF-8 bytes", sent.stderr)
+        self.assertNotIn("queued", sent.stdout)
+        self.assertFalse((self.world.queue_dir / pc.QUEUE_DB_NAME).exists())
+        self.assertEqual(self.world.events(), [])
+
+    def test_unknown_composer_fails_then_allows_next_message(self):
+        self.world.set_composer("shell")
+        first = self.defer("first")
+        self.assertTrue(
+            wait_until(
+                lambda: self.queue_row(first["id"])["status"] == "failed",
+                timeout=25,
+            )
+        )
+        row = self.queue_row(first["id"])
+        self.assertEqual(row["last_block"], "composer_not_recognisable")
+        self.assertEqual(row["attempts"], 1)
+        self.assertEqual(self.world.events(), [])
+        self.world.set_composer("empty")
+        second = self.defer("second")
+        self.assertTrue(
+            wait_until(
+                lambda: self.queue_row(second["id"])["status"] == "sent",
+                timeout=20,
+            )
+        )
+        self.assertEqual(self.world.submitted(), 1)
 
     def test_self_target_and_missing_sender_refuse_before_queueing_or_typing(self):
         for defer, pane in ((False, "left"), (True, "left"), (True, None)):
