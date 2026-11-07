@@ -133,7 +133,8 @@ def exchange_since(transcript: Path, prompts_back: int) -> tuple[tuple[str, str]
 def local_time(raw: str) -> datetime:
     """Transcript times are UTC. A person reads the filename, so it goes in their own clock."""
     try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone()
+        # Python 3.10 cannot parse the "Z" suffix itself; this recipe runs there.
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone()  # noqa: FURB162
     except ValueError:
         return datetime.now().astimezone()
 

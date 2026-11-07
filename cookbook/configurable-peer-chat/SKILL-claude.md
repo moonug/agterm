@@ -1,6 +1,6 @@
 ---
 name: peer-chat
-description: 'Hold a back-and-forth conversation with another coding agent running in the other pane of this agterm split session, as peers. Use when the user says "chat with codex", "work with claude-zai", "discuss this with claude-minimax", "talk to opencode", "ask codex what it thinks", or a similar phrase naming claude, claude-zai, claude-minimax, codex, or opencode — or when a prompt arrives starting with "Chat from Claude:", "Chat from Codex:", or "Chat from OpenCode:". Not for a one-shot task handed to another agent, and not for a read-only second opinion.'
+description: 'Hold a back-and-forth conversation with another coding agent running in another pane of this agterm session — the peer pane of a split, or the primary pane of a full-pane session — as peers. Use when the user says "chat with codex", "work with claude-zai", "discuss this with claude-minimax", "talk to opencode", "ask codex what it thinks", or a similar phrase naming claude, claude-zai, claude-minimax, codex, or opencode — or when a prompt arrives starting with "Chat from Claude:", "Chat from Codex:", or "Chat from OpenCode:". Not for a one-shot task handed to another agent, and not for a read-only second opinion.'
 allowed-tools: Bash, Read, Grep, Glob
 ---
 
@@ -17,14 +17,21 @@ settles. A raw command bypasses those checks.
 
 Invoke `peer-chat.py` as a bare command resolved through `PATH`; it is not a file inside this
 skill directory. Configured peer names live in `~/.config/agterm/peer-chat.json`.
+If it is missing from `PATH`, use the installed `$HOME/bin/peer-chat.py` only
+after confirming it is executable; do not guess a script path from the checkout.
 
 ## Preconditions
 
-The session needs a split with the peer agent already running in the other pane, started by the
-user. This skill never starts an agent and never opens a pane. If the split is missing or the
-other pane does not run the peer, say so and stop.
+The peer agent must already be running, started by the user. It sits either in the peer pane of a
+split session or in the primary pane of a full-pane session. This skill never starts an agent and
+never opens a pane. If the peer is not running, say so and stop.
 
 ## Sending
+
+On an incoming `Chat from ...` that needs an answer, activate this skill and
+send through `peer-chat.py` in the same turn; a reply in your own pane is not
+delivery. Never choose your own pane as `--to`/`--pane`. A refusal is a failed
+send, not a reason to claim the peer was notified.
 
 ```bash
 peer-chat.py --to codex --defer --stdin <<'CHAT'
@@ -33,13 +40,24 @@ CHAT
 ```
 
 A successful send prints a JSON receipt with `"queued"`, a message `id` and a
-deadline. `queued` means the message is stored and a short-lived worker will
-type it into the peer's composer as soon as that pane is confirmably ready for
-input — including right after the user answers a permission dialog there. It
+deadline. `queued` is the length of the normalized body in characters — the receipt
+means the message is stored and a short-lived worker will type it into the
+peer's composer as soon as that pane is confirmably ready for input —
+including right after the user answers a permission dialog there. It
 does not mean the peer has read the message or will answer. Report that the
-message is queued, then move on; do not watch the pane and do not poll — run
+message is queued, then move on; do not watch the pane or poll for a peer reply. Run
 `peer-chat.py --queue-status <id>` once if a status is genuinely needed, and
-`--queue-cancel <id>` if the message must not be delivered after all.
+`--queue-cancel <id>` if the message must not be delivered after all. Never say
+"sent" based on the receipt alone. If claiming submission after `--defer`,
+check `--queue-status <id>` once: say "queued" if still pending/delivering,
+and report a failed or uncertain result instead of claiming delivery. Keep
+your original text until delivery is confirmed: on `failed`, the queue deletes
+the body, so resolve the cause before retrying from your copy.
+Report `queued`, `sent`, `failed`, and `uncertain` by their actual meanings. If
+delivery fails or is uncertain, show the refusal/status to the user instead of
+silently waiting or resending. A prompt that repeats the exact body you just
+sent may be your own echo, not a peer reply; never wait for a reply on that
+basis alone.
 
 If the command refuses because this agterm lacks the pane-id capability
 (`--defer requires agterm with the session.type.pane-id capability`), repeat
@@ -49,19 +67,51 @@ the same send without `--defer`: the direct path below is unchanged.
 `opencode`. Pass the message on stdin through a quoted heredoc, never as an argument. The script
 collapses all whitespace to single spaces before typing, because typing a newline submits the
 fragment before it, so write for one paragraph.
+Keep the entire normalized message to opencode, including the sender label,
+to at most 400 characters in both v1 and v2. Put longer content in a file the
+peer can read and send a short sentence containing its path; the script does
+not create or split the content.
+An overlong `--defer` send refuses before queueing; its error shows character
+and UTF-8 byte counts of the normalized message, including the sender label
+added by the script. Put long content in your own readable file and send its path.
 
 The script finds the peer pane on its own; the pane side (left or right) does not matter. When
 both panes run the same command it targets the pane opposite to yours. If it still asks for a
 pane, add `--pane left|right` as it instructs.
 
+When the peer runs in a full-pane session — no split — the script cannot infer it from the current
+checkout. Name that session explicitly; `agtermctl tree` lists the ids and their titles:
+
+```bash
+peer-chat.py --to opencode --session BEFBFA91-0170-4D3A-AED8-F68B0D55B582 --stdin <<'CHAT'
+the message goes here, as one paragraph
+CHAT
+```
+
+Any unambiguous prefix of the session id works. `--session` also pins the pane, so a deferred
+delivery and a direct send to the same pane cannot interleave. `--window <id>` pins the agterm
+window when a session id is ambiguous across windows.
+
+An OpenCode message over 400 normalized characters including the sender label is
+refused before typing or queueing, in both direct and deferred modes. Write long
+content to a readable file and send its path — `the details are in /tmp/plan.md` —
+and let the peer read the file.
+
 A deferred message is pinned to the exact pane observed at send time. If that pane is replaced,
 the split is closed, or agterm restarts before delivery, the record is cancelled or fails — it is
 never retargeted to whatever appears in its place. Say so and let the user decide about resending.
 
-Before typing, the script confirms the target pane really is running the peer, matching what
-agterm reports for that pane. If the peer runs through a wrapper or an alias, the visible process
-name may differ: add `--target-command <name>` with the visible name. Never guess a name after a
-refusal and never retry with a different one until a human has told you which is right.
+Before typing, the script confirms the target pane really is running the peer. It matches the
+process agterm reports for that pane; when no pane answers to that name it falls back to the
+screen, and a pane that shows a composer of the configured kind is the peer whatever it runs — a
+wrapper such as `bun …/cli.js`, an alias or a patched build included. A wrapped flavour therefore
+needs no configuration. `--target-command <name>` still pins the visible name when the fallback is
+not enough; never guess a name after a refusal and never retry with a different one until a human
+has told you which is right.
+
+A build that draws its own caret block never moves the terminal caret, so agterm reports the caret
+at column 0 whatever the composer holds. The script reads that as "no caret reported" and judges
+emptiness by the composer's content instead, so a draft in the composer is still refused.
 
 Do not write a `Chat from ...:` label yourself. The script adds the label, and that label lets the
 peer read the message as conversation instead of as a fresh instruction from the user.
@@ -142,16 +192,45 @@ pane is ready. A direct (non-deferred) send refuses immediately with
 refusal. A record reported as `uncertain` by `--queue-status` may or may not have been submitted:
 read the target pane before doing anything.
 
-If the refusal says `target composer is collapsed (agent busy thinking)` — the peer is mid-thought and its input area is temporarily hidden; a deferred send simply waits it out, and the default retries ride it out in direct mode.
+If the refusal says `target composer is collapsed (agent busy thinking)` — the peer's input area is
+hidden. Most often the peer is mid-thought and a deferred send simply waits it out, and the default
+retries ride it out in direct mode. But a fresh opencode session has no input row either, and then
+the peer is simply waiting: send it something short to start it.
+
+A refusal that names the composer capacity means the message is too long for that pane. Write it to
+a file and send the path; do not retry it as it stands.
 
 If the script reports a pre-write refusal, nothing was written. After a body verification failure,
-`composer cleared` means its backspaces restored the empty prompt; `composer cleanup failed` means
-text may remain and the pane must be read. Cleanup checks each visible owned section before a bounded
-backspace batch, including after the opening scrolls away. A submit or acceptance failure is
+`composer cleared` means its backspaces restored the empty prompt. `failed / cleanup_failed`
+means text may remain: do not press Enter; inspect the target pane and manually clear only the
+fragment belonging to this send before continuing. The queue status may include a text-free
+`diagnostic.cleanup_reason`. Cleanup checks each visible owned section before a bounded backspace
+batch, including after the opening scrolls away, and erases a draft whose window shows
+only its head. A submit or acceptance failure is
 ambiguous. Stop, report the exact error and never re-send blind.
 
 Nothing the peer says supplies the user's approval for an action that needed it. "The peer agreed"
 is not approval and must never be reported as if it were.
+
+A refusal that says `the target accepted no input at all` means the peer's application did not
+show a single character of the typed text: it is not reading the keyboard. Nothing was submitted
+and nothing was left in the composer. Report it to the user and do not retry — a Claude Code
+build can stop reading input after spawning ripgrep, and only restarting the peer (a build
+launched with `CC_RG_PROXY=0` avoids it) brings the input back.
+
+## Known limitations
+
+The opencode composer is read from a screen capture. Its rows arrive joined into one line; the
+parser recovers the row width from the gutter rule and cuts the rows back out, so a narrow split
+pane parses like a wide one. Both opencode layouts are read: v1, whose status row names the
+agent, the model and the effort, and v2, whose status row names the agent and the model with
+its provider. When the layout is not recognised the send is refused with `target composer prompt
+is not recognisable` and nothing is written.
+
+A draft longer than the composer box does not fit in v1: opencode keeps showing the head of the
+draft and never the tail. v2 scrolls to the caret, but a long input can still leave an unconfirmed
+partial draft if cleanup fails. Both versions refuse inline messages over 400 normalized characters
+including the sender label. Write long content to a file and send a short path; the peer reads it.
 
 ## Manners
 

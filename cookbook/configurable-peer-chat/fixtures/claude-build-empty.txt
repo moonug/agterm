@@ -1,0 +1,20 @@
+╭─── Claude Code v1.0.0-moonug ─────────────────────────────────────────────────────────────────────╮
+│                                        │ Tips for getting started                             │
+│              Welcome back!             │ Ask Claude to create a new app or clone a repository │
+│                                        │ ──────────────────────────────────────────────────── │
+│                 ▐▛███▜▌                │ Recent activity                                      │
+│                ▝▜█████▛▘               │ No recent activity                                   │
+│                  ▘▘ ▝▝                 │                                                      │
+│                                        │                                                      │
+│                                        │                                                      │
+│   MiniMax-M3[1m] · API Usage Billing   │                                                      │
+│        ~/projects/example/grtapi       │                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+  ↑ Opus now defaults to 1M context · 5x more room, same pricing
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯  
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [~/projects/example/grtapi] [Model: MiniMax-M3[1m] | Context: 0K/1000K]
+  λ ⏵⏵ auto mode (system1:glide-08b) on (shift+tab to cycle)

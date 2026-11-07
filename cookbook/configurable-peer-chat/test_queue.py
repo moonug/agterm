@@ -6,6 +6,7 @@ conditions live in a state file, and against a private queue directory. No
 test touches a live agterm pane; the real ctl binary is never invoked.
 """
 
+import argparse
 import fcntl
 import importlib.util
 import json
@@ -17,6 +18,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "peer-chat.py")
@@ -92,7 +94,7 @@ class QueueWorld:
                 "PEER_CHAT_QUEUE_DIR": str(self.queue_dir),
                 "PEER_CHAT_CONFIG": FAKE_CONFIG,
                 "AGTERM_SESSION_ID": "sid",
-                "AGTERM_PANE": "left",
+                "AGTERM_PANE": "right",
                 "AGTERM_WINDOW_ID": "win",
                 "PEER_CHAT_FAKE_STATE": str(self.state_path),
                 "PEER_CHAT_DEBUG_DELIVERY": str(self.root / "delivery-debug.log"),
@@ -294,6 +296,10 @@ class QueueStoreTests(unittest.TestCase):
             ),
             (pc.PromptBlocked("gone", "pane_gone"), ("failed", "pane_gone")),
             (
+                pc.PromptBlocked("unrecognised", "composer_not_recognisable"),
+                ("failed", "composer_not_recognisable"),
+            ),
+            (
                 pc.DeliveryAmbiguous("ambiguous"),
                 ("uncertain", "ambiguous_submit"),
             ),
@@ -306,6 +312,119 @@ class QueueStoreTests(unittest.TestCase):
         ]
         for err, wanted in cases:
             self.assertEqual(pc.classify_delivery_error(err), wanted)
+
+    def test_auto_target_and_worker_use_the_same_opencode_limit(self):
+        info = dict(self.world.state["sessions"][0])
+        info["foreground"] = ["/fake/opencode"]
+        sender = {
+            "AGTERM_SESSION_ID": "sid",
+            "AGTERM_PANE": "right",
+            "PEER_CHAT_CONFIG": FAKE_CONFIG,
+        }
+        profile = pc.Profile(
+            agent="opencode", command="opencode", label="", submit="\n"
+        )
+        with patch.dict(os.environ, sender), patch.object(
+            pc, "resolve_target", return_value=("win", "sid")
+        ), patch.object(pc, "find_node", return_value=info), patch.object(
+            pc, "socket_fingerprint", return_value=(1, 2, 3)
+        ), patch.object(pc.shutil, "which", return_value="/fake/agtermctl"), patch.object(
+            pc, "opencode_build_major", return_value=2
+        ), patch.object(pc, "_pane_text_unchecked", return_value=""):
+            args = argparse.Namespace(session=None, window=None)
+            pc.resolve_defer_target(args, profile)
+            self.assertEqual(pc.opencode_binary_path(profile), "/fake/opencode")
+            pc.check_message_length(profile, "x" * 400)
+            worker_profile = pc.Profile(
+                agent="opencode", command="opencode", label="", submit="\n", pane="left"
+            )
+            pc.pane_text("sid", worker_profile, "win")
+            self.assertEqual(pc.opencode_binary_path(worker_profile), "/fake/opencode")
+            pc.check_message_length(worker_profile, "x" * 400)
+            with self.assertRaisesRegex(pc.PromptBlocked, "400 characters"):
+                pc.check_message_length(worker_profile, "x" * 401)
+            info["foreground"] = ["zsh"]
+            with self.assertRaisesRegex(RuntimeError, "not running"):
+                pc.resolve_defer_target(args, profile)
+
+    def test_delivery_diagnostics_do_not_expose_exception_payloads(self):
+        record, _ = self.enqueue(body="PRIVATE_MESSAGE")
+        row = self.conn.execute(
+            "SELECT * FROM queue WHERE id = ?", (record["id"],)
+        ).fetchone()
+        pre_write = RuntimeError("PRIVATE_MESSAGE")
+        pre_write.__cause__ = ValueError("PRIVATE_MESSAGE")
+        cases = [
+            (pre_write, "not_started", "delivery_error", None),
+            (pc.ComposerDirty("PRIVATE_MESSAGE", "PRIVATE_MESSAGE", cleared=True),
+             "body", "body_failed", True),
+            (pc.ComposerDirty("PRIVATE_MESSAGE", "PRIVATE_MESSAGE"),
+             "body", "cleanup_failed", False),
+            (pc.DeliveryAmbiguous("PRIVATE_MESSAGE"), "accept", "ambiguous_submit", None),
+        ]
+        for err, phase, reason, cleared in cases:
+            def fail(*args, progress, phase=phase, err=err, **kwargs):
+                progress.phase = phase
+                progress.attempt = 2
+                raise err
+
+            with self.subTest(phase=phase, cleared=cleared), patch.object(
+                pc, "send_with_retry", side_effect=fail
+            ):
+                status, block, diagnostic = pc.deliver_pending_row(row)
+                self.assertEqual(block, reason)
+                self.assertEqual(diagnostic["phase"], phase)
+                self.assertEqual(diagnostic["exception"], type(err).__name__)
+                self.assertEqual(diagnostic["causes"], ["ValueError"] if err is pre_write else [])
+                self.assertEqual(diagnostic["attempt"], 2)
+                self.assertEqual(diagnostic["cleanup_cleared"], cleared)
+                self.assertNotIn("PRIVATE_MESSAGE", json.dumps(diagnostic))
+                self.assertIn(status, ("failed", "uncertain"))
+
+    def test_cleanup_failure_reason_is_visible_without_message_text(self):
+        record, _ = self.enqueue(body="PRIVATE_MESSAGE")
+        row = self.conn.execute(
+            "SELECT * FROM queue WHERE id = ?", (record["id"],)
+        ).fetchone()
+
+        def refuse_cleanup(*args, **kwargs):
+            args[-1].append("visible text is not part of the sent text; blind deletion refused")
+            return False
+
+        def fail(*args, progress, **kwargs):
+            progress.phase = "body"
+            pc.raise_after_composer_dirty(
+                "sid", self.profile(), ("", 2),
+                pc.ComposerDirty("PRIVATE_MESSAGE", "PRIVATE_MESSAGE"),
+            )
+
+        with patch.object(pc, "send_with_retry", side_effect=fail), patch.object(
+            pc, "clear_composer", side_effect=refuse_cleanup
+        ):
+            status, block, diagnostic = pc.deliver_pending_row(row)
+        self.assertEqual((status, block), ("failed", "cleanup_failed"))
+        self.conn.execute(
+            "UPDATE queue SET status = ?, last_block = ?, diagnostic = ? WHERE id = ?",
+            (status, block, json.dumps(diagnostic), record["id"]),
+        )
+        public = pc.queue_status(self.conn, record["id"])
+        self.assertEqual(
+            public["records"]["diagnostic"]["cleanup_reason"],
+            "visible text is not part of the sent text; blind deletion refused",
+        )
+        self.assertNotIn("PRIVATE_MESSAGE", json.dumps(public))
+
+    def test_existing_queue_gains_diagnostic_column_without_losing_records(self):
+        record, _ = self.enqueue()
+        self.conn.execute("ALTER TABLE queue DROP COLUMN diagnostic")
+        self.conn.commit()
+        conn = pc.queue_connect()
+        try:
+            row = conn.execute("SELECT * FROM queue WHERE id = ?", (record["id"],)).fetchone()
+            self.assertIsNone(row["diagnostic"])
+            self.assertIn("hello", row["body"])
+        finally:
+            conn.close()
 
     def test_sync_guard_refuses_when_pending_records_exist(self):
         self.enqueue()
@@ -543,6 +662,121 @@ class WorkerDeliveryTests(unittest.TestCase):
         self.assertEqual(self.world.events(), [])
         self.assertNotIn("queued", sent.stdout)
 
+    def test_overlong_message_refuses_before_enqueue(self):
+        body = "ж" * 1100
+        sent = self.world.run_cli(
+            ["--to", "opencode", "--defer", "--stdin"], stdin_text=body
+        )
+        self.assertNotEqual(sent.returncode, 0)
+        self.assertIn("message has 1120 characters", sent.stderr)
+        self.assertIn("including the sender label", sent.stderr)
+        self.assertIn("2220 UTF-8 bytes", sent.stderr)
+        self.assertNotIn("queued", sent.stdout)
+        self.assertFalse((self.world.queue_dir / pc.QUEUE_DB_NAME).exists())
+        self.assertEqual(self.world.events(), [])
+
+    def test_short_opencode_limit_covers_known_failure_before_enqueue(self):
+        body = "ж" * 510
+        sent = self.world.run_cli(
+            ["--to", "opencode", "--defer", "--stdin"], stdin_text=body,
+        )
+        self.assertNotEqual(sent.returncode, 0)
+        self.assertIn("at most 400 characters", sent.stderr)
+        self.assertIn("message has 530 characters", sent.stderr)
+        self.assertIn("1040 UTF-8 bytes", sent.stderr)
+        self.assertFalse((self.world.queue_dir / pc.QUEUE_DB_NAME).exists())
+        self.assertEqual(self.world.events(), [])
+
+    def test_unknown_composer_fails_then_allows_next_message(self):
+        self.world.set_composer("shell")
+        first = self.defer("first")
+        self.assertTrue(
+            wait_until(
+                lambda: self.queue_row(first["id"])["status"] == "failed",
+                timeout=25,
+            )
+        )
+        row = self.queue_row(first["id"])
+        self.assertEqual(row["last_block"], "composer_not_recognisable")
+        self.assertEqual(row["attempts"], 1)
+        self.assertEqual(self.world.events(), [])
+        self.world.set_composer("empty")
+        second = self.defer("second")
+        self.assertTrue(
+            wait_until(
+                lambda: self.queue_row(second["id"])["status"] == "sent",
+                timeout=20,
+            )
+        )
+        self.assertEqual(self.world.submitted(), 1)
+
+    def test_self_target_and_missing_sender_refuse_before_queueing_or_typing(self):
+        for defer, pane in ((False, "left"), (True, "left"), (True, None)):
+            env = self.world.base_env()
+            env["AGTERM_PANE"] = "left"
+            args = ["--to", "opencode", "--stdin"]
+            if defer:
+                args.append("--defer")
+            if pane:
+                args.extend(("--pane", pane))
+            with self.subTest(defer=defer, pane=pane):
+                result = self.world.run_cli(args, stdin_text="do not echo", env=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("target is the sending pane", result.stderr)
+                self.assertEqual(self.world.events(), [])
+                self.assertEqual(self.world.submitted(), 0)
+                self.assertNotIn('"queued"', result.stdout)
+
+        env = self.world.base_env()
+        env.pop("AGTERM_SESSION_ID")
+        result = self.world.run_cli(
+            ["--to", "opencode", "--stdin"], stdin_text="unknown sender", env=env
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sending pane identity is unavailable", result.stderr)
+        self.assertEqual(self.world.events(), [])
+
+    def test_ambiguous_delivery_retains_safe_diagnostics_without_retry(self):
+        self.world.state["submit_ok"] = False
+        self.world.write_state()
+        receipt = self.defer("PRIVATE_MESSAGE")
+        self.assertTrue(wait_until(
+            lambda: self.queue_row(receipt["id"])["status"] == "uncertain", timeout=20
+        ))
+        row = self.queue_row(receipt["id"])
+        diagnostic = json.loads(row["diagnostic"])
+        self.assertEqual(diagnostic["phase"], "accept")
+        self.assertEqual(diagnostic["exception"], "DeliveryAmbiguous")
+        self.assertEqual(diagnostic["attempt"], 1)
+        self.assertEqual(self.world.submitted(), 1)
+        self.assertIsNone(row["body"])
+        conn = self.world.connect()
+        try:
+            public = pc.queue_status(conn, receipt["id"])
+            self.assertEqual(public["records"]["diagnostic"], diagnostic)
+            self.assertNotIn("PRIVATE_MESSAGE", json.dumps(public))
+        finally:
+            conn.close()
+
+    def test_busy_composer_then_two_deferred_messages_preserve_order(self):
+        self.world.set_composer("collapsed")
+        first = self.insert_pending_row("first synthetic message")
+        second = self.insert_pending_row("second synthetic message")
+        self.assertIsNotNone(self.start_bare_worker())
+        self.assertTrue(wait_until(
+            lambda: self.queue_row(first["id"])["attempts"] >= 1, timeout=10
+        ))
+        self.assertEqual(self.world.events(), [])
+        self.world.set_composer("empty")
+        self.assertTrue(wait_until(
+            lambda: self.queue_row(second["id"])["status"] == "sent", timeout=30
+        ), self.world.debug_text())
+        self.assertEqual(self.queue_row(first["id"])["status"], "sent")
+        self.assertEqual(self.world.read_state()["submitted_texts"], [
+            "Chat from Claude: first synthetic message",
+            "Chat from Claude: second synthetic message",
+        ])
+
     def test_defer_without_ttl_uses_the_default(self):
         self.world.set_composer("dialog")  # the worker only probes
         sent = self.world.run_cli(
@@ -618,7 +852,7 @@ class WorkerDeliveryTests(unittest.TestCase):
     def test_worker_death_in_delivering_becomes_uncertain_without_retry(self):
         self.world.state["type_delay"] = 1.5
         self.world.write_state()
-        record = self.insert_pending_row("killed mid delivery " * 20)
+        record = self.insert_pending_row("killed mid delivery " * 18)
         victim = self.start_bare_worker()
         self.assertIsNotNone(victim, "lifetime lock unexpectedly busy")
         self.assertTrue(
