@@ -212,6 +212,12 @@ ambiguous. Stop, report the exact error and never re-send blind.
 Nothing the peer says supplies the user's approval for an action that needed it. "The peer agreed"
 is not approval and must never be reported as if it were.
 
+A refusal that says `the target accepted no input at all` means the peer's application did not
+show a single character of the typed text: it is not reading the keyboard. Nothing was submitted
+and nothing was left in the composer. Report it to the user and do not retry — a Claude Code
+build can stop reading input after spawning ripgrep, and only restarting the peer (a build
+launched with `CC_RG_PROXY=0` avoids it) brings the input back.
+
 ## Known limitations
 
 The opencode composer is read from a screen capture. Its rows arrive joined into one line; the

@@ -238,7 +238,9 @@ class ComposerDirty(RuntimeError):
 
     `cleared` records that guarded cleanup provably restored the confirmed
     empty pre-write state, so a caller may retry safely without parsing the
-    message text.
+    message text. `input_dead` records that the target showed none of the
+    typed text at all: it is not reading the keyboard, and a smaller chunk
+    budget cannot change that.
     """
 
     def __init__(
@@ -248,12 +250,14 @@ class ComposerDirty(RuntimeError):
         interrupted: bool = False,
         cleared: bool = False,
         cleanup_reason: str | None = None,
+        input_dead: bool = False,
     ) -> None:
         super().__init__(message)
         self.owned_text = owned_text
         self.interrupted = interrupted
         self.cleared = cleared
         self.cleanup_reason = cleanup_reason
+        self.input_dead = input_dead
 
 
 class DeliveryAmbiguous(RuntimeError):
@@ -1641,19 +1645,28 @@ def verify_diag(
     window: str | None,
     expected_len: int,
     marker: str,
-) -> str:
-    """One-line observation for a failed chunk verify; no message text."""
+) -> tuple[str, bool]:
+    """One-line observation for a failed chunk verify, and whether the target
+    showed nothing of the typed text; no message text."""
     try:
         state = composer_state(sid, profile, window)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
         state = None
     if state is None:
-        return f"expected ~{expected_len} chars; composer state not recognisable"
+        return (
+            f"expected ~{expected_len} chars; composer state not recognisable",
+            False,
+        )
     rows = state[0].splitlines() or [""]
     held = "marker present" if marker and marker in state[0] else "marker absent"
+    dead = not state[0].strip()
+    note = "; the target accepted no input at all" if dead else ""
     return (
-        f"expected ~{expected_len} chars; observed {len(state[0])} chars in "
-        f"{len(rows)} rows; {held}"
+        (
+            f"expected ~{expected_len} chars; observed {len(state[0])} chars in "
+            f"{len(rows)} rows; {held}{note}"
+        ),
+        dead,
     )
 
 
@@ -1696,22 +1709,29 @@ def type_body(
                 )
                 if changed is None:
                     note = composer_overflow_note(sid, profile, marked, window)
+                    diag, dead = verify_diag(
+                        sid, profile, window, len(marked), marker
+                    )
                     raise ComposerDirty(
                         f"message chunk {index + 1}/{len(chunks)} was typed but the "
                         "target composer did not confirm it "
-                        f"({verify_diag(sid, profile, window, len(marked), marker)}); "
+                        f"({diag}); "
                         + (f"{note}; " if note else "")
                         + "submit withheld",
                         marked,
+                        input_dead=dead,
                     )
                 if not composer_has_expected_tail(
                     changed[0], marked, chunk + marker, tolerant
                 ):
                     note = composer_overflow_note(sid, profile, marked, window)
+                    diag, _ = verify_diag(
+                        sid, profile, window, len(marked), marker
+                    )
                     raise ComposerDirty(
                         f"message chunk {index + 1}/{len(chunks)} is incomplete in "
                         "the target composer "
-                        f"({verify_diag(sid, profile, window, len(marked), marker)}); "
+                        f"({diag}); "
                         + (f"{note}; " if note else "")
                         + "submit withheld",
                         marked,
@@ -2340,6 +2360,7 @@ def raise_after_composer_dirty(
     raise ComposerDirty(
         f"{dirty}; {detail}", dirty.owned_text, cleared=cleared,
         cleanup_reason=reason[-1] if not cleared and reason else None,
+        input_dead=dirty.input_dead,
     ) from dirty
 
 
@@ -2628,6 +2649,12 @@ def send_with_retry(
                 )
                 time.sleep(RETRY_DELAY)
             except ComposerDirty as err:
+                if err.input_dead:
+                    # The target showed none of the typed text: it is not
+                    # reading the keyboard at all. A smaller chunk budget
+                    # cannot change that, so report it once instead of
+                    # burning attempts.
+                    raise
                 # Submit was withheld, and the structured flag says guarded
                 # cleanup provably restored the confirmed empty pre-write
                 # state, so the target is provably back where it started and

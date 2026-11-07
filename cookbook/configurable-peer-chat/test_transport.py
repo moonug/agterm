@@ -217,6 +217,26 @@ class SendScenarios(unittest.TestCase):
         self.assertEqual(pane.submit_count, 0)
         self.assertEqual(pane.text, "")
 
+    def test_dead_input_is_named_and_never_retried(self):
+        # A target that does not read the keyboard at all: nothing it shows
+        # can confirm the text, and a smaller chunk budget cannot change that.
+        pane = FakePane()
+
+        def dead_type(profile, text):
+            pane.events.append(text)
+
+        pane.type = dead_type
+        with Harness(pane), self.assertRaises(pc.ComposerDirty) as ctx:
+            pc.send_with_retry("sid", opencode_profile(), long_message(200))
+        err = str(ctx.exception)
+        self.assertIn("the target accepted no input at all", err)
+        self.assertTrue(ctx.exception.input_dead)
+        self.assertEqual(pane.submit_count, 0)
+        # One attempt only: a retry would type the same text into the same
+        # dead pane.
+        typed = [e for e in pane.events if e.strip()]
+        self.assertEqual(len(typed), 1)
+
     def test_retry_after_confirmed_cleanup_succeeds_once(self):
         message = long_message(390)
         pane = FakePane()

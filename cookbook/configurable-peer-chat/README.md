@@ -87,6 +87,7 @@ When a chunk cannot be verified, the script withholds the submit, restores the e
 - A fresh opencode session (splash box) or any chooser makes the send refuse. Write something in that pane first; never answer choosers for the user.
 - A message that is a lone path (`~/foo`) is taken for opencode's empty-composer cwd hint when the session's cwd is not visible in the capture and the composer shows no input row; avoid such one-token messages.
 - OpenCode inline messages over 400 normalized characters including the sender label are refused before typing, for both v1 and v2. Put long content in a readable file and send a short path.
+- A target that shows none of the typed text is not reading the keyboard: the send stops after the first chunk and says `the target accepted no input at all` instead of retrying with a smaller chunk. A Claude Code build can stop reading input after spawning ripgrep; only restarting the peer brings the input back.
 - No transcript: the conversation lives in the two panes. A reply is never promised.
 - Same-kind pairs share one label (`Chat from Claude: ` for claude-zai ↔ claude-minimax); the peer is identified by pane position, not by label.
 - The delivery pin is a terminal pane, not a conversation: a peer that starts a new conversation in the same pane is not detected. Cancel queued records (`--queue-cancel`) before switching the topic in the target pane, and rely on the TTL (default 30 minutes) to retire stale ones.
