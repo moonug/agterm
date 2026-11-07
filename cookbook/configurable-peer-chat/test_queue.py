@@ -316,7 +316,11 @@ class QueueStoreTests(unittest.TestCase):
     def test_auto_target_and_worker_use_the_same_opencode_limit(self):
         info = dict(self.world.state["sessions"][0])
         info["foreground"] = ["/fake/opencode"]
-        sender = {"AGTERM_SESSION_ID": "sid", "AGTERM_PANE": "right"}
+        sender = {
+            "AGTERM_SESSION_ID": "sid",
+            "AGTERM_PANE": "right",
+            "PEER_CHAT_CONFIG": FAKE_CONFIG,
+        }
         profile = pc.Profile(
             agent="opencode", command="opencode", label="", submit="\n"
         )

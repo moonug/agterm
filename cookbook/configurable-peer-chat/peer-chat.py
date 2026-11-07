@@ -488,10 +488,19 @@ def pane_candidates(
 
 
 def runs_other_kind(foreground: Any, kind: str) -> bool:
-    """Whether the foreground identifies an agent of another kind."""
+    """Whether the foreground identifies an agent of another kind.
+
+    A missing or broken config leaves the exclusion empty: the target comes
+    from the config before any pane is read, so a config problem surfaces
+    there rather than here.
+    """
     if not isinstance(foreground, list):
         return False
-    for spec in load_agents().values():
+    try:
+        agents = load_agents()
+    except RuntimeError:
+        return False
+    for spec in agents.values():
         if spec["kind"] != kind and runs(foreground, spec["command"]):
             return True
     return False
