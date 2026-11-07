@@ -439,8 +439,8 @@ expect(
 expect("v1 prints a bare version", pc.opencode_version_major("1.18.29+moonug"), 1)
 expect("v2 prints a prefixed version", pc.opencode_version_major("opencode v2.2.1"), 2)
 expect("no version at all", pc.opencode_version_major(""), None)
-expect("v1 keeps the head, so the limit is the visible window", pc.OPENCODE_V1_MESSAGE_LIMIT, 1000)
-expect("v2 scrolls to the caret, so the limit is a rule of thumb", pc.OPENCODE_V2_MESSAGE_LIMIT, 1600)
+expect("v1 inline message limit", pc.OPENCODE_V1_MESSAGE_LIMIT, 400)
+expect("v2 inline message limit", pc.OPENCODE_V2_MESSAGE_LIMIT, 400)
 
 # --- a v2 permission dialog must never be typed into ---------------------------------
 v2_dialog = """╭─ Permission required ─
@@ -454,6 +454,92 @@ expect(
     "a dialog without a reject option is not one",
     pc.opencode_permission_dialog(v2_dialog.replace("3. Reject", "3. Later")),
     False,
+)
+
+# --- a claude build behind a wrapper: the screen names the kind ----------------------
+build_capture = fixture("claude-build-empty.txt")
+expect(
+    "the wrapped build's empty composer is recognised",
+    pc.claude_live_prompt_text(build_capture),
+    "",
+)
+expect(
+    "the wrapped build is a claude composer",
+    pc.kind_on_screen(build_capture),
+    "claude",
+)
+expect(
+    "a shell prompt names no kind",
+    pc.kind_on_screen("┌─[moonug@moonug-osx] [~/projects]\n└─[√] $ "),
+    None,
+)
+expect(
+    "the wrapped build shows a claude composer",
+    pc.shows_kind(claude_profile, build_capture),
+    True,
+)
+
+# A build that draws its own caret block never moves the terminal caret: the
+# prompt glyph occupies column 0, so the reported column is 0 and says nothing
+# about the composer.
+expect("the caret at the prompt column agrees", pc.caret_column_agrees(2), True)
+expect("a build that reports no caret agrees", pc.caret_column_agrees(0), True)
+expect("a caret past the composer disagrees", pc.caret_column_agrees(5), False)
+expect(
+    "an empty composer with no reported caret is clear",
+    pc.composer_is_clear(claude_profile, ("", 0)),
+    True,
+)
+expect(
+    "a draft with no reported caret is not clear",
+    pc.composer_is_clear(claude_profile, ("hello", 0)),
+    False,
+)
+
+# A peer that runs through a wrapper answers to no configured command, so the
+# screen is what identifies it.
+wrapped_session = {
+    "id": "wrapped",
+    "hasSplit": True,
+    "foreground": ["opencode"],
+    "splitForeground": ["bun", "/projects/claude-code-build/dist/cli.js"],
+}
+shell_session = {
+    "id": "shell",
+    "hasSplit": True,
+    "foreground": ["opencode"],
+    "splitForeground": ["zsh"],
+}
+
+
+def pane_reader(text):
+    def read(sid, profile, window=None):
+        return text if profile.pane == "right" else ""
+
+    return read
+
+
+with patch.object(pc, "_pane_text_unchecked", pane_reader(build_capture)):
+    expect(
+        "a wrapped peer is found by its composer",
+        pc.pane_candidates(wrapped_session, claude_target),
+        ["right"],
+    )
+with patch.object(
+    pc, "_pane_text_unchecked", pane_reader("┌─[moonug@moonug-osx]\n└─[√] $ ")
+):
+    expect(
+        "a shell pane is not a peer",
+        pc.pane_candidates(shell_session, claude_target),
+        [],
+    )
+expect(
+    "the pane running another agent is never a peer",
+    pc.pane_candidates(
+        {"hasSplit": True, "foreground": ["opencode"], "splitForeground": ["opencode"]},
+        claude_target,
+    ),
+    [],
 )
 
 print("all parser and pane-rule checks passed")

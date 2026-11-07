@@ -55,6 +55,11 @@ RETRY_ATTEMPTS = 5
 RETRY_DELAY = 10.0
 BOX_LINES = 80
 EMPTY_CURSOR_COLUMN = 2
+# The prompt glyph of a composer occupies column 0, so a caret reported there
+# cannot be inside the input area. A build that draws its own caret block and
+# never moves the terminal caret reports this column whatever the composer
+# holds; the value then carries no signal about the composer.
+UNREPORTED_CURSOR_COLUMN = 0
 MAX_MESSAGE_BYTES = 64 * 1024
 # Claude can put a short context label inside the top composer rule, for example `e2e`.
 RULE_RE = re.compile(r"^\s*[─\u2014-]{10,}(?:\s+[^─\u2014-].*?\s+[─\u2014-]+)?\s*$")
@@ -145,6 +150,9 @@ MESSAGE_SPOOL = Path(tempfile.gettempdir()) / f"agterm-peer-chat-{os.getuid()}"
 
 KNOWN_KINDS = ("claude", "codex", "opencode")
 KIND_NAMES = {"claude": "Claude", "codex": "Codex", "opencode": "OpenCode"}
+# The two addressable panes of a session and the tree fields naming what runs
+# in them.
+PANE_FIELDS = (("left", "foreground"), ("right", "splitForeground"))
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "agterm" / "peer-chat.json"
 
 
@@ -239,11 +247,13 @@ class ComposerDirty(RuntimeError):
         owned_text: str,
         interrupted: bool = False,
         cleared: bool = False,
+        cleanup_reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.owned_text = owned_text
         self.interrupted = interrupted
         self.cleared = cleared
+        self.cleanup_reason = cleanup_reason
 
 
 class DeliveryAmbiguous(RuntimeError):
@@ -397,6 +407,12 @@ def sender_label() -> str:
             for spec in load_agents().values():
                 if runs(foreground, spec["command"]):
                     return f"Chat from {KIND_NAMES[spec['kind']]}: "
+            # A peer that runs through a wrapper answers to no configured
+            # command; the screen it draws names the kind instead.
+            text = pane_capture(info, pane, window)
+            kind = kind_on_screen(text) if text is not None else None
+            if kind is not None:
+                return f"Chat from {KIND_NAMES[kind]}: "
     return "Chat from Claude: "
 
 
@@ -445,27 +461,106 @@ def find_node(sid: str, window: str | None = None) -> dict[str, Any]:
     raise RuntimeError(f"ambiguous session prefix {sid!r}")
 
 
-def pane_candidates(info: dict[str, Any], profile: Profile) -> list[str]:
+def pane_candidates(
+    info: dict[str, Any], profile: Profile, window: str | None = None
+) -> list[str]:
+    """Addressable panes that can host the peer.
+
+    A pane whose foreground runs the configured command always qualifies. A
+    peer that runs through a wrapper (`bun .../cli.js`) answers to no
+    configured command, so its screen is the only thing that identifies it:
+    such a pane qualifies when its command belongs to no other configured
+    agent kind and the pane shows a composer of the requested kind.
+    """
     candidates = []
-    if runs(info.get("foreground"), profile.command):
-        candidates.append("left")
-    if runs(info.get("splitForeground"), profile.command):
-        candidates.append("right")
+    for pane, field in PANE_FIELDS:
+        if runs(info.get(field), profile.command):
+            candidates.append(pane)
+    if candidates:
+        return candidates
+    for pane, field in PANE_FIELDS:
+        foreground = info.get(field) or []
+        if not foreground or runs_other_kind(foreground, profile.agent):
+            continue
+        if pane_shows_kind(info, pane, profile, window):
+            candidates.append(pane)
     return candidates
 
 
-def has_target(info: dict[str, Any], profile: Profile) -> bool:
+def runs_other_kind(foreground: Any, kind: str) -> bool:
+    """Whether the foreground identifies an agent of another kind."""
+    if not isinstance(foreground, list):
+        return False
+    for spec in load_agents().values():
+        if spec["kind"] != kind and runs(foreground, spec["command"]):
+            return True
+    return False
+
+
+def pane_capture(
+    info: dict[str, Any], pane: str, window: str | None = None
+) -> str | None:
+    """The visible text of one pane, or None when it cannot be read."""
+    sid = info.get("id")
+    if not sid:
+        return None
+    probe = Profile(agent="claude", command="", label="", submit="\n", pane=pane)
+    try:
+        return _pane_text_unchecked(str(sid), probe, window)
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def pane_shows_kind(
+    info: dict[str, Any],
+    pane: str,
+    profile: Profile,
+    window: str | None = None,
+) -> bool:
+    """Whether the pane's screen shows a composer of the requested kind."""
+    text = pane_capture(info, pane, window)
+    if text is None:
+        return False
+    return shows_kind(profile, text)
+
+
+def shows_kind(profile: Profile, text: str) -> bool:
+    """Whether a screen shows a composer of the requested kind.
+
+    A composer that is busy with a permission dialog shows no live prompt,
+    but it is still the peer: the dialog is the peer's, and refusing to
+    address the pane would hide the reason from the user.
+    """
+    if live_prompt_text(profile, text) is not None:
+        return True
+    return active_modal(profile, text)
+
+
+def kind_on_screen(text: str) -> str | None:
+    """The composer kind a screen shows, whatever runs in it."""
+    for kind in KNOWN_KINDS:
+        probe = Profile(agent=kind, command="", label="", submit="\n")
+        if live_prompt_text(probe, text) is not None:
+            return kind
+    return None
+
+
+def has_target(
+    info: dict[str, Any], profile: Profile, window: str | None = None
+) -> bool:
     """A pane of this session runs the target command.
 
     The peer may sit in the split pane of a split session or in the primary
     pane of a full-pane session; both are addressable panes.
     """
-    return bool(pane_candidates(info, profile))
+    return bool(pane_candidates(info, profile, window))
 
 
-def resolve_pane(info: dict[str, Any], profile: Profile) -> str:
+def resolve_pane(
+    info: dict[str, Any], profile: Profile, window: str | None = None
+) -> str:
     """Pick which pane runs the target command."""
-    candidates = pane_candidates(info, profile)
+    candidates = pane_candidates(info, profile, window)
     if len(candidates) == 1:
         reject_self_target(info, candidates[0])
         return candidates[0]
@@ -478,9 +573,10 @@ def resolve_pane(info: dict[str, Any], profile: Profile) -> str:
             "unknown; pass --pane left|right"
         )
     raise RuntimeError(
-        f"{profile.agent} target pane is not running {profile.command!r}; "
-        "the peer may live in another session — pass --session <id> "
-        "(agtermctl tree lists them); for a wrapper, pass --target-command NAME"
+        f"{profile.agent} target pane is not running {profile.command!r} and "
+        "shows no composer of that kind; the peer may live in another session "
+        "— pass --session <id> (agtermctl tree lists them); for a wrapper, "
+        "pass --target-command NAME"
     )
 
 
@@ -499,11 +595,12 @@ def require_target(
     info = find_node(sid, pinned_window(profile, window))
     profile.node = info
     if profile.pane is None:
-        profile.pane = resolve_pane(info, profile)
-    elif profile.pane not in pane_candidates(info, profile):
+        profile.pane = resolve_pane(info, profile, window)
+    elif profile.pane not in pane_candidates(info, profile, window):
         raise RuntimeError(
             f"{profile.agent} pane {profile.pane} is not running "
-            f"{profile.command!r}; for a wrapper, pass --target-command NAME"
+            f"{profile.command!r} and shows no composer of that kind; for a "
+            "wrapper, pass --target-command NAME"
         )
     reject_self_target(info, profile.pane)
     return str(info["id"])
@@ -519,9 +616,9 @@ def resolve_session(
     candidates = [
         info
         for info in walk(tree(window))
-        if has_target(info, profile)
-        and info.get("cwd")
+        if info.get("cwd")
         and checkout_key(str(info["cwd"])) == wanted
+        and has_target(info, profile, window)
     ]
     # A peer in a split pane is the established setup; a peer in the primary
     # pane of a full-pane session is the fallback.
@@ -532,7 +629,8 @@ def resolve_session(
     if not matches:
         raise RuntimeError(
             "no session in this checkout runs "
-            f"{profile.command!r}; for a wrapper, pass --target-command NAME"
+            f"{profile.command!r} or shows a {profile.agent} composer; for a "
+            "wrapper, pass --target-command NAME"
         )
     raise RuntimeError(
         "more than one session shares this checkout; pass --session ID or launch "
@@ -625,10 +723,10 @@ def verify_pinned_identity(
         raise PromptBlocked(
             "target split no longer exists; delivery cancelled", "pane_gone"
         )
-    if pane not in pane_candidates(info, profile):
+    if pane not in pane_candidates(info, profile, pinned_window(profile, window)):
         raise PromptBlocked(
-            f"target pane {pane} no longer runs {profile.command!r}; "
-            "delivery cancelled",
+            f"target pane {pane} no longer runs {profile.command!r} and shows "
+            "no composer of that kind; delivery cancelled",
             "pane_changed",
         )
     token = info.get("paneID") if pane == "left" else info.get("splitPaneID")
@@ -1111,17 +1209,10 @@ def opencode_split_cwd_hint(
 
 # How long a message may be before it is refused instead of typed.
 #
-# opencode v1 keeps the head of a draft that overflows its box, so the tail
-# of a long message can never be confirmed: the message has to fit in the
-# visible window. Measured on a 215x66 pane: 1078 characters still showed
-# their tail, 1617 did not, so the window is about 1100 characters.
-#
-# v2 scrolls the composer to the caret instead: the tail stays on screen
-# however long the draft is (measured: still visible after 13 900
-# characters, and a 2999 character message went through end to end). There
-# the limit is a rule of thumb, not a wall.
-OPENCODE_V1_MESSAGE_LIMIT = 1000
-OPENCODE_V2_MESSAGE_LIMIT = 1600
+# Both versions can leave an unconfirmed partial draft after long input;
+# keep inline messages short and send longer text by file path instead.
+OPENCODE_V1_MESSAGE_LIMIT = 400
+OPENCODE_V2_MESSAGE_LIMIT = 400
 OPENCODE_VERSION_CACHE: dict[str, str] = {}
 
 
@@ -1393,6 +1484,19 @@ def codex_placeholder_shown(content: str) -> bool:
     return len(expected) in reached
 
 
+def caret_column_agrees(column: int) -> bool:
+    """Whether the reported caret column is consistent with an empty composer.
+
+    Claude Code parks the terminal caret at the prompt column, just after the
+    prompt glyph, so an empty composer reports that column and a caret
+    anywhere else means the composer is not the live input. A build that
+    draws its own caret block and never moves the terminal caret reports
+    column 0 whatever the composer holds; that value carries no signal, so
+    it is accepted and the emptiness rests on the composer's content.
+    """
+    return column in (EMPTY_CURSOR_COLUMN, UNREPORTED_CURSOR_COLUMN)
+
+
 def composer_is_empty(profile: Profile, content: str) -> bool:
     """Recognise known empty-input content for cleanup, acceptance and preflight."""
     if profile.agent == "codex":
@@ -1415,7 +1519,7 @@ def composer_is_clear(profile: Profile, state: tuple[str, int] | None) -> bool:
     so its emptiness is judged on content alone."""
     if state is None or not composer_is_empty(profile, state[0]):
         return False
-    return profile.agent == "opencode" or state[1] == EMPTY_CURSOR_COLUMN
+    return profile.agent == "opencode" or caret_column_agrees(state[1])
 
 
 def composer_state(
@@ -2218,13 +2322,15 @@ def raise_after_composer_dirty(
         ) from cleanup_err
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
         cleared = False
+        reason.append("composer cleanup raised an error")
     detail = "composer cleared" if cleared else "composer cleanup failed"
     if not cleared and reason:
         detail += f" ({'; '.join(reason)})"
     if dirty.interrupted:
         raise KeyboardInterrupt(f"{dirty}; {detail}") from dirty
     raise ComposerDirty(
-        f"{dirty}; {detail}", dirty.owned_text, cleared=cleared
+        f"{dirty}; {detail}", dirty.owned_text, cleared=cleared,
+        cleanup_reason=reason[-1] if not cleared and reason else None,
     ) from dirty
 
 
@@ -2306,9 +2412,8 @@ def check_composer_ready(
     # Claude's free-form suggestions look like drafts in plain screen text.
     # opencode renders no fixed prompt column (splash box, status rows), so
     # its cursor position is not a usable emptiness signal and is skipped.
-    if profile.agent in ("codex", "opencode") and not composer_is_empty(
-        profile, empty_text
-    ):
+    empty = composer_is_empty(profile, empty_text)
+    if profile.agent in ("codex", "opencode") and not empty:
         raise PromptBlocked(
             "target composer contains text; nothing was typed",
             "composer_not_empty",
@@ -2319,10 +2424,19 @@ def check_composer_ready(
         if profile.agent == "opencode"
         else cursor_column(sid, profile, window)
     )
-    if column != EMPTY_CURSOR_COLUMN:
+    if not caret_column_agrees(column):
         raise PromptBlocked(
             "target composer is not confirmably empty; nothing was typed",
             "composer_not_confirmed_empty",
+        )
+    if profile.agent == "claude" and not empty:
+        # The caret check above already refuses a draft for a build that
+        # parks the caret at the prompt column. A build that reports no caret
+        # at all leaves the emptiness to the content, and the draft has to be
+        # caught here.
+        raise PromptBlocked(
+            "target composer contains text; nothing was typed",
+            "composer_not_empty",
         )
     return empty_text, column
 
@@ -2914,7 +3028,7 @@ def resolve_defer_target(
     require_target(sid, profile, window)
     info = find_node(sid, window)
     if profile.pane is None:
-        profile.pane = resolve_pane(info, profile)
+        profile.pane = resolve_pane(info, profile, window)
     token = (
         info.get("paneID") if profile.pane == "left" else info.get("splitPaneID")
     )
@@ -3002,7 +3116,7 @@ def deliver_pending_row(row) -> tuple[str, str, dict[str, Any] | None]:
         while cause is not None and len(causes) < 4:
             causes.append(type(cause).__name__)
             cause = cause.__cause__
-        return status, block, {
+        diagnostic = {
             "phase": progress.phase,
             "exception": type(err).__name__,
             "causes": causes,
@@ -3010,6 +3124,9 @@ def deliver_pending_row(row) -> tuple[str, str, dict[str, Any] | None]:
             "cleanup_cleared": err.cleared if isinstance(err, ComposerDirty) else None,
             "attempt": progress.attempt,
         }
+        if isinstance(err, ComposerDirty) and not err.cleared and err.cleanup_reason:
+            diagnostic["cleanup_reason"] = err.cleanup_reason
+        return status, block, diagnostic
     finally:
         release_target_lock(lock_fd)
     return "sent", "", None

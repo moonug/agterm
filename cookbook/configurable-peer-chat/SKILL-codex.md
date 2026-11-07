@@ -68,6 +68,9 @@ An overlong `--defer` send refuses before queueing, with character and UTF-8
 byte counts of the normalized message, including the sender label added by the
 script. Prepare a separate readable file containing the long answer and send a
 short path; do not resend the same overlong message.
+For an OpenCode target the entire normalized message, including the sender label,
+must fit within 400 characters in both v1 and v2, in direct and deferred modes.
+The script does not create or split the long answer file.
 
 A deferred message is pinned to the exact pane observed at send time. If that pane is replaced,
 the split is closed, or agterm restarts before delivery, the record is cancelled or fails — it is
@@ -82,10 +85,17 @@ means this Codex was started without the injection, and the fix is a launch flag
 apply. Say so and let him decide; never pass `--session` with an id you inferred, and never try
 another one to see if it works.
 
-Before typing, the script confirms the target pane really is running the peer, matching what
-agterm reports for that pane. If the peer runs through a wrapper or an alias, the visible process
-name may differ: add `--target-command <name>` with the visible name. Never guess a name after a
-refusal and never retry with a different one until a human has told you which is right.
+Before typing, the script confirms the target pane really is running the peer. It matches the
+process agterm reports for that pane; when no pane answers to that name it falls back to the
+screen, and a pane that shows a composer of the configured kind is the peer whatever it runs — a
+wrapper such as `bun …/cli.js`, an alias or a patched build included. A wrapped flavour therefore
+needs no configuration. `--target-command <name>` still pins the visible name when the fallback is
+not enough; never guess a name after a refusal and never retry with a different one until a human
+has told you which is right.
+
+A build that draws its own caret block never moves the terminal caret, so agterm reports the caret
+at column 0 whatever the composer holds. The script reads that as "no caret reported" and judges
+emptiness by the composer's content instead, so a draft in the composer is still refused.
 
 Do not write `Chat from Codex:` yourself. The script adds the label, and that label lets the peer
 read the message as conversation instead of as a fresh instruction from the user.
@@ -157,8 +167,10 @@ read the target pane before doing anything.
 If the refusal says `target composer is collapsed (agent busy thinking)` — the peer is mid-thought and its input area is temporarily hidden; a deferred send simply waits it out, and the default retries ride it out in direct mode.
 
 If the script reports a pre-write refusal, nothing was written. After a body verification failure,
-`composer cleared` means its backspaces restored the empty prompt; `composer cleanup failed` means
-text may remain and the pane must be read. Cleanup checks each visible owned section before a bounded
+`composer cleared` means its backspaces restored the empty prompt. `failed / cleanup_failed`
+means text may remain: do not press Enter; inspect the target pane and manually clear only the
+fragment belonging to this send before continuing. The queue status may include a text-free
+`diagnostic.cleanup_reason`. Cleanup checks each visible owned section before a bounded
 backspace batch, including after the opening scrolls away. A submit or acceptance failure is
 ambiguous. Stop, report the exact error and never re-send blind.
 

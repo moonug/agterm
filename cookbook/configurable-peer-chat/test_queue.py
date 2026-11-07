@@ -330,15 +330,15 @@ class QueueStoreTests(unittest.TestCase):
             args = argparse.Namespace(session=None, window=None)
             pc.resolve_defer_target(args, profile)
             self.assertEqual(pc.opencode_binary_path(profile), "/fake/opencode")
-            pc.check_message_length(profile, "x" * 1500)
+            pc.check_message_length(profile, "x" * 400)
             worker_profile = pc.Profile(
                 agent="opencode", command="opencode", label="", submit="\n", pane="left"
             )
             pc.pane_text("sid", worker_profile, "win")
             self.assertEqual(pc.opencode_binary_path(worker_profile), "/fake/opencode")
-            pc.check_message_length(worker_profile, "x" * 1500)
-            with self.assertRaisesRegex(pc.PromptBlocked, "1600 characters"):
-                pc.check_message_length(worker_profile, "x" * 1601)
+            pc.check_message_length(worker_profile, "x" * 400)
+            with self.assertRaisesRegex(pc.PromptBlocked, "400 characters"):
+                pc.check_message_length(worker_profile, "x" * 401)
             info["foreground"] = ["zsh"]
             with self.assertRaisesRegex(RuntimeError, "not running"):
                 pc.resolve_defer_target(args, profile)
@@ -376,6 +376,39 @@ class QueueStoreTests(unittest.TestCase):
                 self.assertEqual(diagnostic["cleanup_cleared"], cleared)
                 self.assertNotIn("PRIVATE_MESSAGE", json.dumps(diagnostic))
                 self.assertIn(status, ("failed", "uncertain"))
+
+    def test_cleanup_failure_reason_is_visible_without_message_text(self):
+        record, _ = self.enqueue(body="PRIVATE_MESSAGE")
+        row = self.conn.execute(
+            "SELECT * FROM queue WHERE id = ?", (record["id"],)
+        ).fetchone()
+
+        def refuse_cleanup(*args, **kwargs):
+            args[-1].append("visible text is not part of the sent text; blind deletion refused")
+            return False
+
+        def fail(*args, progress, **kwargs):
+            progress.phase = "body"
+            pc.raise_after_composer_dirty(
+                "sid", self.profile(), ("", 2),
+                pc.ComposerDirty("PRIVATE_MESSAGE", "PRIVATE_MESSAGE"),
+            )
+
+        with patch.object(pc, "send_with_retry", side_effect=fail), patch.object(
+            pc, "clear_composer", side_effect=refuse_cleanup
+        ):
+            status, block, diagnostic = pc.deliver_pending_row(row)
+        self.assertEqual((status, block), ("failed", "cleanup_failed"))
+        self.conn.execute(
+            "UPDATE queue SET status = ?, last_block = ?, diagnostic = ? WHERE id = ?",
+            (status, block, json.dumps(diagnostic), record["id"]),
+        )
+        public = pc.queue_status(self.conn, record["id"])
+        self.assertEqual(
+            public["records"]["diagnostic"]["cleanup_reason"],
+            "visible text is not part of the sent text; blind deletion refused",
+        )
+        self.assertNotIn("PRIVATE_MESSAGE", json.dumps(public))
 
     def test_existing_queue_gains_diagnostic_column_without_losing_records(self):
         record, _ = self.enqueue()
@@ -631,10 +664,22 @@ class WorkerDeliveryTests(unittest.TestCase):
             ["--to", "opencode", "--defer", "--stdin"], stdin_text=body
         )
         self.assertNotEqual(sent.returncode, 0)
-        self.assertIn("message has 1118 characters", sent.stderr)
+        self.assertIn("message has 1120 characters", sent.stderr)
         self.assertIn("including the sender label", sent.stderr)
-        self.assertIn("2218 UTF-8 bytes", sent.stderr)
+        self.assertIn("2220 UTF-8 bytes", sent.stderr)
         self.assertNotIn("queued", sent.stdout)
+        self.assertFalse((self.world.queue_dir / pc.QUEUE_DB_NAME).exists())
+        self.assertEqual(self.world.events(), [])
+
+    def test_short_opencode_limit_covers_known_failure_before_enqueue(self):
+        body = "ж" * 510
+        sent = self.world.run_cli(
+            ["--to", "opencode", "--defer", "--stdin"], stdin_text=body,
+        )
+        self.assertNotEqual(sent.returncode, 0)
+        self.assertIn("at most 400 characters", sent.stderr)
+        self.assertIn("message has 530 characters", sent.stderr)
+        self.assertIn("1040 UTF-8 bytes", sent.stderr)
         self.assertFalse((self.world.queue_dir / pc.QUEUE_DB_NAME).exists())
         self.assertEqual(self.world.events(), [])
 
@@ -803,7 +848,7 @@ class WorkerDeliveryTests(unittest.TestCase):
     def test_worker_death_in_delivering_becomes_uncertain_without_retry(self):
         self.world.state["type_delay"] = 1.5
         self.world.write_state()
-        record = self.insert_pending_row("killed mid delivery " * 20)
+        record = self.insert_pending_row("killed mid delivery " * 18)
         victim = self.start_bare_worker()
         self.assertIsNotNone(victim, "lifetime lock unexpectedly busy")
         self.assertTrue(

@@ -184,6 +184,14 @@ class ClearComposerBoundary(unittest.TestCase):
 class SendScenarios(unittest.TestCase):
     """Full send/send_with_retry paths over the in-memory terminal."""
 
+    def test_opencode_refuses_401_characters_before_typing(self):
+        pane = FakePane()
+        with Harness(pane), self.assertRaises(pc.PromptBlocked) as ctx:
+            pc.send_with_retry("sid", opencode_profile(), "x" * 401)
+        self.assertEqual(ctx.exception.reason, "message_too_long")
+        self.assertIn("at most 400 characters", str(ctx.exception))
+        self.assertEqual(pane.events, [])
+
     def test_over_long_message_is_refused_before_anything_is_typed(self):
         # The composer cannot show a message this long in full, so the send
         # stops before the first character reaches the pane.
@@ -197,8 +205,8 @@ class SendScenarios(unittest.TestCase):
         self.assertEqual(pane.submit_count, 0)
 
     def test_unconfirmable_last_chunk_cleans_and_refuses(self):
-        message = long_message(600)
-        pane = FakePane(cap=520)  # the true tail can never land
+        message = long_message(390)
+        pane = FakePane(cap=310)  # the true tail can never land
         with Harness(pane), self.assertRaises(pc.ComposerDirty) as ctx:
             pc.send_with_retry("sid", opencode_profile(), message)
         err = str(ctx.exception)
@@ -210,7 +218,7 @@ class SendScenarios(unittest.TestCase):
         self.assertEqual(pane.text, "")
 
     def test_retry_after_confirmed_cleanup_succeeds_once(self):
-        message = long_message(600)
+        message = long_message(390)
         pane = FakePane()
 
         original_type = pane.type
@@ -218,8 +226,8 @@ class SendScenarios(unittest.TestCase):
         def flaky_type(profile, text):
             if set(text) != {"\x7f"} and text != profile.submit and pane.loss_armed:
                 original_type(profile, text)
-                if len(pane.text) > 520:
-                    pane.text = pane.text[:520]
+                if len(pane.text) > 310:
+                    pane.text = pane.text[:310]
                     pane.loss_armed = False
                 return
             original_type(profile, text)
@@ -259,6 +267,10 @@ class SendScenarios(unittest.TestCase):
         self.assertIn("blind deletion refused", err)
         self.assertNotIn("КВИНТЭССЕНЦИЯ", err)
         self.assertFalse(ctx.exception.cleared)
+        self.assertEqual(
+            ctx.exception.cleanup_reason,
+            "visible text is not part of the sent text; blind deletion refused",
+        )
         self.assertEqual(pane.submit_count, 0)
         # Nothing is deleted: the composer still holds the owned prefix and
         # the foreign text, so the user can read what happened in the pane.
@@ -266,7 +278,7 @@ class SendScenarios(unittest.TestCase):
         self.assertIn("Тест доставки длинного сообщения", pane.text)
 
     def test_ambiguous_submit_is_not_retried(self):
-        message = long_message(800)
+        message = long_message(380)
         pane = FakePane(accept_submit=False)
         with Harness(pane), self.assertRaises(pc.DeliveryAmbiguous) as ctx:
             pc.send_with_retry("sid", opencode_profile(), message)
@@ -274,14 +286,14 @@ class SendScenarios(unittest.TestCase):
         self.assertEqual(pane.submit_count, 1)
 
     def test_diag_reports_sizes_without_message_text(self):
-        message = long_message(600)
-        pane = FakePane(cap=520)
+        message = long_message(390)
+        pane = FakePane(cap=310)
         with Harness(pane), self.assertRaises(pc.ComposerDirty) as ctx:
             pc.send_with_retry("sid", opencode_profile(), message)
         err = str(ctx.exception)
         self.assertRegex(err, r"chunk \d+/\d+ was typed")
         self.assertIn("expected ~", err)
-        self.assertIn("chars in 6 rows", err)
+        self.assertRegex(err, r"chars in \d+ rows")
         self.assertNotIn("КВИНТЭССЕНЦИЯ", err)
         # every attempt cleans up provably, so even the final refusal is a
         # confirmed-clear result
@@ -427,7 +439,7 @@ class PinnedDelivery(unittest.TestCase):
         world = CtlWorld(self.info())
         world.armed_swap = True  # the server restarts after the first event
         with self.assertRaises(pc.PromptBlocked) as ctx:
-            self.run_pinned(world, long_message(600))
+            self.run_pinned(world, long_message(390))
         self.assertEqual(ctx.exception.reason, "socket_replaced")
         self.assertEqual(len(world.type_events), 1)
         self.assertEqual(world.submit_count, 0)

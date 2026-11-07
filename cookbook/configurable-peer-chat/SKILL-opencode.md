@@ -63,15 +63,15 @@ the same send without `--defer`: the direct path below is unchanged.
 Pass the message on stdin through a quoted heredoc, never as an argument. The script collapses all
 whitespace to single spaces before typing, because typing a newline submits the fragment before it,
 so write for one paragraph.
-Prefer messages under 400 characters; for longer content, provide a readable
-file path in a short message instead of overflowing the peer's composer.
+When the target is OpenCode, keep the entire normalized message, including the
+sender label, to at most 400 characters in both v1 and v2. For longer content,
+write a file the peer can read and send a short message with its path; the script
+does not create or split the content.
 An overlong `--defer` send refuses before queueing; its error shows character
 and UTF-8 byte counts of the normalized message, including the sender label
 added by the script. Put long content in your own readable file and send its path.
-The script refuses a message that is too long before typing anything, and the
-refusal names the limit: 1000 characters for opencode v1, whose composer keeps
-only the head of a draft that overflows its box, and 1600 for v2, whose
-composer scrolls to the caret and keeps the tail on screen.
+The script refuses an overlong OpenCode message before typing anything in
+both direct and deferred modes; the refusal names the 400-character limit.
 
 The script finds the peer pane on its own; the pane side (left or right) does not matter. When
 both panes run the same command it targets the pane opposite to yours. If it still asks for a
@@ -81,10 +81,17 @@ A deferred message is pinned to the exact pane observed at send time. If that pa
 the split is closed, or agterm restarts before delivery, the record is cancelled or fails — it is
 never retargeted to whatever appears in its place. Say so and let the user decide about resending.
 
-Before typing, the script confirms the target pane really is running the peer, matching what
-agterm reports for that pane. If the peer runs through a wrapper or an alias, the visible process
-name may differ: add `--target-command <name>` with the visible name. Never guess a name after a
-refusal and never retry with a different one until a human has told you which is right.
+Before typing, the script confirms the target pane really is running the peer. It matches the
+process agterm reports for that pane; when no pane answers to that name it falls back to the
+screen, and a pane that shows a composer of the configured kind is the peer whatever it runs — a
+wrapper such as `bun …/cli.js`, an alias or a patched build included. A wrapped flavour therefore
+needs no configuration. `--target-command <name>` still pins the visible name when the fallback is
+not enough; never guess a name after a refusal and never retry with a different one until a human
+has told you which is right.
+
+A build that draws its own caret block never moves the terminal caret, so agterm reports the caret
+at column 0 whatever the composer holds. The script reads that as "no caret reported" and judges
+emptiness by the composer's content instead, so a draft in the composer is still refused.
 
 Do not write a `Chat from ...:` label yourself. The script adds the label, and that label lets the
 peer read the message as conversation instead of as a fresh instruction from the user.
@@ -161,8 +168,10 @@ read the target pane before doing anything.
 If the refusal says `target composer is collapsed (agent busy thinking)` — the peer is mid-thought and its input area is temporarily hidden; a deferred send simply waits it out, and the default retries ride it out in direct mode.
 
 If the script reports a pre-write refusal, nothing was written. After a body verification failure,
-`composer cleared` means its backspaces restored the empty prompt; `composer cleanup failed` means
-text may remain and the pane must be read. Cleanup checks each visible owned section before a bounded
+`composer cleared` means its backspaces restored the empty prompt. `failed / cleanup_failed`
+means text may remain: do not press Enter; inspect the target pane and manually clear only the
+fragment belonging to this send before continuing. The queue status may include a text-free
+`diagnostic.cleanup_reason`. Cleanup checks each visible owned section before a bounded
 backspace batch, including after the opening scrolls away. A submit or acceptance failure is
 ambiguous. Stop, report the exact error and never re-send blind.
 

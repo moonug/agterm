@@ -67,9 +67,10 @@ the same send without `--defer`: the direct path below is unchanged.
 `opencode`. Pass the message on stdin through a quoted heredoc, never as an argument. The script
 collapses all whitespace to single spaces before typing, because typing a newline submits the
 fragment before it, so write for one paragraph.
-Keep messages to opencode short (prefer under 400 characters). Put longer
-content in a file the peer can read and send a short sentence containing its
-path; do not try to force an overflowing draft through the composer.
+Keep the entire normalized message to opencode, including the sender label,
+to at most 400 characters in both v1 and v2. Put longer content in a file the
+peer can read and send a short sentence containing its path; the script does
+not create or split the content.
 An overlong `--defer` send refuses before queueing; its error shows character
 and UTF-8 byte counts of the normalized message, including the sender label
 added by the script. Put long content in your own readable file and send its path.
@@ -91,21 +92,26 @@ Any unambiguous prefix of the session id works. `--session` also pins the pane, 
 delivery and a direct send to the same pane cannot interleave. `--window <id>` pins the agterm
 window when a session id is ambiguous across windows.
 
-A long message is refused before anything is typed. The limit depends on the opencode build the
-peer runs: v1 keeps the head of a draft that overflows its box, so the tail can never be
-confirmed and the limit is about 1000 characters; v2 scrolls the composer to the caret and keeps
-the tail on screen, and the limit is 1600 characters. The refusal names the limit. Write long
-content to a file and send its path — `the details are in /tmp/plan.md` — and let the peer read
-the file.
+An OpenCode message over 400 normalized characters including the sender label is
+refused before typing or queueing, in both direct and deferred modes. Write long
+content to a readable file and send its path — `the details are in /tmp/plan.md` —
+and let the peer read the file.
 
 A deferred message is pinned to the exact pane observed at send time. If that pane is replaced,
 the split is closed, or agterm restarts before delivery, the record is cancelled or fails — it is
 never retargeted to whatever appears in its place. Say so and let the user decide about resending.
 
-Before typing, the script confirms the target pane really is running the peer, matching what
-agterm reports for that pane. If the peer runs through a wrapper or an alias, the visible process
-name may differ: add `--target-command <name>` with the visible name. Never guess a name after a
-refusal and never retry with a different one until a human has told you which is right.
+Before typing, the script confirms the target pane really is running the peer. It matches the
+process agterm reports for that pane; when no pane answers to that name it falls back to the
+screen, and a pane that shows a composer of the configured kind is the peer whatever it runs — a
+wrapper such as `bun …/cli.js`, an alias or a patched build included. A wrapped flavour therefore
+needs no configuration. `--target-command <name>` still pins the visible name when the fallback is
+not enough; never guess a name after a refusal and never retry with a different one until a human
+has told you which is right.
+
+A build that draws its own caret block never moves the terminal caret, so agterm reports the caret
+at column 0 whatever the composer holds. The script reads that as "no caret reported" and judges
+emptiness by the composer's content instead, so a draft in the composer is still refused.
 
 Do not write a `Chat from ...:` label yourself. The script adds the label, and that label lets the
 peer read the message as conversation instead of as a fresh instruction from the user.
@@ -195,9 +201,11 @@ A refusal that names the composer capacity means the message is too long for tha
 a file and send the path; do not retry it as it stands.
 
 If the script reports a pre-write refusal, nothing was written. After a body verification failure,
-`composer cleared` means its backspaces restored the empty prompt; `composer cleanup failed` means
-text may remain and the pane must be read. Cleanup checks each visible owned section before a bounded
-backspace batch, including after the opening scrolls away, and erases a draft whose window shows
+`composer cleared` means its backspaces restored the empty prompt. `failed / cleanup_failed`
+means text may remain: do not press Enter; inspect the target pane and manually clear only the
+fragment belonging to this send before continuing. The queue status may include a text-free
+`diagnostic.cleanup_reason`. Cleanup checks each visible owned section before a bounded backspace
+batch, including after the opening scrolls away, and erases a draft whose window shows
 only its head. A submit or acceptance failure is
 ambiguous. Stop, report the exact error and never re-send blind.
 
@@ -214,12 +222,9 @@ its provider. When the layout is not recognised the send is refused with `target
 is not recognisable` and nothing is written.
 
 A draft longer than the composer box does not fit in v1: opencode keeps showing the head of the
-draft and never the tail, so the tail of a long message can never be confirmed. The script refuses
-such a message before typing it (`target composer takes a message of at most N characters …;
-nothing was typed`) and, when that estimate is wrong, after the box fills up — the draft is erased
-and nothing is submitted. v2 scrolls the composer to the caret and keeps the tail on screen, so
-there the same refusal is a rule of thumb rather than a wall. Write long content to a file and
-send the path; the peer reads the file.
+draft and never the tail. v2 scrolls to the caret, but a long input can still leave an unconfirmed
+partial draft if cleanup fails. Both versions refuse inline messages over 400 normalized characters
+including the sender label. Write long content to a file and send a short path; the peer reads it.
 
 ## Manners
 
