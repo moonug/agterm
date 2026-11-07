@@ -3114,11 +3114,15 @@ def classify_delivery_error(err: Exception) -> tuple[str, str]:
     if isinstance(err, PromptBlocked):
         if err.reason in IDENTITY_BLOCK_REASONS:
             return "failed", err.reason
-        if err.reason in ("message_too_long", "composer_not_recognisable"):
-            # Waiting cannot fix an overlong message or unrecognised composer.
+        if err.reason == "message_too_long":
+            # Waiting cannot make an overlong message fit.
             return "failed", err.reason
         # A dialog is answered by the user in that pane, so the record stays
-        # queued and goes out once the pane is ready again.
+        # queued and goes out once the pane is ready again. A composer that
+        # is momentarily unrecognisable is the same case: a live TUI
+        # repaints, and the capture can land between two frames. The record
+        # keeps its body and the worker tries again, so a redraw does not
+        # destroy a queued message.
         return "pending", err.reason
     if isinstance(err, DeliveryAmbiguous):
         return "uncertain", "ambiguous_submit"

@@ -296,8 +296,11 @@ class QueueStoreTests(unittest.TestCase):
             ),
             (pc.PromptBlocked("gone", "pane_gone"), ("failed", "pane_gone")),
             (
+                # A live TUI repaints; the capture can land between two
+                # frames, so the record waits for the pane instead of being
+                # destroyed with its body.
                 pc.PromptBlocked("unrecognised", "composer_not_recognisable"),
-                ("failed", "composer_not_recognisable"),
+                ("pending", "composer_not_recognisable"),
             ),
             (
                 pc.DeliveryAmbiguous("ambiguous"),
@@ -687,28 +690,52 @@ class WorkerDeliveryTests(unittest.TestCase):
         self.assertFalse((self.world.queue_dir / pc.QUEUE_DB_NAME).exists())
         self.assertEqual(self.world.events(), [])
 
-    def test_unknown_composer_fails_then_allows_next_message(self):
+    def test_unknown_composer_keeps_the_record_until_the_pane_returns(self):
+        # A live TUI repaints, and the capture can land between two frames:
+        # the composer is unrecognisable for a moment. The record keeps its
+        # body and the worker tries again, so the message is not lost.
         self.world.set_composer("shell")
         first = self.defer("first")
         self.assertTrue(
             wait_until(
-                lambda: self.queue_row(first["id"])["status"] == "failed",
+                lambda: self.queue_row(first["id"])["last_block"]
+                == "composer_not_recognisable",
                 timeout=25,
             )
         )
         row = self.queue_row(first["id"])
-        self.assertEqual(row["last_block"], "composer_not_recognisable")
-        self.assertEqual(row["attempts"], 1)
+        self.assertEqual(row["status"], "pending")
+        self.assertIn("first", row["body"])
         self.assertEqual(self.world.events(), [])
+        self.world.set_composer("empty")
+        self.assertTrue(
+            wait_until(
+                lambda: self.queue_row(first["id"])["status"] == "sent",
+                timeout=25,
+            )
+        )
+        self.assertEqual(self.world.submitted(), 1)
+
+    def test_next_message_follows_the_queued_one_for_the_same_pane(self):
+        self.world.set_composer("shell")
+        first = self.defer("first")
+        self.assertTrue(
+            wait_until(
+                lambda: self.queue_row(first["id"])["last_block"]
+                == "composer_not_recognisable",
+                timeout=25,
+            )
+        )
         self.world.set_composer("empty")
         second = self.defer("second")
         self.assertTrue(
             wait_until(
                 lambda: self.queue_row(second["id"])["status"] == "sent",
-                timeout=20,
+                timeout=25,
             )
         )
-        self.assertEqual(self.world.submitted(), 1)
+        self.assertEqual(self.queue_row(first["id"])["status"], "sent")
+        self.assertEqual(self.world.submitted(), 2)
 
     def test_self_target_and_missing_sender_refuse_before_queueing_or_typing(self):
         for defer, pane in ((False, "left"), (True, "left"), (True, None)):
