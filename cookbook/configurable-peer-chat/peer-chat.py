@@ -142,8 +142,14 @@ OPENCODE_DIALOG_RE = re.compile(r"△ Permission required|Allow once\s+Allow alw
 OPENCODE_DIALOG_SCAN_ROWS = 24
 # While the agent is thinking, the input area and status row collapse and only
 # the bottom border remains above the footer. The state is transient.
-OPENCODE_TYPE_SLICE = 24
-OPENCODE_TYPE_PAUSE = 0.08
+# A live TUI can lose or reorder characters from a single large write, so
+# every write goes out in small slices with a pause between them.
+TYPE_SLICE = 24
+TYPE_PAUSE = 0.08
+# The marker removal is a short burst of backspaces; it has to land exactly,
+# so it is paced in even smaller pieces.
+BACKSPACE_SLICE = 8
+SHORT_BACKSPACE_BATCH = 64
 MESSAGE_NAME_RE = re.compile(r"peer-chat-[a-z0-9][a-z0-9-]{2,48}\.txt")
 MESSAGE_SPOOL = Path(tempfile.gettempdir()) / f"agterm-peer-chat-{os.getuid()}"
 
@@ -824,21 +830,32 @@ def type_text(
             input_text=part,
         )
 
-    # Live sends into a redrawing opencode TUI occasionally lose one character
-    # from a single large write. Pace the event in small slices; verification
-    # and markers stay per whole chunk. Paste is not an alternative here:
+    # A live TUI can lose or reorder characters from a single large write:
+    # the redrawing opencode loses one, and a patched Claude Code build
+    # rotates the text. Pace every write in small slices; verification and
+    # markers stay per whole chunk. Paste is not an alternative here:
     # opencode collapses a bracketed paste into a "[Pasted ~1 lines]" token.
-    # Pure-backspace cleanup events skip the pacing: over-backspacing an empty
-    # composer is harmless and the rounds repeat anyway.
-    if (
-        profile.agent == "opencode"
-        and len(text) > OPENCODE_TYPE_SLICE
-        and text.strip("\x7f")
-    ):
-        for index in range(0, len(text), OPENCODE_TYPE_SLICE):
+    # Long pure-backspace cleanup events skip the pacing: they have their own
+    # pacing, and over-backspacing an empty composer is harmless because the
+    # rounds repeat anyway.
+    if len(text) > TYPE_SLICE and text.strip("\x7f"):
+        for index in range(0, len(text), TYPE_SLICE):
             verify_pinned_identity(sid, profile, window)
-            event(text[index : index + OPENCODE_TYPE_SLICE])
-            time.sleep(OPENCODE_TYPE_PAUSE)
+            event(text[index : index + TYPE_SLICE])
+            time.sleep(TYPE_PAUSE)
+        return
+    if (
+        len(text) > BACKSPACE_SLICE
+        and len(text) <= SHORT_BACKSPACE_BATCH
+        and not text.strip("\x7f")
+    ):
+        # A short burst of backspaces can lose characters too, and the marker
+        # removal has to land exactly; the long cleanup batches keep their
+        # own pacing.
+        for index in range(0, len(text), BACKSPACE_SLICE):
+            verify_pinned_identity(sid, profile, window)
+            event(text[index : index + BACKSPACE_SLICE])
+            time.sleep(TYPE_PAUSE)
         return
     event(text)
 

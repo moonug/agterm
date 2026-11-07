@@ -320,6 +320,53 @@ class SendScenarios(unittest.TestCase):
         self.assertTrue(ctx.exception.cleared)
 
 
+class WritePacing(unittest.TestCase):
+    """A live TUI needs the write sliced.
+
+    A single large write loses or reorders characters: the redrawing
+    opencode drops one, and a patched Claude Code build rotates the text.
+    The marker removal is a short burst of backspaces and has to land
+    exactly, so it is paced in even smaller pieces.
+    """
+
+    def profile(self):
+        return pc.Profile(
+            agent="claude", command="claude", label="", submit="\n", pane="left"
+        )
+
+    def typed(self, text):
+        sent = []
+
+        def fake_ctl(*args, **kwargs):
+            sent.append(kwargs.get("input_text"))
+            return ""
+
+        with patch.dict(
+            pc.__dict__,
+            {"ctl": fake_ctl, "require_target": lambda *a, **k: "sid"},
+        ):
+            pc.type_text("sid", self.profile(), text)
+        return sent
+
+    def test_a_long_write_goes_out_in_slices(self):
+        sent = self.typed("x" * 100)
+        self.assertGreater(len(sent), 1)
+        self.assertTrue(all(len(part) <= pc.TYPE_SLICE for part in sent), sent)
+        self.assertEqual("".join(sent), "x" * 100)
+
+    def test_a_short_backspace_burst_goes_out_in_slices(self):
+        sent = self.typed("\x7f" * 30)
+        self.assertGreater(len(sent), 1)
+        self.assertTrue(all(len(part) <= pc.BACKSPACE_SLICE for part in sent), sent)
+        self.assertEqual("".join(sent), "\x7f" * 30)
+
+    def test_a_long_cleanup_batch_keeps_its_own_pacing(self):
+        # The long backspace batches of the cleanup have their own pacing;
+        # slicing them here would make the cleanup crawl.
+        sent = self.typed("\x7f" * 200)
+        self.assertEqual(len(sent), 1)
+
+
 class PreWriteRefusals(unittest.TestCase):
     """Occupied or unrecognisable targets must refuse before any event."""
 
