@@ -33,6 +33,7 @@ its *needs* column, so searching this page for `claude` or `kiro` finds those di
 
 | recipe | what it does | needs |
 |---|---|---|
+| [agent-pair-next](agent-pair-next/) | explicitly hand the selected next-session prompt to a fresh writer/read-only pair | unreleased `session.new.split-command` + `session.type.expect-pane-id`, Python 3.10+, existing peer-chat, configured agents |
 | [agent-reset](agent-reset/) | one chord clears the pane's Claude Code or codex run, and nothing when neither is running | 0.26.0, python3, Claude Code or Codex |
 | [annotate-claude-replies](annotate-claude-replies/) | mark up Claude's answers in revdiff and send the notes back | 0.13.0, revdiff, python3, Claude Code |
 | [annotate-pane-output](annotate-pane-output/) | mark up what the pane just printed in revdiff and send the notes back to whatever is running there | 0.13.0, revdiff, python3 |
