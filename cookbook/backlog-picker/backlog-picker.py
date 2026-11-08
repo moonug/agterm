@@ -128,7 +128,7 @@ def age_label(added: str, today: date) -> str:
 def local_today() -> date:
     """local_today is today in the machine's own zone; an item's age is read in local terms."""
     # datetime.UTC needs Python 3.11; this recipe runs on 3.9.
-    return datetime.now(timezone.utc).astimezone().date()  # noqa: UP017
+    return datetime.now(timezone.utc).astimezone().date()
 
 
 def load_items(root: Path) -> list[Item]:
