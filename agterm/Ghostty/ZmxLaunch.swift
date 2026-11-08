@@ -11,10 +11,11 @@ enum ZmxLaunch {
         let initialInput: String?
     }
 
-    private struct Runtime {
+    struct Runtime {
         let bundleURL: URL
         let environment: [String: String]
         let passwordDatabaseShell: String?
+        let commandShell: String?
         let allowDebugOverride: Bool
     }
 
@@ -59,12 +60,13 @@ enum ZmxLaunch {
         bundleURL: URL = Bundle.main.bundleURL,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         passwordDatabaseShell: String? = passwordDatabaseLoginShell(),
+        commandShell: String?,
         isUITestLaunch: Bool = ContentView.isUITestLaunch,
         allowDebugOverride: Bool = allowDebugOverride
     ) -> String? {
         if isUITestLaunch, environment[uiTestOptInKey] != "1" { return uiTestBypassReason }
         let runtime = Runtime(bundleURL: bundleURL, environment: environment,
-                              passwordDatabaseShell: passwordDatabaseShell,
+                              passwordDatabaseShell: passwordDatabaseShell, commandShell: commandShell,
                               allowDebugOverride: allowDebugOverride)
         return switch configurationResult(runtime: runtime,
                                           paneIdentity: UUID(), baseEnvironment: [:]) {
@@ -73,8 +75,8 @@ enum ZmxLaunch {
         }
     }
 
-    @MainActor static func configuration(paneIdentity: UUID?, pane: String, environment base: [String: String])
-        -> ZmxSupport.Configuration? {
+    @MainActor static func configuration(paneIdentity: UUID?, pane: String, environment base: [String: String],
+                                         lead: ZmxLeadAttachment? = nil) -> ZmxSupport.Configuration? {
         guard let paneIdentity else {
             logger.error("zmx configuration failed for \(pane, privacy: .public) pane: missing pane identity")
             return nil
@@ -82,8 +84,10 @@ enum ZmxLaunch {
         let runtime = Runtime(bundleURL: Bundle.main.bundleURL,
                               environment: ProcessInfo.processInfo.environment,
                               passwordDatabaseShell: passwordDatabaseLoginShell(),
+                              commandShell: GhosttyApp.shared.liveCommandShell,
                               allowDebugOverride: allowDebugOverride)
-        let result = configurationResult(runtime: runtime, paneIdentity: paneIdentity, baseEnvironment: base)
+        let result = configurationResult(runtime: runtime, paneIdentity: paneIdentity, baseEnvironment: base,
+                                         lead: lead)
         switch result {
         case .success(let configuration): return configuration
         case .failure(let reason):
@@ -105,7 +109,7 @@ enum ZmxLaunch {
         guard case .wrapped(let configuration) = disposition else { return nil }
         let captured = session.takePendingForegroundCommand(pane: pane)
         let replay = suppressed ? nil : captured
-        let creationCommand: String? = if replay == nil, !suppressed {
+        let paneCommand: String? = if replay == nil, !suppressed {
             switch pane {
             case .left: session.initialCommand
             case .right: session.splitInitialCommand
@@ -114,7 +118,7 @@ enum ZmxLaunch {
         } else { nil }
         return SurfaceSeed(
             command: ZmxSupport.attachCommand(
-                configuration, replaying: replay, creationCommand: creationCommand, denylist: denylist
+                configuration, replaying: replay, paneCommand: paneCommand, denylist: denylist
             ),
             initialInput: nil
         )
@@ -126,8 +130,8 @@ enum ZmxLaunch {
         return value.isEmpty ? nil : value
     }
 
-    private static func configurationResult(runtime: Runtime, paneIdentity: UUID,
-                                            baseEnvironment: [String: String])
+    static func configurationResult(runtime: Runtime, paneIdentity: UUID,
+                                    baseEnvironment: [String: String], lead: ZmxLeadAttachment? = nil)
         -> Result<ZmxSupport.Configuration, ZmxSupport.Rejection> {
         let bundledResources = runtime.bundleURL.appendingPathComponent("Contents/Resources/ghostty").path
         let resources = runtime.environment["GHOSTTY_RESOURCES_DIR"].flatMap { $0.isEmpty ? nil : $0 }
@@ -143,7 +147,9 @@ enum ZmxLaunch {
             baseEnvironment: baseEnvironment,
             inheritedZdotdir: runtime.environment["ZDOTDIR"],
             sessionHostExecutablePath: sessionHostExecutablePath(bundleURL: runtime.bundleURL, environment: runtime.environment,
-                                                                  allowDebugOverride: runtime.allowDebugOverride)
+                                                                  allowDebugOverride: runtime.allowDebugOverride),
+            lead: lead,
+            commandShell: runtime.commandShell
         ))
     }
 }

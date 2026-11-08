@@ -1,5 +1,6 @@
 import AgtermResponsibility
 import Darwin
+import GhosttyKit
 import XCTest
 import agtermCore
 @testable import agterm
@@ -115,11 +116,14 @@ final class SessionHostSeamTests: XCTestCase {
             if supervised { try startHost() }
             let marker = directory.appendingPathComponent("snapshot")
             let envFile = directory.appendingPathComponent("environment")
+            let expect = directory.appendingPathComponent("expect")
             try? FileManager.default.removeItem(at: marker)
             try? FileManager.default.removeItem(at: envFile)
+            try? FileManager.default.removeItem(at: expect)
             var env = ["HOME": directory.path, "SEAM_PROFILE": "", "SEAM_RC": "", "SEAM_ZSHENV": "",
                        "SEAM_VALUE": "two words; $literal 'quote'", "SEAM_OUTPUT": marker.path, "SEAM_ENV": envFile.path,
-                       "__CF_USER_TEXT_ENCODING": "0x\(String(getuid(), radix: 16)):0x7:0x31"]
+                       "__CF_USER_TEXT_ENCODING": "0x\(String(getuid(), radix: 16)):0x7:0x31",
+                       "SEAM_EXPECT": expect.path]
             env["SEAM_AFTER_HOST_START"] = "new pane environment"
             let probe = directory.appendingPathComponent("probe.zsh")
             env["SEAM_PROBE"] = probe.path
@@ -128,8 +132,15 @@ final class SessionHostSeamTests: XCTestCase {
                                           stateDirectory: directory.path, paneIdentity: paneID, baseEnvironment: env, inheritedZdotdir: zdotdir.path,
                                           sessionHostExecutablePath: supervised ? executable.path : nil)
             let configuration = try ZmxSupport.configuration(for: inputs).get()
+            // the probe can run before the attach client forwards the laid-out resize, so both paths are
+            // compared only after their ptys reach the grid the fixture publishes
             let script = """
             umask 077
+            i=0
+            until [[ -s "$SEAM_EXPECT" && "$(/bin/stty size)" == "$(<"$SEAM_EXPECT")" ]]; do
+                (( i++ >= 200 )) && return 1
+                sleep 0.05
+            done
             /usr/bin/env -0 > "$SEAM_ENV"
             previous=""
             for attempt in {1..100}; do
@@ -143,7 +154,8 @@ final class SessionHostSeamTests: XCTestCase {
             """
             try script.write(to: probe, atomically: true, encoding: .utf8)
             let session = Session(initialCwd: physicalDirectory)
-            session.initialCommand = creationPayload ? "source -- " + CommandRestore.shellQuotedLine([probe.path]) : nil
+            // a creation command ends its pane, so the probe's pane stays up until the leader is read and killed below
+            session.initialCommand = creationPayload ? "source -- " + CommandRestore.shellQuotedLine([probe.path]) + "; sleep 60" : nil
             let seed = try XCTUnwrap(ZmxLaunch.surfaceSeed(disposition: .wrapped(configuration), session: session, pane: .left, denylist: []))
             if supervised { XCTAssertTrue(seed.command.contains("'client'")) }
             let surface = GhosttySurfaceView(workingDirectory: physicalDirectory, fontSize: 14, command: seed.command,
@@ -155,8 +167,17 @@ final class SessionHostSeamTests: XCTestCase {
             surface.frame = NSRect(x: 0, y: 0, width: 800, height: 480)
             window.contentView?.addSubview(surface)
             surface.createSurface()
-            XCTAssertNotNil(surface.surface)
+            let ghosttySurface = try XCTUnwrap(surface.surface)
             let deadline = Date().addingTimeInterval(15)
+            let backing = surface.convertToBacking(surface.bounds).size
+            var grid = ghostty_surface_size(ghosttySurface)
+            while Date() < deadline, Int(grid.width_px) != Int(backing.width) || Int(grid.height_px) != Int(backing.height) {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+                grid = ghostty_surface_size(ghosttySurface)
+            }
+            XCTAssertEqual(Int(grid.width_px), Int(backing.width))
+            XCTAssertEqual(Int(grid.height_px), Int(backing.height))
+            try "\(grid.rows) \(grid.columns)\n".write(to: expect, atomically: true, encoding: .utf8)
             while Date() < deadline {
                 if let data = try? String(contentsOf: marker, encoding: .utf8), data.contains("size="), data.hasSuffix("\n") { break }
                 RunLoop.main.run(until: Date().addingTimeInterval(0.01))

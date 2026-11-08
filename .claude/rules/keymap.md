@@ -15,8 +15,9 @@ paths:
 - `<configDir>/keymap.conf` (default `~/.config/agterm`) rebinds built-in menu shortcuts and defines
   custom shell commands, which appear in the action palette as `custom`. One parsed `Keymap` drives the
   menu, custom-command monitor, and palette; host-free logic lives in `agtermCore`.
-- `global-hotkey <chord>` is the third verb: ONE chord, modifier required, no `|` alternatives and no
-  leader sequence (`RegisterEventHotKey` expresses neither), last line wins. It is registered with the OS
+- `global-hotkey <chord>` is the third verb: ONE chord, modifier or function key required,
+  no `|` alternatives and no leader sequence (`RegisterEventHotKey` expresses neither).
+  Last line wins. It is registered with the OS
   by `GlobalHotkey`, never with `KeybindMatcher`, so it is deliberately OUTSIDE the conflict model below —
   it may share a chord with a menu item — but the OS hotkey WINS and CONSUMES the key, agterm frontmost
   included, so the menu binding then never fires. Say that rather than "whichever app is in front decides",
@@ -29,9 +30,16 @@ paths:
   `keyCode(forChordKey:)` resolves it
   by physical position, inverting `namedKey`/`latinKey` rather than adding a third table, so it survives a
   layout switch. It summons the quick terminal; see [[windows]] for the panel.
-- `parseKeymap` never throws. `map <chord> <action>` takes one whitespace-delimited chord token.
-  `command "<name>" [chord] <shell...>` treats the token after the quoted name as a shortcut only when
-  `parseKeybinds` accepts it with a modifier; a bare key is diagnosed and the command stays palette-only.
+- `parseKeymap` never throws. `map <chord> [--repeat] <action>` takes one whitespace-delimited chord token.
+  `command "<name>" [chord] [options] <shell...>` treats the token after the quoted name as a shortcut only when
+  `parseKeybinds` accepts it with a modifier or a bare function key;
+  other bare keys are diagnosed and stay palette-only.
+  Parse `--repeat`, `--error-hud`, `--error-position POS`, and `--error-pane left|right` as a contiguous prefix
+  after that optional chord, in any order. Position uses `HudPosition.parse`, aliases included.
+  The first ordinary shell token or `--` ends option parsing; preserve the remaining substring and
+  never seek another chord. Missing/invalid values, duplicate flags, unknown leading `--error-*`,
+  or placement without `--error-hud` diagnose and skip the command. Defaults: false, center, no pane.
+  `CustomCommand` Codable and `ControlKeymapCommand` read-back carry all four fields.
   Empty shell text is invalid. Both verbs split on spaces/tabs. Blank lines and comments are skipped;
   inline `#` starts a comment only after whitespace and outside double quotes. Each bad line yields
   `KeymapDiagnostic{line,message}` without stopping later lines. `{AGT_X}` text remains verbatim.
@@ -48,8 +56,8 @@ paths:
   else took meanwhile — being unbound is what freed it.
 - Per-alternative grammar follows the dispatch path, not the verb. The menu-bound alternative keeps `map`'s
   own rules (bare non-arrow legal, reserved chords and modifier-less arrows rejected); every monitor-bound
-  alternative requires a modifier on its first chord, since a bare first key would be swallowed everywhere
-  in the terminal.
+  alternative requires a modifier or a function key on its first chord,
+  since an ordinary bare first key would be swallowed everywhere in the terminal.
 - A malformed alternative kills the whole line deliberately — `parseKeybinds` returns nil, so a typo cannot
   hide behind a line that half worked. On a `command` line that token would otherwise be swallowed as shell
   text with no diagnostic, so `hasMalformedAlternative` tells a typo from a real pipeline: a `|` token where
@@ -62,27 +70,58 @@ paths:
   alternative, `alternative skipped`/`alternative dropped` with more), pinned by
   `KeymapTests.pipeFreeKeymapParsesExactlyAsItDidBeforeAlternatives`.
 - Pure types live in `Keybind.swift`, `KeybindMatcher`, `CustomCommand`/`CommandContext`,
-  `BuiltinAction` (46 cases, pinned by `BuiltinActionTests`), `Keymap`, and `ConfigPaths`.
+  `BuiltinAction` (54 cases, pinned by `BuiltinActionTests`), `Keymap`, and `ConfigPaths`.
   `CommandContext` owns the shared expansion/environment token table.
 - Built-ins use AppKit menu key equivalents from `keymap.equivalent(for:)`; apply only non-nil
-  `KeyboardShortcut`s. SwiftUI rebuilds menu shortcuts on the next activation, not immediately after
+  `KeyboardShortcut`s. SwiftUI rebuilds menu shortcuts lazily, on activation or key dispatch rather than on
   `keymap reload`, and resolves stock collisions by unbinding agterm's item.
-- `AppDelegate.applyCloseSessionChord` clears stock File > Close ⌘W while `close_session` owns it and
-  restores it otherwise. Run at launch, `.agtermKeymapChanged`, asynchronously after `didBecomeActive`,
-  and during menu tracking because every rebuild can reapply the collision. ⌘W is the only built-in with
-  a stock competitor.
+- `AppDelegate.applyStockMenuChords` asserts every contested stock chord from the AppKit side.
+  `applyCloseSessionChord` keeps the ⌘W pair with File > Close, matched by title.
+  `stockMenuChords` holds the other stock chords the grammar can spell, matched by selector plus modifier
+  mask because several stock items share a selector. A claimed chord clears only the stock key; the kept
+  mask finds the item again on release. A freed chord first leaves any `menuAction:` item still carrying it,
+  even with the stock item absent (AppKit adds some alternates lazily), then returns to the stock item.
+  Stale-chord cleanup touches only `menuAction:` items; user Services are left alone.
+  Run at launch, `.agtermKeymapChanged`, asynchronously after `didBecomeActive`, and during menu tracking,
+  because every rebuild can reapply the collision. No shipped default sits on a stock chord except ⌘W.
 - Diagnose live shortcut state with `agtermctl keymap list`, whose `actions` and `menu` expose parsed and
   dispatched chords through host-free `namedKey(forKeyEquivalent:)`; the actions column's contract is owned
   by [[control-api]], and only its first field can appear under `menu`. `overridden` compares the resolved
   menu chord against the shipped default, so an action left with alternatives only reports `overridden` with
   no `chord` when it ships a default, and stays unmarked when it is keyless. Test the reload path, not
-  only a seeded file: see `CloseSessionChordTests`,
+  only a seeded file: see `StockMenuChordTests`,
   `CustomCommandRunnerTests.testKeymapReloadRebindsTheBuiltinAlternatives`, and
   `KeymapUITests.testCloseSessionReclaimsCommandWAfterReload`.
-- `CustomCommandRunner` uses an app-wide local `.keyDown` monitor. Its `KeybindMatcher` supports simple
-  chords and leaders such as `ctrl+a>g`, ignores repeats, and times leaders out after 1.5 seconds.
-  `.fired` launches detached `/bin/sh -c` with cwd, selection, and `$AGT_*`; non-zero exit calls
-  `notifyCommandFailure`. `.firedBuiltin` routes through `AppActions.perform(_:in:)`, a reverse lookup over
+- `CustomCommandRunner` uses an app-wide local `.keyDown`/`.keyUp` monitor.
+  Its `KeybindMatcher` supports simple chords and leaders such as `ctrl+a>g`,
+  times leaders out after 1.5 seconds, and consumes repeats/releases for presses it consumed.
+  `--repeat` (`Keymap.builtinRepeating`, `CustomCommand.repeats`) is tmux `bind -r`: a fired repeatable
+  leader sequence leaves its prefix live for the last chord of any repeatable bind under it, until 0.5 seconds
+  after the fired tail's keyUp: the first autorepeat arrives only after "Delay until repeat" (0.5 s or more),
+  so a window timed from the fire would close first. Autorepeat of that live tail fires too, every other
+  consumed autorepeat stays swallowed. A new leader pressed while the tail is held keeps its 1.5 s timeout;
+  app deactivation, a text-field or auxiliary-window key, and Esc close the window (Esc still reaching the
+  terminal). So do menu tracking starting and a window resigning key while agterm is inactive: a local
+  monitor never sees a keyUp consumed by menu tracking, and the quick terminal is key without agterm being
+  active, so neither release would ever start the timeout. A resign inside the active app is left alone,
+  or `--repeat next_window` would stop after one step. Any other chord closes it and is matched afresh; it is deliberately not `isArmed`, which would
+  swallow those keys. The chord goes to the matcher before the `toggle_fullscreen` and page `close_session`
+  checks, which run only on an unmatched, unarmed chord, so a tail equal to either chord repeats instead.
+  `NSMenu.willSendActionNotification` also records current F-key presses dispatched by AppKit menus,
+  so their repeats/releases stay consumed without predicting from a stale keymap or intercepting the
+  first press. Mouse and programmatic menu actions without a current F-key down record nothing.
+  Track held keycodes independently: a leader tail can arrive before its prefix is released.
+  `.fired` launches detached `/bin/sh -c` with cwd, selection, and `$AGT_*`; stdin and stdout go to
+  `/dev/null`. Only `errorHud` commands capture stderr to a temp file (`StderrFile`, `CommandFailure`),
+  reading its last 16 KiB before removing it. A pipe would break background descendants after agterm exits;
+  the file avoids that, but its write size is unbounded until every writer exits.
+  A spawn error or non-zero exit always calls `notifyCommandFailure`, which obeys the notification
+  setting. Only `errorHud` adds a panel through injected `FailureHud`, with the name, reason and any
+  usable stderr line. `errorPosition` defaults to `HudPosition.defaultPosition`; `errorPane` defaults nil.
+  Resolve an explicit left/right role at failure time. Placement rejection falls back to session-wide
+  at the configured position and logs it; other errors do not retry, and program overlays keep their slot.
+  HUD auto-hide owns the ten-second lifetime (`failureHudSeconds`); [[control-api]] owns that contract.
+  Exit 0 reports nothing whatever it printed. `.firedBuiltin` routes through `AppActions.perform(_:in:)`, a reverse lookup over
   `PaletteCommand.allCases` on `builtinAction`, falling
   back to `paletteLessHandler(for:)` — the sole listing of the actions holding no palette row, partitioned
   against `PaletteCommand` by `AppActionsPaletteTests`. Rebuild the matcher from commands AND
@@ -112,7 +151,11 @@ paths:
   any cwd reports that shell emits. `AGT_SESSION_PWD` stays the pane's reported path, remote or not; the
   command's execution directory comes separately from `Session.localWorkingDirectory`, which returns
   that path for a local session and, for a remote one, only when it exists here as a directory, else
-  HOME. Scratch, overlay default, quick terminal, a local split (the first on an unsplit remote session
+  HOME.
+  The runner then applies the same existence rule to every session, so a local session whose directory
+  was deleted runs its commands in HOME; the other launches leave a missing path to libghostty, which
+  ignores it.
+  Scratch, overlay default, quick terminal, a local split (the first on an unsplit remote session
   or one after the attach-time split closes), Duplicate Session and a new session under the
   current-directory setting seed through the same helper.
 - `{AGT_PANE}`/`$AGT_PANE` is `left`, `right`, or `scratch`, derived from the firing surface for keybinds
@@ -123,6 +166,11 @@ paths:
   why `CommandContext.Pane` deliberately cannot spell an overlay; its buffer is `session overlay copy`/
   `text`, owned by [[control-api]]. A single pane is always `left`. Primary exit promotes the
   split into the main slot, clears `isSplitPane`, and makes it addressable only as `left`.
+- `{AGT_PANE_ID}`/`$AGT_PANE_ID` is the stable token of the surface in that slot, `Session.paneToken(for:)`,
+  read from the slot rather than the firing surface because an overlay's own view carries no token (#602).
+  It is the same value `--pane-id` consumers resolve, so an overlay chord carries the token of the pane
+  it names, and a scratch chord the scratch's own. Empty in the sessionless context, and deliberately
+  not session-scoped so a launcher naming it still fires there.
 - `resolveBuiltinOverrides` is order-independent: fold last-wins candidates, resolve all final chords,
   then drop every overridden owner of each collision together. A drop reverts to the shipped default, so
   repeat to a fixpoint; distinct shipped defaults and strict candidate removal guarantee termination.
@@ -155,14 +203,21 @@ paths:
   rather than a menu equivalent: `undo_close` through `UndoCloseShortcut`, so native text undo still
   works, and `toggle_fullscreen` through `CustomCommandRunner`, because agterm ships no full screen menu
   item for it to ride — see [[windows]]. Both are absent from `keymap list`'s `menu` by design.
+  `close_session` and `toggle_overlay` keep their menu items, but `CustomCommandRunner` also matches their
+  chords while an `HtmlOverlayWebView` holds focus: WebKit hands key equivalents to the page first and reports a cancelled
+  keydown as handled, so the menu would never see it.
 - Write shifted symbols as `shift+<base>`: `shift+/` for `?`, `shift+=` for `+`, `shift+5` for `%`, and
-  `shift+.` for `>`. `CustomCommandRunner` uses `characters(byApplyingModifiers: [])` to recover that
+  `shift+.` for `>`. `CustomCommandRunner` translates with Shift left out to recover that
   base; keep `KeymapUITests.testCustomCommandShiftedSymbolFires`.
-- Named keys are `left/right/up/down/tab/space/return/delete`. `parseMapLine` rejects modifier-less
-  arrows because an always-on menu equivalent would swallow navigation in terminals, palettes,
+- Named keys are `left/right/up/down/tab/space/return/delete` and `f1` through `f20`.
+  `parseMapLine` rejects modifier-less arrows because an always-on menu equivalent would swallow
+  navigation in terminals, palettes,
   dashboard, and text fields. Bare non-arrow built-in maps remain legal, and a bare arrow can be a
-  leader tail such as `ctrl+a>left`; custom shortcuts always require modifiers.
-- Host-free `namedKey(forKeyCode:)` is shared by `CustomCommandRunner` and `UndoCloseShortcut`.
+  leader tail such as `ctrl+a>left`.
+  Bare function keys may start commands, map alternatives/leaders, and global hotkeys.
+  `global-hotkey f5` takes F5 machine-wide, including from local map/command bindings.
+- `CustomCommandRunner` and `UndoCloseShortcut` build their chord through `NSEvent.keymapChord(produced:)`,
+  which applies host-free `namedKey(forKeyCode:)` and then `chordKey`; each passes its own accessor.
   `KeybindTests` pins its range exactly to `bindableNamedKeys`; keep
   `KeymapUITests.testCustomCommandArrowChordFires` because a private-use AppKit glyph can otherwise
   create an unspellable runtime chord.
@@ -173,6 +228,10 @@ paths:
   `latinKey(forKeyCode:)` position for non-ASCII layouts. Do not use a per-key ASCII fallback: Greek Q
   emits `;`, Hebrew Q emits `/`, and Hebrew can collapse two physical positions to `,`, causing false
   firing plus consumed input.
+  The runner translates with Command applied when it is held (`modifierFlags.intersection(.command)`),
+  because the menu matches through the layout's Command table: Dvorak - QWERTY ⌘ switches to QWERTY there
+  and Lithuanian's number row types digits (discussion 795). Shift, Option and Control stay out: Shift breaks
+  `shift+<base>`, Option types `∂` for D, Control types control characters.
 - Drop ISO section key code 10 on non-ASCII layouts because Ukrainian-PC `\` and Hebrew-PC `;` collide
   with table codes 42/41. Keypad/number-row aliases are deliberate because keypad output is
   layout-independent. Keep `latinKey` disjoint from named-key codes and pin every entry individually;
@@ -180,7 +239,8 @@ paths:
   Latin positions, not their produced Cyrillic glyphs.
 - Do not merge this policy with `InterruptKeystroke`, which classifies one produced letter.
   The live non-Latin monitor branch cannot be unit-tested because tests cannot change the input source.
-  `characters(byApplyingModifiers: [])` re-translates synthesized runner events through the live layout;
+  `characters(byApplyingModifiers:)` re-translates synthesized runner events through the live layout, and
+  U.S.'s Command table equals its plain one, so no hosted test can observe the Command-table branch either;
   `UndoCloseShortcut` uses verbatim `charactersIgnoringModifiers`. Hosted tests pin wiring and named-key
   precedence; host-free tests take `layoutIsASCIICapable`.
 - Do not switch the runner to `charactersIgnoringModifiers`: it breaks shifted-symbol normalization and
@@ -188,8 +248,8 @@ paths:
   punctuation/digits on ASCII layouts (`shift+/` parses `/`, but runtime reports `?`); shifted letters
   work, and non-ASCII physical lookup works. Hosted tests skip when the machine layout is non-ASCII.
   After monitor changes, manually verify a letter, `cmd+r>t`, `ctrl+a>d`, and ⌘Z on isolated
-  Russian-Phonetic and U.S. instances. Russian-Phonetic does not cover Greek/Hebrew punctuation, which
-  host-free measured-data tests cover.
+  Russian-Phonetic and U.S. instances, plus `cmd+d` and `cmd+1` on Dvorak - QWERTY ⌘ and Lithuanian.
+  Russian-Phonetic does not cover Greek/Hebrew punctuation, which host-free measured-data tests cover.
 - `ghostty.conf` has a separate upstream grammar: bare `g` is Unicode and `key_g` physical; Unicode
   triggers cannot fire on non-Latin layouts. agterm matches Ghostty.app and cannot fix this app-side.
   Use `key_`, as `ghostty-defaults.conf` does for `super+key_c/key_v/key_a` (issue #30).
@@ -209,9 +269,16 @@ paths:
   it to parse clean, and counts the chords that survive.
   Both verbs rot: `validateBindings` clears a custom shortcut a built-in has claimed just as
   `resolveBuiltinOverrides` drops the colliding `map`.
+- A new shipped default must also avoid the shortcuts macOS Services claim in every app while text is
+  selected. Terminal.app's `NSServices` take ⇧⌘A and ⇧⌘M, both enabled on a stock Mac;
+  `plutil -convert json -o - <App>/Contents/Info.plist | jq '.NSServices'` lists an app's.
+  It may shadow a Ghostty default on the same chord, which the menu claims first: ⌘J hides
+  `scroll_to_selection` and ⇧⌘J `write_screen_file:paste`.
 - New shipped defaults must not break a valid existing keymap. `parseKeymap` vacates the new horizontal
   split default when an old file explicitly uses `cmd+shift+d`, and vacates Dashboard's new default when
-  an old file explicitly uses `cmd+shift+g`. An explicit map for the new action opts into its new chord.
+  an old file explicitly uses `cmd+shift+g`, `attach_remote`'s when one uses `cmd+shift+r`, and
+  `toggle_overlay`'s when one uses `cmd+shift+j`.
+  An explicit map for the new action opts into its new chord.
 - **`{AGT_X}` interpolation is intentionally raw and unquoted.** Selection, OSC title, OSC 7 pwd, and the
   session/workspace/window names and `--cwd` a caller supplies over control or the GUI can all inject
   visible shell metacharacters. `TerminalText.sanitized` strips control characters, not `;`,
@@ -230,3 +297,6 @@ paths:
   optional fish, VISUAL precedence, rc sourcing, and quoting.
   Overlay close reloads only the recorded edit session. No control command is needed because scripts can
   compose `session overlay open "$EDITOR <path>" --size-percent 95`.
+- `hooks.conf` shares `ConfigPaths`, `KeymapDiagnostic` and the Edit/Reload UX, not the parser:
+  `parseHooksConf` keeps the shell remainder verbatim with no inline-comment stripping. Its contract is
+  in [[control-api]].

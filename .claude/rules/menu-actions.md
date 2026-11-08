@@ -40,13 +40,39 @@ paths:
 - **`PaletteItem.isEnabled` is a closure over live state, never a flag captured when the list was built.**
   `filtered` refreshes only on appear, query and mode, so a snapshot goes stale under an open palette: a
   session exits, a pending close expires, control mutates the tree. The row asks it during body evaluation
-  and `runIfEnabled()` asks it again at the keystroke, returning whether it ran — which is the only thing
-  that dismisses the palette, so an inert row cannot close it on a keystroke that did nothing.
+  and `runIfEnabled()` asks it again at the keystroke, returning whether it ran, so an inert row cannot close
+  the palette on a keystroke that did nothing. A row that ran closes it unless the mode `keepsOpenOnRun`.
+  `PaletteItem.indicator` is a closure for the same reason: a session row reads its live `agentIndicator`
+  in the row body, so an agent finishing under an open ⌃P or attention palette updates its glyph.
 - `toggleQuickTerminal` gates on all `uiActionsEnabled`, including terminal zoom and dashboard.
   Control drives `QuickTerminalController.shared` directly, there being one panel per app. The titlebar
   button is replaced by dashboard chrome, which hides an open quick terminal before showing the grid.
 - Every new action must satisfy the control contract in [[control-api]]: protocol, dispatch, CLI, and
   protocol/end-to-end tests. Do not restate per-action audits here.
+- File ▸ Attach Remote… picks among `remotes.conf` entries (`destination [label]`, parsed by
+  `parseRemotesConf`) in the window picker, skipping the question for a single entry, and is disabled when
+  the file lists none (`PaletteContext.hasRemotes`). It is `BuiltinAction.attachRemote`, default
+  Command-Shift-R, with a palette row. `RemotesWatcher` re-reads on file and directory events
+  and banners once when an edit turns a clean file into one with bad lines or an unreadable one,
+  because SwiftUI rebuilds `Commands` on its own schedule and a read in the menu body would go stale.
+  `AppActions.attachRemote()` composes the existing `remoteTree`, window picker and `attachRemoteGroup` (a
+  top-level pick) or `attachRemoteSession` (a companion) through `RemoteAttaching`, so it adds no control
+  command: `zmx tree` + `pick` + `zmx attach [--companions]` already script it. A HUD over the starting
+  session shows the ssh waits and a failure, the latter hiding itself after `remoteAttachErrorSeconds`;
+  a partial group attach moves the failure to the new parent row, and a window with no session or a parent
+  row already gone falls back to `notifyCommandFailure`.
+
+- New Companion (`new_companion`, keyless) sits beside Duplicate Session in the row menu and the Session
+  menu, with a palette row. On a remote row it asks the origin through `RemoteAttaching.createRemoteCompanion`,
+  showing the two ssh waits in the Attach Remote HUD.
+- Duplicate as Companion (`duplicate_companion`, keyless) follows it in both menus, with a palette row; it is in
+  `terminalOnly` and takes the same remote route. `AppActions` reaches the local planner through
+  `CompanionDuplicating`, which `ControlServer` implements, so the GUI and `session.companion.duplicate` share one
+  planner; a refusal shows in a timed `RemoteAttachHud` over the session, falling back to `notifyCommandFailure`.
+- Convert to Companion (`convert_companion`, keyless) follows Duplicate as Companion in both menus, with a palette row;
+  a top-level page takes it too, and `PaletteContext.activeSessionIsCompanion`/`activeSessionIsRemote` disable it.
+  `AppActions.convertToCompanion` shares `AppStore.convertToCompanion` with `session.companion.convert`, and a
+  refusal reaches the same timed HUD Duplicate as Companion uses.
 
 ## Dock menu
 
@@ -74,13 +100,22 @@ paths:
   split/scratch/find/quick terminal, and fullscreen. Navigate contains palettes, session/attention
   stepping, pane focus, and Dashboard. File UI tests against the menu that owns the item.
 - Workspace focus controls are mode-agnostic because membership applies when tree mode returns.
-  Expand/Collapse Workspaces alone are disabled outside tree mode, in both menu and palette.
+  Expand/Collapse Workspaces and Collapse/Expand Workspace need workspace ROWS
+  (`PaletteContext.sidebarShowsWorkspaceRows`): the ordinary tree or the flagged tree, not the flat flagged list.
+  Previous/Next Workspace keep the narrower `sidebarShowsWorkspaceTree`, since `navigateWorkspace` steps the
+  focus projection and would land on a workspace the flagged tree has no row for.
+  An init call that omits `sidebarShowsWorkspaceRows` takes `sidebarShowsWorkspaceTree`, which is what keeps
+  the `agterm-linux` fork's fold commands visible.
 - Dashboard uses Command-Shift-G, `BuiltinAction.dashboard`, and `toggleDashboard`; it toggles an MRU,
   auto-sized grid unless terminal zoom is active. Share `dashboardMembers` with control.
+- View ▸ Hide/Show Overlays, the palette's Toggle Overlays, the optional title-bar button and `toggle_overlay`
+  run `AppActions.toggleOverlays`, the store toggle `session.overlay.toggle` uses. The item's title follows the
+  active session's state; it is enabled through `PaletteContext.activeSessionHasOverlay`.
 - The View menu carries no fullscreen item of agterm's own, and `toggle_fullscreen` rides the key monitor
   rather than a menu shortcut; see [[windows]]. It remains rebindable and control-drivable.
 - Font shortcuts call libghostty binding actions on the key window's first-responder surface, falling back
-  to the active session. Persistence still flows from cell-size callbacks.
+  to the active session, unless an HTML page owns the keys, which zooms the pages instead ([[control-api]]).
+  Persistence still flows from cell-size callbacks.
 - `shortcutGlyph` delegates to host-free `Keymap.glyphHint`. Use it for palette hints and the ten built-in
   toolbar/sidebar tooltips so rebinds update both. This visual text is keep-in-sync exempt.
 
@@ -94,12 +129,13 @@ paths:
 - Wire all four callbacks through `wireSearchCallbacks` for main, split, and scratch. Surface methods are
   thin binding-action wrappers; `AppActions` owns GUI needle/navigation/end behavior. The same session
   state and `searchDisplayText` back `session.search`.
-- Scratch is searchable; quick terminal and full overlay are not. `searchTarget` checks a covering scratch
-  FIRST, then returns nil when the focused pane sits under its own pane overlay, then falls back to the
-  focused surface. That order is load-bearing: the scratch covers a pane overlay too and is searchable.
-  Keep the pane-overlay rung in `searchTarget` alone; `coverHidesActiveSession` covers only the
-  session-wide blockers, and duplicating the rung there blocks Command-F on the scratch above it.
-  Floating overlay leaves pane search available.
+- What is on top owns Command-F. `AppActions.coverTakesSearch` runs before the close branch: the quick terminal
+  holding the keys, or `Session.visibleCover` (a shown page or program overlay over the focused pane, full or
+  floating), takes the key, so the terminal behind never opens or closes its bar. A text page focuses its own
+  field; every other cover does nothing with it. A HUD is passive and a pane overlay on the other pane of a split
+  covers nothing the user types into, so neither takes it.
+- Scratch is searchable. With no cover on top, `searchTarget` checks the scratch FIRST, then the focused surface,
+  so the scratch above a pane overlay keeps Command-F.
 - On scratch exit, clear search only when `searchSurface === scratchSurface`; pane-owned search survives.
   Split/primary teardown follows the same ownership rule.
 
@@ -127,6 +163,8 @@ paths:
 - Persist each pane cwd and the 0...1 primary-pane `splitRatio`. `SplitRatioAccessor` is an unconditional
   background representable on primary, introspects `NSSplitView`, retries until its axis extent exists, observes
   `didResizeSubviews` but writes only during a drag, and debounces save by about 0.4 seconds. Regular saves and quit flush also persist it.
+  It re-applies the stored ratio whenever the split's safe-area inset or axis length changes, because
+  SwiftUI's own redistribution leaves the primary pane at zero after one large shrink (#691).
 - Double-clicking the divider restores `splitRatioDefault` through the same `applyRatio` path as
   `session.resize`, persisting immediately rather than through the drag debounce. AppKit offers no hook:
   `NSSplitView`'s own double-click collapses a pane through the delegate SwiftUI owns. One shared
@@ -177,8 +215,9 @@ paths:
 - This preserves the current workspace when possible, remains inside flagged/focused views while they
   contain survivors, and lets `disableFocusIfSelectionOutsideSet` reveal a whole-tree fallback while
   preserving membership.
-- If MRU is empty, narrowed modes use `nearestInScopeTarget` over flattened sidebar order; unfiltered tree
-  uses the sole `reselectionTarget` caller. Do not choose the first flagged row because it destroys locality.
+- If MRU is empty, narrowed modes use `nearestInScopeTarget` over flattened sidebar order; the flat and plain
+  flagged lists first walk the saved `flaggedOrder` from the closed id's slot (`nearestInSavedFlaggedOrder`),
+  so every caller passes the closed id; unfiltered tree uses the sole `reselectionTarget` caller. Do not choose the first flagged row because it destroys locality.
   Closing the last flagged session widens to the whole tree rather than leaving no terminal.
 - Workspace removal uses `workspaceRemovalTarget`: most recent visible, then first visible, then positional.
   Preserve `softCloseSessions.removedBeforeActive` for fallback index adjustment. The named
@@ -200,11 +239,23 @@ paths:
   captured indicator exactly as plain session nav does. **Collapse is not a navigation filter** —
   `navigableSessions` and `navigateWorkspace` both ignore `isExpanded`, and adding a term to either would
   silently rewrite where every existing keystroke, `session.go` call and Ctrl-Tab candidate lands.
+- Previous/Next Window are the level above THAT, and the only navigation pair keyed on the library rather
+  than a store: `WindowLibrary.navigateWindow` steps the open windows in library order, wrapping, and raises
+  the target. Keyless, and live in either sidebar mode — a window has no sidebar row for flagged mode to
+  hide. `PaletteContext.canStepWindows` is the enablement term, so one open window disables rather than
+  no-ops. Menu, palette and `window.go` share the one step. The raise and the frontmost publication follow
+  [[windows]]: `WindowRegistry.raise` directly, never the `openWindow` hub, and `takeFrontmost` explicitly,
+  because the key monitor fires this from the quick terminal with agterm inactive.
 - When selection moves, GUI callers reveal a captured blocked/completed pane; unchanged plain navigation
   only refocuses, preventing a one-item wrap from resetting split focus. Modal focus guards still apply.
-- Attention navigation defaults to Control-Option-Up/Down, includes blocked/completed only, wraps, and
-  excludes current. If it finds no other target, GUI callers may use the current live indicator solely to
+- Attention navigation defaults to Control-Option-Up/Down, includes blocked/completed (plus active under
+  `attentionIncludesActive`, see [[settings]]), wraps, and excludes current. If it finds no other target, GUI callers may use the current live indicator solely to
   reveal its tagged pane. Control changes selection only.
+- Under `attentionNavigationAcrossWindows` the GUI step walks windows in library order and each window's
+  `navigableSessions` in sidebar order, skipping a window `uiActionsEnabled(for:)` refuses. The attention
+  commands then stay enabled without an active session, so an empty window can step out. A target in
+  another window goes through `selectAttention` one main-queue tick later, as the attention palette does;
+  a same-window target selects at once. `session.go` never crosses windows.
 - `revealActiveBlockedPane` focuses right only when the split surface exists, explicitly chooses primary
   for left/nil, and shows/focuses scratch. Promotion retags right to left. Idle/active never change pane or
   dismiss scratch. Navigation, palettes, sidebar, Dock menu, titlebar attention, and auto-follow share it.
@@ -218,15 +269,36 @@ paths:
   and Enter target cannot diverge; sort by score then title. Built-in palettes match label plus subtitle;
   caller-supplied pickers match the label only, so subtitle consequence text cannot filter a safe row out
   and leave a destructive one preselected. Ctrl-P opens sessions; Ctrl-Shift-P opens actions.
-- An empty query skips ranking in two cases: attention mode and a caller-supplied picker. Both keep their
-  source order, because every row scores 0 and the tie-break would re-sort A→Z and replace the row Return
-  runs. Every other palette lists everything A→Z.
-- Attention mode lists every non-idle session, ordered blocked, active, completed and then newest
-  `statusChangedAt`, with nil last. Palette items carry status plus per-call color/shape, resolved by the
-  same helpers as sidebar glyphs. Typed queries use fuzzy score.
+- An empty query skips ranking in four cases: attention mode, ⌃P sessions, the two membership editors, and a
+  caller-supplied picker. All keep their source order, because every row scores 0 and the tie-break would
+  re-sort A→Z and replace the row Return runs. ⌃P's source order is `AppStore.listOrdered`: A→Z by label,
+  each parent followed by its companions. Every other palette lists everything A→Z.
+- Flat session lists title a companion `parent › child` through `AppStore.listLabel(for:)`: ⌃P, ⌃Tab, the
+  attention palette, both titlebar popovers, the Dock menu, dashboard captions, the flagged editor and every
+  flagged layout. The sidebar tree, rename and Copy Name keep the bare `displayName`. The Attach Remote picker
+  builds the same label from its listing (`remotePickItem`), with the bare name when the parent is not listed.
+- Edit Flagged Sessions (`.flaggedEditor`) lists every session of the frontmost window in tree order, focus-hidden
+  ones included; Edit Focused Workspaces (`.focusEditor`) lists every workspace. Both are `keepsOpenOnRun`:
+  Return or a click toggles the row through `setFlag`/`setFocusMembership` and the palette stays open on the same
+  query, order and highlight, and a click moves the highlight first so the next Return hits that row. Each row
+  captures its id and store, never the active session, and reads membership live through `PaletteItem.mark`.
+  Focus membership follows [[sidebar]]. One deferred opener per editor serves the palette row, the
+  keymap, the View menu and the flagged empty-state link; opening them is keep-in-sync exempt like every palette,
+  `session.flag` and `workspace.focus` being the scripted forms.
+- Attention mode lists every open window's non-idle sessions (`WindowLibrary.attentionAcrossWindows`),
+  ordered blocked, active, completed and then newest `statusChangedAt`, with nil last, as one combined
+  sort. Items carry a subtitle naming the window once more than one is open, and `isEnabled` asking the OWNING
+  window's modal gate. A pick defers `AppActions.selectAttention` past the palette's close, which raises
+  another window before selecting. Typed queries use fuzzy score.
 - Open attention through `show_attention` (Ctrl-Shift-I), Navigate > Go to Attention, or Show Attention
   in the action palette. The titlebar bell opens a popover, not this palette. Palette opening is
   keep-in-sync exempt.
+- Every session list draws the status glyph TRAILING, as the sidebar does, with per-call color/shape
+  through the sidebar's helpers and nothing for idle: ⌃P, attention, the session editor, Ctrl-Tab, both
+  titlebar popovers, and a pick whose items carry status (Attach Remote).
+- Ctrl-J/Ctrl-K move the selection through `CommandPalette.selectionStep`, which resolves the key with
+  `chordKey` from `NSApp.currentEvent`; `KeyPress` carries only the typed character, which is not `j`/`k`
+  on a non-Latin layout. See [[keymap]] for the layout rule.
 - Keep the next-runloop `fieldFocused = true` retry: button-opened palettes otherwise lose first responder,
   even though no current titlebar button uses this path.
 - Rename actions post begin-edit notifications; the Coordinator edits the selected row asynchronously after
@@ -241,11 +313,12 @@ paths:
 
 - Keep clock and bell popovers in `WindowContentView+RecentSessions` so `WindowContentView.swift` remains
   below 1000 lines. They use
-  `SessionPopoverRow`: optional status glyph, hover selection color, full-row hit target, terminal
+  `SessionPopoverRow`: trailing status glyph, hover selection color, full-row hit target, terminal
   background, and chrome text.
 - Clock lists up to `maxCandidates` recent visible sessions excluding active and enables only with at
   least two sessions. Selection records activity, selects, and focuses.
-- Bell lists all non-idle sessions including current. Selection uses pane-aware reveal.
+- Bell lists all non-idle sessions across open windows, current included. Selection uses the same
+  pane-aware reveal as the palette; see [[notifications]] for the cross-window raise.
 - Popover opens are keep-in-sync exempt. Synthesized XCUITest clicks inside `NSPopover` do not fire the
   SwiftUI button, though real clicks do; tests verify open/list contents, while selection is manual plus
   host-free API coverage.

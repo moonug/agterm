@@ -9,7 +9,7 @@ extension AppStore {
     /// reveals its target and the active session is always inside the visible set. Navigation is scoped to
     /// `navigableSessions`, so it never trips this. No-op when the filter is off, nothing is selected, or the
     /// selection sits in a member workspace; persistence rides the caller's `selectSession` save. Also a no-op
-    /// in `.flagged` mode — that flat list is cross-workspace and ignores the marked set, so without the term,
+    /// in `.flagged` mode — that view is cross-workspace and ignores the marked set, so without the term,
     /// entering flagged view with the only flagged session in an unmarked workspace would silently disable it.
     /// Returning to `.tree` re-applies it.
     func disableFocusIfSelectionOutsideSet(_ sessionID: UUID?) {
@@ -159,7 +159,7 @@ extension AppStore {
     /// The workspaces the sidebar TREE renders: the marked set while the filter is enabled, else all — the
     /// `!workspaceFilter || focused` TERM of the row-visibility contract (`ControlWorkspaceNode.focused`), not
     /// the whole predicate a script evaluates: sidebar mode and visibility gate the tree ABOVE this (`.flagged`
-    /// renders a flat session list and never calls here). The empty-result fallback guards an INVARIANT
+    /// renders the flagged sessions, in any layout, and never calls here). The empty-result fallback guards an INVARIANT
     /// VIOLATION only — reaching it takes writing the two stored fields directly (`internal(set)`, so
     /// in-module), since the mutators keep `enabled + empty` out of reach, marking is gated on the id existing
     /// and `restoreFocus` prunes stale ids. Rendering the full tree beats stranding the user with no rows.
@@ -173,7 +173,9 @@ extension AppStore {
     /// what `PaletteCommand.isEnabled` reads, so the menu item and the mapped key cannot claim to do
     /// something the action then declines. A lone visible workspace is a dead end only while it is ALREADY
     /// current: when the current one is filtered out, entering the sole survivor is the whole point of the
-    /// step. Flagged mode renders no workspace rows at all.
+    /// step. Off in flagged mode whatever its layout: the flagged tree does render workspace rows, but
+    /// `navigateWorkspace` steps `visibleWorkspaces`, the FOCUS projection, and would land on a workspace
+    /// that view has no row for and select a session that is not flagged.
     public var canStepWorkspaces: Bool {
         guard sidebarMode == .tree else { return false }
         let ids = visibleWorkspaces.map(\.id)
@@ -182,13 +184,20 @@ extension AppStore {
         return ids.count > 1
     }
 
+    /// Whether the sidebar has workspace rows: always in the ordinary tree, and in flagged mode only under
+    /// the tree layout. The precondition of every expand/collapse path.
+    public func rendersWorkspaceRows(flaggedLayout: FlaggedViewLayout) -> Bool {
+        sidebarMode == .tree || flaggedLayout == .tree
+    }
+
     /// The session set navigation operates over — the VISIBLE/FILTERED set, not the whole tree: flagged
     /// sessions in `.flagged` mode, the marked workspaces' sessions while the filter is on, else all. Computed
     /// live, so clearing the flag/filter restores the full set. `navigateSession` next/prev WRAP within it,
     /// never leaking across the filter. Backs `navigateSession` (and via it `session.go`, attention-nav), the
     /// Ctrl-Tab MRU candidates and the ⌃P session palette (`AppActions.paletteSessions`) — all one filter.
     public var navigableSessions: [Session] {
-        sidebarMode == .flagged ? flaggedSessions : visibleWorkspaces.flatMap(\.sessions)
+        guard sidebarMode == .flagged else { return visibleWorkspaces.flatMap(\.sessions) }
+        return flaggedLayout == .tree ? flaggedSessions : orderedFlaggedSessions
     }
 
     /// Moves the selection back inside the visible set whenever the active session is outside it — a narrowing

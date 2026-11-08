@@ -20,12 +20,14 @@ struct agtermApp: App {
     @State private var undoCloseShortcut: UndoCloseShortcut
     @State private var globalHotkey: GlobalHotkey
     @State var settingsModel: SettingsModel
+    @State private var hookController: HookController
     @State private var controlServer: ControlServer
     @State var liveReset: LiveResetCoordinator
     @State private var customCommandRunner: CustomCommandRunner
     @State private var appearanceObserver: SystemAppearanceObserver
     @State private var accessibilityObserver: SystemAccessibilityObserver
     @State private var wakeObserver: SystemWakeObserver
+    @State private var linkObserver: RemoteLinkObserver
 
     /// Whether this launch owes the user the first-run welcome. Decided in `init()`, because the first
     /// launch writes its own window snapshot moments after the scene appears and that write would read back
@@ -45,6 +47,27 @@ struct agtermApp: App {
 
     /// The plain `WindowGroup`'s scene id, used by `openWindow(id:)` to spawn additional windows.
     private static let windowGroupID = "terminal"
+
+    /// Held for the whole process; the kernel releases it at exit, a force-quit included.
+    private static var stateDirectoryLock: StateDirectoryLock?
+
+    /// Exits before anything reads or writes `directory` unless this process owns it. A lock that cannot
+    /// be taken exits too: it does not show that no other process is using the directory.
+    private static func claimStateDirectory(_ directory: URL) {
+        let reason: String
+        switch StateDirectoryLock.acquire(directory: directory) {
+        case .owned(let lock):
+            stateDirectoryLock = lock
+            return
+        case .heldByAnother:
+            reason = "another instance is already running on \(directory.path); control it with agtermctl"
+        case .unavailable(let detail):
+            reason = "cannot claim the state directory: \(detail)"
+        }
+        logger.error("\(reason, privacy: .public)")
+        FileHandle.standardError.write(Data("agterm: \(reason)\n".utf8))
+        exit(1)
+    }
 
     /// Which agterm this is, read from the bundle ONCE and shared by every surface that reports a version:
     /// the `TERM_PROGRAM_VERSION` of each spawned terminal, the `tree` payload, and the `version` command.
@@ -67,16 +90,31 @@ struct agtermApp: App {
     }
 
     init() {
+        #if DEBUG
+        // in the environment, ahead of every reader of the variable and of every child that inherits it
+        if let adopted = DebugStateDirectory.adopted(environment: ProcessInfo.processInfo.environment,
+                                                     liveDirectory: PersistenceStore.defaultDirectory) {
+            setenv(DebugStateDirectory.environmentKey, adopted, 1)
+        }
+        #endif
         let stateDirectory = ProcessInfo.processInfo.environment["AGTERM_STATE_DIR"]
             .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? PersistenceStore.defaultDirectory
+        Self.claimStateDirectory(stateDirectory)
         liveResetMarkerStore = LiveResetMarkerStore(directory: stateDirectory)
-        // FIRST, before anything reads or writes the state directory: `WindowLibrary`'s bootstrap seeds a
-        // window and saves it, which a later read would see as evidence of an earlier launch.
+        HtmlOverlayRegistry.shared.profile = BrowserProfile(directory: stateDirectory)
+        // before anything else reads or writes the state directory (the lock adds only `agterm.lock`):
+        // `WindowLibrary`'s bootstrap seeds a window and saves it, which would read as an earlier launch.
         let hadPriorState = FirstRunWelcome.hasPriorState(in: stateDirectory)
+        // restoredRuntime's first GhosttyApp.shared touch loads this file once, so it must be current first;
+        // the seeded default theme lives only in memory, never in settings.json.
+        let settingsStore = SettingsStore(directory: stateDirectory)
+        let launchSettings = settingsStore.load()
+        _ = SettingsModel.writeGhosttyConfig(launchSettings)
         // the pacer exists before the library so the model can discard the key of a pane it removes before
         // that pane's window ever mounts; the registry that routes grants comes after
         let pacer = SpawnPacer()
-        let restored = agtermApp.restoredRuntime(stateDirectory: stateDirectory, pacer: pacer)
+        let restored = agtermApp.restoredRuntime(stateDirectory: stateDirectory, pacer: pacer,
+                                                 flaggedLayout: launchSettings.effectiveFlaggedViewLayout)
         spawnRegistry = SpawnRegistry(pacer: pacer)
         let library = restored.library
         zmxForegroundResolver = restored.foregroundResolver
@@ -84,11 +122,12 @@ struct agtermApp: App {
         _library = State(initialValue: library)
         let actions = AppActions(library: library)
         _actions = State(initialValue: actions)
-        // settings persist alongside the workspace snapshot (same AGTERM_STATE_DIR override); built before the
-        // control server so it can drive `keymap.reload`, safe since both need only the library.
-        let settingsStore = SettingsStore(directory: stateDirectory)
+        // built before the control server so it can drive `keymap.reload`, safe since both need only the library.
         let settingsModel = SettingsModel(library: library, settingsStore: settingsStore)
         _settingsModel = State(initialValue: settingsModel)
+        // here, not in the scene `.task`: the menu's first evaluation reads remotes through it, and a later
+        // assignment invalidates nothing, leaving File ▸ Attach Remote disabled until an unrelated rebuild.
+        actions.settingsModel = settingsModel
         captureOnExit = AppDelegate.makeExitCapture(
             settingsModel: settingsModel, zmxResolver: restored.foregroundResolver)
         welcomeDue = FirstRunWelcome.isDue(welcomeShown: settingsModel.settings.welcomeShown,
@@ -96,8 +135,32 @@ struct agtermApp: App {
         let controlServer = ControlServer(library: library, actions: actions, settingsModel: settingsModel,
                                           identity: Self.appIdentity,
                                           zmxForegroundResolver: restored.foregroundResolver,
-                                          zmxClient: restored.zmxClient)
+                                          zmxClient: restored.zmxClient,
+                                          zmxOutdatedBefore: restored.zmxOutdatedBefore)
         _controlServer = State(initialValue: controlServer)
+        actions.remoteAttacher = controlServer
+        actions.companionDuplicator = controlServer
+        LinkOpener.shared.mode = { settingsModel.settings.effectiveLinkOpenMode }
+        controlServer.installRemoteLinkClicks()
+        LinkOpener.shared.overlay = { [weak controlServer] url, session, percent in
+            controlServer?.openLinkOverlay(url, session: session, sizePercent: percent) ?? false
+        }
+        LinkOpener.shared.image = { [weak controlServer] url, session, done in
+            guard let controlServer else { return done(false) }
+            controlServer.openImageLink(url, session: session, completion: done)
+        }
+        LinkOpener.shared.markdown = { [weak controlServer] url, session, percent, done in
+            guard let controlServer else { return done(false) }
+            controlServer.openMarkdownLink(url, session: session, sizePercent: percent, completion: done)
+        }
+        LinkOpener.shared.text = { [weak controlServer] link, done in
+            guard let controlServer else { return done(false) }
+            controlServer.openTextLink(link, completion: done)
+        }
+        LinkOpener.shared.document = { [weak controlServer] url, session, percent, done in
+            guard let controlServer else { return done(false) }
+            controlServer.openDocumentLink(url, session: session, sizePercent: percent, completion: done)
+        }
         let liveReset = LiveResetCoordinator(settingsModel: settingsModel,
                                              selection: { [weak controlServer] in controlServer?.liveResetSelection() })
         controlServer.liveReset = liveReset
@@ -111,7 +174,18 @@ struct agtermApp: App {
         _customCommandRunner = State(initialValue: CustomCommandRunner(
             library: library, settings: settingsModel, actions: actions,
             usage: CustomCommandUsageStore(directory: stateDirectory),
-            socketProvider: { controlServer.resolvedSocketPath }))
+            socketProvider: { controlServer.resolvedSocketPath },
+            failureHud: FailureHud(
+                open: { [weak controlServer] sessionID, spec, pane in
+                    guard let controlServer else { return "control server is gone" }
+                    let response = controlServer.openCommandFailureHud(sessionID, spec: spec, pane: pane)
+                    return response.ok ? nil : response.error ?? "refused without a reason"
+                })))
+        // hooks.conf scripts: fed by the library's post-append observer, applied from the settings model.
+        let hookController = HookController(library: library, settings: settingsModel,
+                                            socketProvider: { controlServer.resolvedSocketPath })
+        controlServer.hookStatus = { hookController.scheduler.status }
+        _hookController = State(initialValue: hookController)
         // follows macOS light/dark via KVO on NSApp.effectiveAppearance; dependency-free, started in `.task`.
         _appearanceObserver = State(initialValue: SystemAppearanceObserver())
         // follows Reduce Motion / Reduce Transparency via NSWorkspace's accessibility-display notification,
@@ -120,6 +194,9 @@ struct agtermApp: App {
         // re-attempts surface creation on display wake: libghostty refuses to create one while the display
         // sleeps, which leaves a scheduled job's session realized-never and its --command unrun (#416).
         _wakeObserver = State(initialValue: SystemWakeObserver())
+        _linkObserver = State(initialValue: RemoteLinkObserver { [weak controlServer] in
+            controlServer?.retryRemoteLinksNow()
+        })
         // the library restored the model and ran the reap inside its init, and no window has mounted yet;
         // arm records expectations only, so nothing here waits on a view.
         if !Self.isHostedUnitTest {
@@ -138,7 +215,7 @@ struct agtermApp: App {
         // claim the next open id off `WindowLibrary`'s claim queue (dedup-by-id); one past the set dismisses itself.
         WindowGroup(id: Self.windowGroupID) {
             if Self.isHostedUnitTest {
-                Color.clear
+                HostedTestPlaceholder()
             } else {
                 ContentView(
                     library: library,
@@ -160,7 +237,7 @@ struct agtermApp: App {
                         let qtVisible = QuickTerminalController.shared.holdsKey
                         return Self.makeScratchSurface(for: session, store: store,
                                                        env: surfaceEnv(for: session, pane: .scratch),
-                                                       suppressAutoFocus: session.programOverlayActive || qtVisible,
+                                                       suppressAutoFocus: session.coverOverlayVisible || qtVisible,
                                                        actions: actions)
                     },
                     captureOnExit: captureOnExit,
@@ -205,14 +282,16 @@ struct agtermApp: App {
                         // hand the delegate the action hub and drain folders `open -a agterm /path` queued
                         // before the window store resolved.
                         appDelegate.actions = actions
+                        // hooks apply BEFORE the drain: a queued `open -a agterm /path` creates a session, and a
+                        // session.created hook must already be scheduled to see it (idempotent).
+                        hookController.start()
+                        // a hook on it calls back over the socket, so an unbound launch emits nothing
+                        library.emitAppLaunched(ready: controlServer.boundSocketPath != nil)
                         appDelegate.drainPendingOpenDirectories()
                         customCommandRunner.start()
-                        // wire the keymap + runner into the action hub for the command palette's custom
-                        // commands; both are built after `actions`, so not in `init`.
-                        actions.settingsModel = settingsModel
-                        // seed auto-follow into every open store now the model is wired: idempotent and
-                        // order-independent of resolveStore/onAppear (later windows seed in resolveStore).
-                        settingsModel.applyAutoFollowToAllWindows()
+                        // seed the per-window settings into every open store now the model is wired: idempotent
+                        // and order-independent of resolveStore/onAppear (later windows seed in resolveStore).
+                        settingsModel.applyWindowSettingsToAllWindows()
                         actions.customCommandRunner = customCommandRunner
                         // the action hub opens the .themes palette for the "Select Theme…" launcher + menu.
                         actions.palette = palette
@@ -221,6 +300,28 @@ struct agtermApp: App {
                         NotificationManager.shared.actions = actions
                         NotificationManager.shared.library = library
                         NotificationManager.shared.start()
+                        let paneServices = surfaceServices
+                        PaneLead.reattach = { old, claim in Self.reattachPane(old, claim: claim, services: paneServices) }
+                        PaneLead.replace = { old, launch, lead in
+                            Self.replacePane(old, launch: launch, lead: lead, cover: false, spawnFirst: true,
+                                             services: paneServices)
+                        }
+                        PaneLead.roleChanged = { [library] view in
+                            view.session.flatMap { library.store(forSession: $0.id) }?.leadRoleChanged()
+                        }
+                        PaneLead.reconnect = { old, cover in
+                            Self.reattachPane(old, claim: false, cover: cover, services: paneServices)
+                        }
+                        PaneLead.heldExit = { [weak server = controlServer] view in server?.remotePaneHeld(view) }
+                        PaneLead.ownerRespawn = { [weak server = controlServer] session, daemon in
+                            let prior = server?.priorLeader(daemon: daemon)
+                            return { server?.ownerRespawned(session: session, daemon: daemon, prior: prior) }
+                        }
+                        PaneLead.waitToReconnect = { [weak server = controlServer, library] view, cover in
+                            guard let session = view.session, let store = library.store(holdingSession: session.id) else { return }
+                            Self.remotePaneStopped(view, store: store, sessionID: session.id, library: library)
+                            server?.waitToReconnect(view, cover: cover)
+                        }
                         // drive the Dock badge (via UNUserNotifications) from the app-wide unseen total — the
                         // sidebar pills' Session.unseenCount summed across windows.
                         DockBadgeController.shared.library = library
@@ -229,6 +330,12 @@ struct agtermApp: App {
                         // before registration. launch window only: `hasReopened` is false until `reopenWindows()`.
                         if !library.hasReopened, !settingsModel.keymapDiagnostics.isEmpty {
                             NotificationManager.shared.notifyKeymapDiagnostics(count: settingsModel.keymapDiagnostics.count)
+                        }
+                        if !library.hasReopened, !settingsModel.hooksDiagnostics.isEmpty {
+                            NotificationManager.shared.notifyHooksDiagnostics(count: settingsModel.hooksDiagnostics.count)
+                        }
+                        if !library.hasReopened, settingsModel.remotes.issueCount > 0 {
+                            NotificationManager.shared.notifyRemotesDiagnostics(count: settingsModel.remotes.issueCount)
                         }
                         // same for ghostty config diagnostics, recorded at boot by GhosttyApp.loadConfig
                         // (applicationDidFinishLaunching, before registration): same `hasReopened` gate.
@@ -248,6 +355,8 @@ struct agtermApp: App {
                         // consumers read current accessibility values at first render; this handles live flips.
                         accessibilityObserver.start()
                         wakeObserver.start()
+                        linkObserver.start()
+                        linkObserver.watchPath()
                         // last: a modal here blocks the rest of the task, and the window behind it should be
                         // fully wired before it opens. `presentOnce` latches, so the per-window .task is safe.
                         if welcomeDue { WelcomeAlert.presentOnce(settingsModel: settingsModel) }
@@ -273,6 +382,8 @@ struct agtermApp: App {
         /// finalizer/reap closures, where nothing else could reach it.
         let zmxClient: ZmxClient?
         let spawnContext: LaunchSpawnContext
+        /// zmxOutdatedBefore is this launch's `ZmxBuildRecord` cutoff.
+        var zmxOutdatedBefore: Date?
     }
 
     /// What the launch reap learned before any window mounted, read by every pane factory: the daemon names
@@ -289,9 +400,11 @@ struct agtermApp: App {
 
     /// Builds the window library and zmx foreground resolver for the state directory. Bootstrap
     /// migrates/recovers persisted windows and inventories claimed pane identities before surfaces mount.
-    private static func restoredRuntime(stateDirectory: URL, pacer: SpawnPacer) -> RestoredRuntime {
+    private static func restoredRuntime(stateDirectory: URL, pacer: SpawnPacer,
+                                        flaggedLayout: FlaggedViewLayout) -> RestoredRuntime {
         guard !isHostedUnitTest else {
-            return RestoredRuntime(library: WindowLibrary(directory: stateDirectory),
+            return RestoredRuntime(library: WindowLibrary(directory: stateDirectory, paneFinalizer: nil,
+                                                          flaggedLayout: flaggedLayout),
                                    foregroundResolver: nil, zmxClient: nil, spawnContext: LaunchSpawnContext())
         }
         let ghostty = GhosttyApp.shared
@@ -299,7 +412,8 @@ struct agtermApp: App {
         let executable = ZmxLaunch.executablePath(bundleURL: Bundle.main.bundleURL, environment: environment,
                                                   allowDebugOverride: ZmxLaunch.allowDebugOverride)
         let client = ZmxClient(executablePath: executable,
-                              socketDirectory: ZmxSupport.socketDirectory(forStateDirectory: stateDirectory.path))
+                              socketDirectory: ZmxSupport.socketDirectory(forStateDirectory: stateDirectory.path),
+                              sweeper: ProcessSweeper())
         let foregroundResolver = ZmxForegroundResolver(leaderProvider: { client.sessionLeaderPIDs(timeout: $0) })
         let context = LaunchSpawnContext()
         let library = WindowLibrary(
@@ -311,18 +425,26 @@ struct agtermApp: App {
             launchInventorySink: { context.launchInventory = $0 },
             launchPaneDrop: { identities in
                 for identity in identities { pacer.discard(identity) }
-            })
+            },
+            flaggedLayout: flaggedLayout)
         // the reap waits for the library so a confirmed Live sessions reset can narrow its marker against the
         // current claims first; both finish before any window mounts
-        let consumer = LiveResetConsumer.Dependencies(markerStore: LiveResetMarkerStore(directory: stateDirectory),
+        let outdatedBefore = ZmxBuildRecord.launchCutoff(bundledID: Self.bundledZmxBuildID(), directory: stateDirectory)
+        var consumer = LiveResetConsumer.Dependencies(markerStore: LiveResetMarkerStore(directory: stateDirectory),
                                                       probe: LiveAttributionProbe())
+        consumer.outdatedBefore = outdatedBefore
         let launch = LaunchOrchestration.Inputs(library: library, client: client, resolver: foregroundResolver,
                                                 context: context, launchDecision: ghostty.restoreLaunchDecision)
         if let outcome = LaunchOrchestration.run(launch, consumer: consumer) {
             ghostty.recordLiveResetOutcome(outcome)
         }
         return RestoredRuntime(library: library, foregroundResolver: foregroundResolver, zmxClient: client,
-                               spawnContext: context)
+                               spawnContext: context, zmxOutdatedBefore: outdatedBefore)
+    }
+
+    private static func bundledZmxBuildID() -> String? {
+        guard let url = Bundle.main.url(forResource: "BUILD", withExtension: nil, subdirectory: "zmx") else { return nil }
+        return try? String(contentsOf: url, encoding: .utf8)
     }
 
     /// Opens the windows open at quit beyond the one SwiftUI auto-opened at launch (which claimed the launch
@@ -378,12 +500,17 @@ struct agtermApp: App {
         // foreground pid, so it is never captured and restores via the exec `command` path, keeping close-on-exit.
         // `LaunchSeedProvider` owns the precedence between them and resolves it at spawn time, not here, so
         // the pending slots stay on the session until the pane really spawns.
+        // without the claim: a pane relaunched while another Mac leads its daemon comes back covered
+        let lead = ZmxLeadAttachment(claim: false)
         let zmx = ZmxLaunch.wrapsLocally(mode: ghostty.launchRestoreMode, session: session)
-            ? ZmxLaunch.configuration(paneIdentity: session.paneIdentity, pane: "primary", environment: env)
+            ? ZmxLaunch.configuration(paneIdentity: session.paneIdentity, pane: "primary", environment: env, lead: lead)
             : nil
         let disposition = ZmxLaunch.disposition(requested: ghostty.requestedRestoreMode,
                                                 active: ghostty.launchRestoreMode, configuration: zmx)
-        if disposition.backedByZmx { services.zmxForegroundResolver?.noteLifecycleChange() }
+        if disposition.backedByZmx {
+            services.zmxForegroundResolver?.noteLifecycleChange()
+            ZmxLeadBook.shared.begin(lead, pane: session.paneIdentity)
+        }
         let cwd = session.localWorkingDirectory(reported: session.effectiveCwd, homeDirectory: NSHomeDirectory())
         let view = GhosttySurfaceView(workingDirectory: cwd, fontSize: session.fontSize.map(Float.init),
                                       env: Self.surfaceEnv(disposition: disposition, fallback: env),
@@ -392,7 +519,17 @@ struct agtermApp: App {
                                                policy: Self.launchSeedPolicy(ghostty, context: services.launchContext))
         view.launchSeed = provider
         services.spawnRegistry?.enqueue(view, key: session.paneIdentity, provider: provider)
+        Self.wirePane(view, session: session, store: store, services: services)
+        return view
+    }
+
+    /// The callbacks every session pane carries, whichever slot it sits in and whether a factory or a
+    /// fresh attach built it. Each one reads the surface's LIVE role, so nothing here is slot-specific.
+    @MainActor
+    private static func wirePane(_ view: GhosttySurfaceView, session: Session, store: AppStore,
+                                 services: SurfaceServices) {
         view.session = session
+        if let title = GhosttyApp.shared.staticTitle { view.applyTitle(title) }
         let sessionID = session.id
         view.onExit = { [weak view] in
             guard let view else { return }
@@ -417,6 +554,80 @@ struct agtermApp: App {
             Self.persistFontSize(size, from: view, store: store, sessionID: sessionID)
         }
         Self.wireSearchCallbacks(view, store: store, sessionID: sessionID, actions: services.actions)
+        view.onExitHeld = { [weak view] in
+            guard let view else { return }
+            // the wrapper is gone, so no key can end a wait; a replaced surface's late exit is not this pane's
+            if let pane = UUID(uuidString: view.paneToken),
+               view.session?.surface === view || view.session?.splitSurface === view {
+                RemoteReconnectBook.shared.cancel(pane: pane)
+            }
+            Self.remotePaneStopped(view, store: store, sessionID: sessionID, library: services.library)
+            PaneLead.heldExit?(view)
+        }
+    }
+
+    /// An attach that stopped, on its exit prompt (a failed take-over included) or waiting to reconnect:
+    /// no client is left to report a role, and a cover would hide the line saying what happened.
+    @MainActor
+    static func remotePaneStopped(_ view: GhosttySurfaceView, store: AppStore, sessionID: UUID, library: WindowLibrary) {
+        if let pane = UUID(uuidString: view.paneToken) {
+            ZmxLeadBook.shared.forget(pane: pane)
+            store.leadRoleChanged()
+        }
+        Self.handleRemotePaneHeld(view, store: store, sessionID: sessionID, library: library)
+    }
+
+    /// Replaces `old` with a fresh attach of the same pane in the same slot. None of the pane's close paths
+    /// run: the session, the daemon and the pane identity all stay, so the program inside keeps the
+    /// `AGTERM_PANE_ID` it was started with.
+    @MainActor @discardableResult
+    static func reattachPane(_ old: GhosttySurfaceView, claim: Bool, cover: Bool = true, services: SurfaceServices) -> Bool {
+        let lead = ZmxLeadAttachment(claim: claim)
+        guard let session = old.session,
+              let identity = old.isSplitPane ? session.splitPaneIdentity : session.paneIdentity,
+              let launch = PaneReattach.launch(replacing: old, session: session, identity: identity, lead: lead)
+        else { return false }
+        return replacePane(old, launch: launch, lead: lead, cover: cover, services: services) != nil
+    }
+
+    /// replacePane puts a surface built from `launch` in `old`'s slot and destroys `old`, running none of
+    /// the pane's close paths. `spawnFirst` creates the new surface at the old size BEFORE the free: libghostty
+    /// routes a queued child-exit by surface address, and a surface created after it can take the old exit.
+    @MainActor
+    static func replacePane(_ old: GhosttySurfaceView, launch: PaneReattach, lead: ZmxLeadAttachment, cover: Bool,
+                            spawnFirst: Bool = false, services: SurfaceServices) -> GhosttySurfaceView? {
+        guard let session = old.session, let store = services.library.store(forSession: session.id),
+              let identity = old.isSplitPane ? session.splitPaneIdentity : session.paneIdentity
+        else { return nil }
+        // a dashboard cell's transient font is not the pane's: seeding from it would persist the small size
+        let fontSize = old.dashboardFontOverride == nil ? old.currentFontSize() ?? session.fontSize : session.fontSize
+        let view = GhosttySurfaceView(workingDirectory: launch.workingDirectory, fontSize: fontSize.map(Float.init),
+                                      command: launch.command, waitAfterCommand: launch.wait,
+                                      env: launch.environment, backedByZmx: old.backedByZmx)
+        view.isSplitPane = old.isSplitPane
+        Self.wirePane(view, session: session, store: store, services: services)
+        view.dashboardFontOverride = old.dashboardFontOverride
+        ZmxLeadBook.shared.begin(lead, pane: identity, reattaching: cover)
+        if session.remoteHost != nil { RemoteRespawnBook.shared.attachStarted(pane: identity, session: session.id) }
+        // the old client's exit must not close the pane the new one now owns
+        _ = old.claimProcessExit()
+        let hadFocus = old.window?.firstResponder === old
+        // synchronously: END_SEARCH reports back through a callback `destroySurface` clears first
+        if session.searchSurface === old {
+            session.searchActive = false
+            session.searchNeedle = ""
+            session.searchTotal = nil
+            session.searchSelected = nil
+            session.searchSurface = nil
+        }
+        if old.isSplitPane { session.splitSurface = view } else { session.surface = view }
+        if spawnFirst {
+            view.frame = old.frame.isEmpty ? NSRect(x: 0, y: 0, width: 800, height: 600) : old.frame
+            view.createSurface()
+        }
+        old.destroySurface()
+        if old.backedByZmx { services.zmxForegroundResolver?.noteLifecycleChange() }
+        if hadFocus { view.focusAfterReparent() }
         return view
     }
 
@@ -427,13 +638,18 @@ struct agtermApp: App {
     @MainActor
     static func handlePaneExit(_ view: GhosttySurfaceView, store: AppStore, sessionID: UUID,
                                library: WindowLibrary, alreadyFinalized: UUID? = nil) {
+        guard let session = store.session(withID: sessionID), session.surface === view || session.splitSurface === view else { return }
         if view.isSplitPane {
             store.closeSplitPane(sessionID, alreadyFinalized: alreadyFinalized)
         } else {
-            store.closePrimaryPane(sessionID, alreadyFinalized: alreadyFinalized)
+            // the daemon's leader is read before the respawn replaces it, so its successor can be told apart
+            let publishRespawn = view.backedByZmx ? view.zmxSessionName.flatMap { PaneLead.ownerRespawn?(sessionID, $0) } : nil
             // makeSplitSurface omits onFontSizeChange, but a promoted survivor is the sole pane and must persist
-            // its own cmd +/-. no-op when the session closed instead (`surface` nil).
-            if let promoted = store.session(withID: sessionID)?.surface as? GhosttySurfaceView {
+            // its own cmd +/-. a respawned parent gets a fresh primary surface, which wires its own.
+            let outcome = store.closePrimaryPane(sessionID, alreadyFinalized: alreadyFinalized)
+            if outcome == .respawned { publishRespawn?() }
+            if outcome == .promoted,
+               let promoted = store.session(withID: sessionID)?.surface as? GhosttySurfaceView {
                 promoted.onFontSizeChange = { store.setFontSize(sessionID, $0) }
                 // the same "session survived ⇒ its split was promoted" test, for a dashboard holding this
                 // session by `<id>:right`. synchronous, so it lands before the reconcile onChange prunes the
@@ -445,6 +661,8 @@ struct agtermApp: App {
         }
         // focus the surviving (now maximized) pane, else the session reselected to; the collapse/switch re-hosts
         // the target, hence the retry. `topmostSurface` prefers an overlay/scratch cover over the pane it hides.
+        if let survivor = store.session(withID: sessionID) ?? store.activeSession,
+           HtmlOverlayRegistry.shared.focusCover(of: survivor) { return }
         let target = store.session(withID: sessionID)?.topmostSurface ?? store.activeSession?.topmostSurface
         (target as? GhosttySurfaceView)?.focusAfterReparent()
     }
@@ -510,6 +728,7 @@ struct agtermApp: App {
             // is pending, but its async END must not return focus behind it.
             guard PickRegistry.shared.controller(for: windowID)?.modalPending != true else { return }
             actions.resignDismissedFieldEditor(for: windowID)
+            if HtmlOverlayRegistry.shared.focusCover(of: session) { return }
             if let surface = session.topmostSurface as? GhosttySurfaceView, !surface.deferFocusToAsk() { surface.focusAfterReparent() }
         }
         view.onSearchTotal = { total in store.session(withID: sessionID)?.searchTotal = total }
@@ -529,6 +748,8 @@ struct agtermApp: App {
         view.onUserInputClearsStatus = { [weak view] keystroke in
             let pane = fixedPane ?? ((view?.isSplitPane ?? false) ? .right : .left)
             let reset = GhosttyApp.shared.statusReset
+            // a status mirrored from an origin pane this Mac has no counterpart for is not this pane's to clear
+            guard store.session(withID: sessionID)?.remotePresentation?.allowsKeystrokeStatusClear != false else { return }
             if store.session(withID: sessionID)?.agentIndicator
                 .clearedBy(pane: pane, keystroke: keystroke, reset: reset) == true {
                 store.setAgentIndicator(AgentIndicator(), forSession: sessionID)
@@ -549,12 +770,16 @@ struct agtermApp: App {
         // the parent's window/workspace/session ids.
         // Creation, capture and override precedence matches the primary.
         let ghostty = GhosttyApp.shared
+        let lead = ZmxLeadAttachment(claim: false)
         let zmx = ZmxLaunch.wrapsLocally(mode: ghostty.launchRestoreMode, session: session)
-            ? ZmxLaunch.configuration(paneIdentity: session.splitPaneIdentity, pane: "split", environment: env)
+            ? ZmxLaunch.configuration(paneIdentity: session.splitPaneIdentity, pane: "split", environment: env, lead: lead)
             : nil
         let disposition = ZmxLaunch.disposition(requested: ghostty.requestedRestoreMode,
                                                 active: ghostty.launchRestoreMode, configuration: zmx)
-        if disposition.backedByZmx { services.zmxForegroundResolver?.noteLifecycleChange() }
+        if disposition.backedByZmx {
+            services.zmxForegroundResolver?.noteLifecycleChange()
+            if let identity = session.splitPaneIdentity { ZmxLeadBook.shared.begin(lead, pane: identity) }
+        }
         let cwd = session.localWorkingDirectory(reported: session.initialSplitCwd ?? session.effectiveCwd,
                                                 homeDirectory: NSHomeDirectory())
         let view = GhosttySurfaceView(workingDirectory: cwd,
@@ -565,36 +790,10 @@ struct agtermApp: App {
                                                policy: Self.launchSeedPolicy(ghostty, context: services.launchContext))
         view.launchSeed = provider
         services.spawnRegistry?.enqueue(view, key: session.splitPaneIdentity, provider: provider)
-        view.session = session
         view.isSplitPane = true
-        let sessionID = session.id
-        view.onExit = { [weak view] in
-            guard let view else { return }
-            Self.handlePaneExit(view, store: store, sessionID: sessionID, library: services.library)
-        }
-        view.onFocusChange = { [weak view] focused in
-            guard let splitFocused = Self.focusedSplitState(focused, surface: view) else { return }
-            store.session(withID: sessionID)?.splitFocused = splitFocused
-            store.clearUnseen(sessionID)
-            NotificationManager.shared.clearDelivered(sessionID: sessionID)
-        }
-        // the focus-free half of the clear above, for the zoom-hosted case (see makeSurface).
-        view.onClearUnseen = {
-            store.clearUnseen(sessionID)
-            NotificationManager.shared.clearDelivered(sessionID: sessionID)
-        }
-        Self.wireStatusClear(view, store: store, sessionID: sessionID)
-        view.onUserInput = { store.noteUserActivity() }
-        view.onFontSizeChange = { [weak view] size in
-            Self.persistFontSize(size, from: view, store: store, sessionID: sessionID)
-        }
-        Self.wireSearchCallbacks(view, store: store, sessionID: sessionID, actions: services.actions)
+        Self.wirePane(view, session: session, store: store, services: services)
         return view
     }
-
-    /// The fixed wrapper running the overlay command and recording its exit status to a temp file. stdout/stderr
-    /// are NOT redirected (so a TUI renders normally); only the status is captured.
-    private static let overlayExitWrapper = "sh -c '\(OverlayCapture.shellLine)'"
 
     /// Overlay-terminal surface factory: an ephemeral surface running the session's `overlayCommand` in
     /// `overlayCwd` (default the session's current dir). NOT wired to the session (no `view.session`), so its
@@ -616,18 +815,21 @@ struct agtermApp: App {
         let isHud = pane == nil && session.hudActive
         let hudFile = isHud ? session.hudFile : nil
         let codeFile = (NSTemporaryDirectory() as NSString).appendingPathComponent("agterm-ovl-\(UUID().uuidString).code")
-        var overlayEnv = env
-        overlayEnv[OverlayCapture.cmdEnvKey] = spec.command
-        overlayEnv[OverlayCapture.codeEnvKey] = codeFile
-        if let hudFile { overlayEnv[HudLayout.fileEnvKey] = hudFile }
         // an explicit `--cwd` is the caller's local choice; only the inherited default follows the remote rule.
-        let cwd = spec.cwd ?? session.localWorkingDirectory(reported: session.effectiveCwd,
-                                                             homeDirectory: NSHomeDirectory())
-        let view = GhosttySurfaceView(workingDirectory: cwd,
-                                      fontSize: session.fontSize.map(Float.init), command: overlayExitWrapper,
-                                      waitAfterCommand: spec.wait, autoFocus: !isHud, env: overlayEnv)
+        let context = OverlayLaunchContext(
+            command: spec.command,
+            cwd: OverlayLaunchContext.cwd(explicit: spec.cwd, session: session, homeDirectory: NSHomeDirectory()),
+            sessionEnvironment: env)
+        let fontSize = isHud ? session.hudFontSize ?? session.fontSize : session.fontSize
+        let view = GhosttySurfaceView(workingDirectory: context.cwd,
+                                      fontSize: fontSize.map(Float.init), command: OverlayCapture.surfaceCommand,
+                                      waitAfterCommand: spec.wait, autoFocus: !isHud,
+                                      env: context.localEnvironment(codeFile: codeFile, hudFile: hudFile))
         view.overlayCodeFile = codeFile
         view.hudBodyFile = hudFile
+        // the panel was sized from an estimated cell before this surface existed; once it has a grid, and
+        // whenever a config reload changes its cell, the refresh measures with the cell libghostty draws
+        if isHud { view.onGridChange = { [weak session] in session?.onHudGeometryChange?() } }
         // the overlay's own background color (`session.overlay.open --background-color`), applied in
         // createSurface — the overlay is sessionless, so it can't read it off the session there.
         view.overlayBackgroundColorHex = spec.backgroundColor
@@ -647,6 +849,7 @@ struct agtermApp: App {
             }
             view.onExitCodeCaptured = { store.recordPaneOverlayExit(sessionID, pane: livePane(), code: $0) }
             view.onExit = { store.closePaneOverlay(sessionID, pane: livePane()) }
+            view.onExitHeld = { store.replicaOverlayHeld(forSession: sessionID, pane: livePane()) }
             // a PANE overlay tracks its pane's focus like the pane itself does: clicking it moves
             // `splitFocused`, so the deck's per-pane focus gate keeps it active instead of resigning first
             // responder on the next update, and `focusedOverlayPane` (⌘W rung, search, `topmostSurface`)
@@ -662,6 +865,7 @@ struct agtermApp: App {
                 view.onExitCodeCaptured = { store.recordOverlayExit(sessionID, code: $0) }
             }
             view.onExit = { store.closeOverlay(sessionID) }
+            view.onExitHeld = { store.replicaOverlayHeld(forSession: sessionID, pane: nil) }
         }
         // typing is user activity: resets the auto-follow idle timer so an idle fire can't change the selection
         // (vanishing the overlay) mid-typing. destroySurface nils this, breaking the store->surface->closure cycle.

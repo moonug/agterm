@@ -13,7 +13,15 @@ extension GhosttySurfaceView {
     static let firstPresentPoll: UInt64 = 250_000_000
     static let hiddenJanitorInterval: UInt64 = 30_000_000_000
 
-    var showsOnScreen: Bool { deckOnScreen && window != nil }
+    /// showsOnScreen needs a visible window: one minimized, ordered out or hidden keeps its views attached.
+    var showsOnScreen: Bool { deckOnScreen && window?.isVisible == true }
+
+    /// observeWindowVisibility handles ordering changes that occlusion notifications can miss.
+    func observeWindowVisibility() {
+        windowVisibilityObservation = window?.observe(\.isVisible) { [weak self] _, _ in
+            Task { @MainActor in self?.updateRendererVisibility() }
+        }
+    }
 
     /// `delayHide: false` skips the reparent grace; every hide still lands AFTER the pane's first
     /// present. The renderer's release is edge-triggered, so an edge sent before the restore paints

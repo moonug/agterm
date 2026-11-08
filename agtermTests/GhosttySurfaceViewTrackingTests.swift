@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import agterm
 @testable import agtermCore
@@ -33,6 +34,7 @@ final class GhosttySurfaceViewTrackingTests: XCTestCase {
             window.isReleasedWhenClosed = false
             content = StubContentView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
             window.contentView = content
+            window.orderFront(nil)
             // both surfaces stay at their zero init frame, so `viewDidMoveToWindow` parks in
             // `pendingSurfaceCreation` instead of spawning a libghostty surface and a shell.
             surface = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
@@ -171,6 +173,100 @@ final class GhosttySurfaceViewTrackingTests: XCTestCase {
         XCTAssertNil(view.hitTest(inside), "a view-only surface must let the click through instead of taking it")
     }
 
+    func testAHudPanelStaysClosedToEveryHit() {
+        let view = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        view.frame = NSRect(x: 0, y: 0, width: 120, height: 80)
+        view.hudBodyFile = NSTemporaryDirectory() + "agterm-hud-\(UUID().uuidString)"
+        view.viewOnly = true
+
+        XCTAssertNil(view.hitTest(NSPoint(x: 40, y: 30)))
+        XCTAssertFalse(view.acceptsFirstResponder)
+    }
+
+    private func mouse(_ type: NSEvent.EventType, _ flags: NSEvent.ModifierFlags,
+                       at point: NSPoint = NSPoint(x: 40, y: 30)) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: flags, timestamp: 0,
+                                         windowNumber: window.windowNumber, context: nil, eventNumber: 0,
+                                         clickCount: 1, pressure: 1))
+    }
+
+    // regression: a command-click on the search bar over a HUD went to the panel underneath
+    func testTheSearchBarKeepsACommandClickOverAHudPanel() throws {
+        let panel = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        content.addSubview(panel)
+        panel.frame = NSRect(x: 0, y: 0, width: 320, height: 200)
+        panel.viewOnly = true
+        panel.hudBodyFile = NSTemporaryDirectory() + "agterm-hud-\(UUID().uuidString)"
+        defer { panel.hudBodyFile = nil; panel.removeFromSuperview() }
+        let bar = NSHostingView(rootView: TerminalSearchBar(
+            needle: .constant(""), displayText: "", onNext: {}, onPrevious: {}, onClose: {},
+            chromeText: .white, terminalColor: .black))
+        bar.frame = NSRect(origin: NSPoint(x: 20, y: 120), size: bar.fittingSize)
+        content.addSubview(bar)
+        bar.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        let onBar = NSPoint(x: bar.frame.midX, y: bar.frame.midY)
+        let beside = NSPoint(x: bar.frame.midX, y: 40)
+
+        XCTAssertFalse(HudLinkClick.consumes(try mouse(.leftMouseDown, .command, at: onBar)),
+                       "the search bar is drawn above the panel, so the click is the bar's")
+        HudLinkClick.hover(try mouse(.mouseMoved, .command, at: onBar))
+        XCTAssertNil(HudLinkClick.hovered, "and the panel is not told the pointer is over it")
+        XCTAssertTrue(HudLinkClick.consumes(try mouse(.leftMouseDown, .command, at: beside)),
+                      "the same panel still takes a command-click beside the bar")
+        XCTAssertTrue(HudLinkClick.consumes(try mouse(.leftMouseUp, [], at: beside)))
+
+        bar.removeFromSuperview()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertTrue(HudLinkClick.consumes(try mouse(.leftMouseDown, .command, at: onBar)),
+                      "a bar that is gone covers nothing")
+        XCTAssertTrue(HudLinkClick.consumes(try mouse(.leftMouseUp, [], at: onBar)))
+    }
+
+    func testOnlyACommandOrCommandOptionLeftPressIsALinkClick() throws {
+        XCTAssertTrue(HudLinkClick.isLinkClick(try mouse(.leftMouseDown, .command)))
+        XCTAssertTrue(HudLinkClick.isLinkClick(try mouse(.leftMouseDown, [.command, .capsLock])))
+        XCTAssertTrue(HudLinkClick.isLinkClick(try mouse(.leftMouseDown, [.command, .option])), "the reveal chord")
+        XCTAssertFalse(HudLinkClick.isLinkClick(try mouse(.leftMouseDown, [])))
+        XCTAssertFalse(HudLinkClick.isLinkClick(try mouse(.leftMouseDown, .option)))
+        XCTAssertFalse(HudLinkClick.isLinkClick(try mouse(.leftMouseDown, [.command, .shift])))
+        XCTAssertFalse(HudLinkClick.isLinkClick(try mouse(.leftMouseDown, [.command, .option, .shift])))
+        XCTAssertFalse(HudLinkClick.isLinkClick(try mouse(.leftMouseDown, [.command, .control])))
+        XCTAssertFalse(HudLinkClick.isLinkClick(try mouse(.rightMouseDown, .command)))
+    }
+
+    func testACommandClickOverAHudPanelIsClaimedAsAPair() throws {
+        let panel = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        content.addSubview(panel)
+        panel.frame = NSRect(x: 0, y: 0, width: 120, height: 80)
+        panel.viewOnly = true
+        panel.hudBodyFile = NSTemporaryDirectory() + "agterm-hud-\(UUID().uuidString)"
+        defer { panel.hudBodyFile = nil; panel.removeFromSuperview() }
+
+        XCTAssertFalse(HudLinkClick.consumes(try mouse(.leftMouseDown, [])), "a plain click passes on to the session")
+        XCTAssertFalse(HudLinkClick.consumes(try mouse(.leftMouseUp, [])), "and so does its release")
+        XCTAssertFalse(HudLinkClick.consumes(try mouse(.leftMouseDown, .command, at: NSPoint(x: 200, y: 150))),
+                       "a command-click beside the panel is not the panel's")
+
+        XCTAssertTrue(HudLinkClick.consumes(try mouse(.leftMouseDown, .command)))
+        XCTAssertTrue(HudLinkClick.consumes(try mouse(.leftMouseUp, [])), "the release follows its press")
+        XCTAssertFalse(HudLinkClick.consumes(try mouse(.leftMouseUp, [])))
+
+        HudLinkClick.hover(try mouse(.mouseMoved, .command))
+        XCTAssertTrue(HudLinkClick.hovered === panel, "the pointer is the panel's while command is held over it")
+        XCTAssertFalse(HudLinkClick.ownsCursor, "with no link under it the pane beneath keeps the cursor")
+        HudLinkClick.hover(try mouse(.mouseMoved, []))
+        XCTAssertNil(HudLinkClick.hovered, "without command the panel hears nothing")
+        HudLinkClick.hover(try mouse(.mouseMoved, .command, at: NSPoint(x: 200, y: 150)))
+        XCTAssertNil(HudLinkClick.hovered)
+
+        panel.deckOnScreen = false
+        XCTAssertFalse(HudLinkClick.consumes(try mouse(.leftMouseDown, .command)), "a panel not on screen claims nothing")
+        panel.deckOnScreen = true
+        panel.hudBodyFile = nil
+        XCTAssertFalse(HudLinkClick.consumes(try mouse(.leftMouseDown, .command)), "a closed panel claims nothing")
+    }
+
     func testRendererVisibilityRequiresAnOnScreenHost() {
         surface.wantsLayer = true
         surface.layer?.contents = NSColor.red.cgColor
@@ -183,6 +279,82 @@ final class GhosttySurfaceViewTrackingTests: XCTestCase {
         surface.deckOnScreen = true
         surface.removeFromSuperview()
         XCTAssertFalse(surface.showsOnScreen)
+    }
+
+    // a window that was miniaturized, ordered out or hidden with the app kept its panes' swap chains
+    func testAnOrderedOutWindowIsNotOnScreenAndOrderingItInRevealsThePane() async throws {
+        surface.wantsLayer = true
+        surface.layer?.contents = NSColor.red.cgColor
+        XCTAssertTrue(surface.showsOnScreen)
+
+        window.orderOut(nil)
+        XCTAssertFalse(surface.showsOnScreen)
+        try await waitUntil("the hide starts on order-out") { self.surface.rendererVisibilityTask != nil }
+
+        window.orderFront(nil)
+        XCTAssertTrue(surface.showsOnScreen)
+        try await waitUntil("order-in cancels the hide") { self.surface.rendererVisibilityTask == nil }
+        XCTAssertEqual(surface.layer?.needsDisplayOnBoundsChange, true)
+    }
+
+    func testAMiniaturizedWindowIsNotOnScreenAndRestoringItRevealsThePane() async throws {
+        let mini = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
+                            styleMask: [.titled, .miniaturizable], backing: .buffered, defer: false)
+        mini.isReleasedWhenClosed = false
+        let pane = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        pane.wantsLayer = true
+        defer {
+            pane.removeFromSuperview()
+            mini.orderOut(nil)
+        }
+        mini.contentView?.addSubview(pane)
+        mini.orderFront(nil)
+        pane.layer?.contents = NSColor.red.cgColor
+        try await waitUntil("the pane is on screen") { pane.showsOnScreen && pane.rendererVisibilityTask == nil }
+
+        mini.miniaturize(nil)
+        try await waitUntil("the hide starts on minimize") { !pane.showsOnScreen && pane.rendererVisibilityTask != nil }
+        XCTAssertTrue(mini.isMiniaturized)
+
+        mini.deminiaturize(nil)
+        try await waitUntil("restore cancels the hide") { pane.showsOnScreen && pane.rendererVisibilityTask == nil }
+    }
+
+    func testAPaneAttachedToAWindowNotYetOrderedInIsRevealedWhenItIs() async throws {
+        let late = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 200), styleMask: [.titled],
+                            backing: .buffered, defer: false)
+        late.isReleasedWhenClosed = false
+        let pane = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        pane.wantsLayer = true
+        defer {
+            pane.removeFromSuperview()
+            late.orderOut(nil)
+        }
+        late.contentView?.addSubview(pane)
+        XCTAssertFalse(pane.showsOnScreen)
+        try await waitUntil("an unordered window's pane waits to hide") { pane.rendererVisibilityTask != nil }
+
+        late.orderFront(nil)
+
+        try await waitUntil("order-in reveals it") { pane.rendererVisibilityTask == nil }
+        XCTAssertTrue(pane.showsOnScreen)
+        XCTAssertEqual(pane.layer?.needsDisplayOnBoundsChange, true)
+    }
+
+    func testAnotherWindowsOrderingLeavesAPendingHideAlone() async throws {
+        surface.wantsLayer = true
+        surface.deckOnScreen = false
+        let pending = try XCTUnwrap(surface.rendererVisibilityTask)
+        let other = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 100, height: 100), styleMask: [.titled],
+                             backing: .buffered, defer: false)
+        other.isReleasedWhenClosed = false
+
+        other.orderFront(nil)
+        other.orderOut(nil)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(surface.rendererVisibilityTask, pending)
+        surface.deckOnScreen = true
     }
 
     func testHiddenJanitorSweepsWhileHiddenAndRetiresOnReveal() async throws {

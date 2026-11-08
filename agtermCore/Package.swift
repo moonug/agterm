@@ -25,7 +25,9 @@ let package = Package(
             ]
         ),
         .executableTarget(name: "agtermctl", dependencies: ["agtermctlKit"]),
-        .testTarget(name: "agtermctlKitTests", dependencies: ["agtermctlKit"]),
+        // debug-only fixture: it imports agtermctlKit @testable, and release builds name their products.
+        .executableTarget(name: "session-wait-watchdog-probe", dependencies: ["agtermctlKit"]),
+        .testTarget(name: "agtermctlKitTests", dependencies: ["agtermctlKit", "agtermctl", "session-wait-watchdog-probe"]),
     ],
     swiftLanguageModes: [.v6]
 )
@@ -39,7 +41,9 @@ package.targets += [
     // The fixtures need a socket client they can copy into a test bundle, which /usr/bin/nc
     // cannot be (see the target's own comment).
     .executableTarget(name: "session-host-test-client"),
+    .executableTarget(name: "session-host-pty-probe"),
     .testTarget(name: "SessionHostRuntimeTests",
-                dependencies: ["SessionHostRuntime", "agterm-session-host", "session-host-test-client"]),
+                dependencies: ["SessionHostRuntime", "agterm-session-host", "session-host-test-client",
+                               "session-host-pty-probe"]),
 ]
 #endif

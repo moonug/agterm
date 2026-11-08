@@ -7,8 +7,30 @@ import agtermCore
 struct Keymap: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Keymap commands.",
-        subcommands: [Reload.self, List.self]
+        subcommands: [Reload.self, List.self, Run.self]
     )
+
+    struct Run: RequestCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Run one of your custom commands by name against a session.",
+            discussion: """
+            NAME is a custom command's name exactly as `keymap list` prints it. The command runs as it \
+            does from the palette, with the target session's focused pane, primary or split and never \
+            its scratch or an overlay, supplying the working directory, the selection and the context \
+            tokens. A name no command carries is refused.
+
+            The reply says the command started. It runs detached, so its exit status and output are not \
+            reported here; a command set to show a failure panel still shows it.
+            """
+        )
+        @Argument(help: "Custom command name, from `keymap list`.") var name: String
+        @OptionGroup var target: TargetOptions
+        @OptionGroup var options: ClientOptions
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .keymapRun, target: target.target, args: options.withWindow(ControlArgs(name: name)))
+        }
+    }
 
     struct Reload: RequestCommand {
         static let configuration = CommandConfiguration(abstract: "Re-read and apply keymap.conf (prints the diagnostic count).")
@@ -32,6 +54,79 @@ struct Keymap: ParsableCommand {
         @OptionGroup var options: BasicOptions
 
         func makeRequest() throws -> ControlRequest { ControlRequest(cmd: .keymapList) }
+    }
+}
+
+// MARK: - hooks
+
+struct Hooks: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Event hook commands.",
+        subcommands: [Reload.self, List.self]
+    )
+
+    struct Reload: RequestCommand {
+        static let configuration = CommandConfiguration(abstract: "Re-read and apply hooks.conf (prints the diagnostic count).")
+        // app-global like the keymap commands, so no `--window`.
+        @OptionGroup var options: BasicOptions
+
+        func makeRequest() throws -> ControlRequest { ControlRequest(cmd: .hooksReload) }
+    }
+
+    struct List: RequestCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Show every hook with its running child, queue depth, dropped count and last failure.",
+            discussion: "One row per `on <kind> <shell...>` line in file order, then any hook removed from the file "
+                + "whose child is still running, marked retired. `running` is the child's pid and elapsed seconds "
+                + "while a hook is busy; `pending` is how many events wait behind it and `dropped` how many the "
+                + "bounded queue discarded; `last failure` stays until the hook's next clean run (a reload keeps it)."
+        )
+        @OptionGroup var options: BasicOptions
+
+        func makeRequest() throws -> ControlRequest { ControlRequest(cmd: .hooksList) }
+    }
+}
+
+// MARK: - browser
+
+struct Browser: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Saved browser storage of --persistent URL overlays, and where clicked links open.",
+        subcommands: [Clear.self, Links.self]
+    )
+
+    /// `agtermctl browser links [MODE]`: no mode reads the setting. App-wide, so no `--window`.
+    struct Links: RequestCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Set or read where a clicked web link in a terminal opens (browser|overlay|overlay95|overlay75|overlay50).",
+            discussion: "overlay opens http and https links in a full session web overlay with JavaScript, navigation "
+                + "buttons and the saved browser store; overlay95, overlay75 and overlay50 open it at that percent of "
+                + "the session. With no MODE the current one is printed. A link in a HUD, a link "
+                + "clicked while a HUD is up or the terminal is zoomed, and a link the overlay cannot show open in the browser."
+        )
+        @Argument(help: "Mode: browser, overlay, overlay95, overlay75 or overlay50. Omit to read the current mode.") var mode: String?
+        @OptionGroup var options: BasicOptions
+
+        func validate() throws {
+            guard let mode else { return }
+            guard LinkOpenMode(rawValue: mode) != nil else { throw ValidationError("mode must be browser, overlay, overlay95, overlay75 or overlay50") }
+        }
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .browserLinks, args: mode.map { ControlArgs(mode: $0) })
+        }
+    }
+
+    struct Clear: RequestCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Remove every cookie and all site data the saved browser store holds.",
+            discussion: "Refused while a --persistent page is open, one in a just-closed session that can still be restored included: "
+                + "an open page writes its login back. Removing the local data does not sign you out on the server."
+        )
+        // one store serves every window, so no `--window`.
+        @OptionGroup var options: BasicOptions
+
+        func makeRequest() throws -> ControlRequest { ControlRequest(cmd: .browserClear) }
     }
 }
 
@@ -270,11 +365,14 @@ struct Surface: ParsableCommand {
             line is not empty; AT the prompt it establishes nothing, since the caret may have been moved \
             back over text that is still there.
             """)
+        @Option(name: .customLong("pane-id"), help: "Stable pane token ($AGTERM_PANE_ID). With it --target names the session ('active' or a session id), not a surface.")
+        var paneID: String?
         @OptionGroup var target: SurfaceTargetOptions
         @OptionGroup var options: ClientOptions
 
         func makeRequest() throws -> ControlRequest {
-            ControlRequest(cmd: .surfaceCursor, target: target.target, args: options.withWindow(ControlArgs()))
+            ControlRequest(cmd: .surfaceCursor, target: target.target,
+                           args: options.withWindow(ControlArgs(paneID: paneID)))
         }
     }
 
@@ -378,6 +476,8 @@ struct Pick: ParsableCommand {
         @Option(name: .long, help: "Initial text for the picker query field; it opens already filtered.")
         var query: String?
         @Flag(name: .long, help: "Accept the current query as a custom result.") var allowCustom = false
+        @Option(name: .long, help: "Item id to open highlighted; a --query that hides it falls back to the first row.")
+        var select: String?
         @Flag(name: .long, help: "Raise the target window when the picker opens.") var follow = false
         @Flag(name: .long, help: "Print the picker id and return without waiting for a result.") var noBlock = false
         @OptionGroup var options: ClientOptions
@@ -393,7 +493,8 @@ struct Pick: ParsableCommand {
                 items: try Self.parseItems(input),
                 prompt: prompt,
                 query: query,
-                allowCustom: allowCustom ? true : nil
+                allowCustom: allowCustom ? true : nil,
+                selection: select
             )
             return ControlRequest(cmd: .pickOpen, args: options.withWindow(args))
         }
@@ -429,7 +530,7 @@ struct Pick: ParsableCommand {
         /// real delays or process fds.
         func execute(
             input: Data,
-            send: @escaping (ControlRequest) throws -> ControlResponse,
+            send: @escaping (ControlRequest) throws -> SocketReply,
             sleep: @escaping (TimeInterval) -> Void,
             output: @escaping (String) -> Void,
             errorOutput: @escaping (String) -> Void = ModalCommandRunner.writeStandardError
@@ -462,7 +563,7 @@ struct Pick: ParsableCommand {
         /// One-shot read with injectable transport/stdout/stderr, so every wire outcome and exit mapping is
         /// covered without replacing process file descriptors.
         func execute(
-            send: @escaping (ControlRequest) throws -> ControlResponse,
+            send: @escaping (ControlRequest) throws -> SocketReply,
             output: @escaping (String) -> Void,
             errorOutput: @escaping (String) -> Void = ModalCommandRunner.writeStandardError
         ) throws {
@@ -493,7 +594,7 @@ struct ModalCommandRunner {
 
     let family: Family
     let json: Bool
-    let send: (ControlRequest) throws -> ControlResponse
+    let send: (ControlRequest) throws -> SocketReply
     let sleep: (TimeInterval) -> Void
     let output: (String) -> Void
     let errorOutput: (String) -> Void
@@ -501,7 +602,7 @@ struct ModalCommandRunner {
     func open(_ request: ControlRequest, noBlock: Bool) throws {
         let opened = try send(request)
         try requireSuccess(opened)
-        guard let id = opened.result?.id else {
+        guard let id = opened.response.result?.id else {
             errorOutput("error: \(family.rawValue).open result missing id")
             throw ExitCode.failure
         }
@@ -511,17 +612,17 @@ struct ModalCommandRunner {
         }
         var pendingPolls = 0
         while true {
-            let response: ControlResponse
+            let polled: SocketReply
             do {
-                response = try send(ControlRequest(cmd: family.resultCommand, target: id))
+                polled = try send(ControlRequest(cmd: family.resultCommand, target: id))
             } catch {
                 // each request opens its own connection, so cancellation can still reach the host after a failed poll.
                 abandon(id)
                 throw error
             }
             // the id-only poll cannot resolve to another window; failure means the host no longer holds the dialog.
-            try requireSuccess(response)
-            guard let result = try reply(from: response) else {
+            try requireSuccess(polled)
+            guard let result = try reply(from: polled.response) else {
                 errorOutput("error: \(family.rawValue).result missing result")
                 abandon(id)
                 throw ExitCode.failure
@@ -538,9 +639,9 @@ struct ModalCommandRunner {
     }
 
     func read(_ request: ControlRequest) throws {
-        let response = try send(request)
-        try requireSuccess(response)
-        guard let result = try reply(from: response) else {
+        let polled = try send(request)
+        try requireSuccess(polled)
+        guard let result = try reply(from: polled.response) else {
             errorOutput("error: \(family.rawValue).result missing result")
             throw ExitCode.failure
         }
@@ -567,10 +668,9 @@ struct ModalCommandRunner {
         }
     }
 
-    private func requireSuccess(_ response: ControlResponse) throws {
-        guard !response.ok else { return }
-        let line = SocketClient.formatResponse(response, json: json)
-        if json { output(line) } else { errorOutput(line) }
+    private func requireSuccess(_ reply: SocketReply) throws {
+        guard !reply.response.ok else { return }
+        if json { output(reply.line) } else { errorOutput(SocketClient.formatResponse(reply.response)) }
         throw ExitCode.failure
     }
 
@@ -589,7 +689,7 @@ struct ModalCommandRunner {
 struct Sidebar: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Sidebar visibility and view mode.",
-        subcommands: [Visibility.self, Mode.self, Expand.self, Collapse.self, Width.self],
+        subcommands: [Visibility.self, Mode.self, FlaggedLayout.self, Density.self, Expand.self, Collapse.self, Width.self],
         defaultSubcommand: Visibility.self
     )
 
@@ -605,7 +705,7 @@ struct Sidebar: ParsableCommand {
         }
     }
 
-    /// Flips the frontmost window's sidebar between the workspace tree and the flat flagged working-set list.
+    /// Flips the frontmost window's sidebar between the workspace tree and the flagged working-set view.
     struct Mode: RequestCommand {
         static let configuration = CommandConfiguration(commandName: "mode", abstract: "Sidebar view mode (tree|flagged|toggle).")
         @Argument(help: "Mode: tree, flagged, or toggle (default).") var mode: String = "toggle"
@@ -619,6 +719,42 @@ struct Sidebar: ParsableCommand {
 
         func makeRequest() throws -> ControlRequest {
             ControlRequest(cmd: .sidebarMode, args: ControlArgs(mode: mode))
+        }
+    }
+
+    /// Sets how every window's flagged sidebar view arranges its sessions; app-wide, so no `--window`.
+    struct FlaggedLayout: RequestCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "flagged-layout", abstract: "Flagged view layout (flat|plain|tree|toggle).")
+        @Argument(help: "Layout: flat, plain (flat without workspace names), tree, or toggle (default).") var layout: String = "toggle"
+        @OptionGroup var options: BasicOptions
+
+        func validate() throws {
+            guard ["flat", "plain", "tree", "toggle"].contains(layout) else {
+                throw ValidationError("layout must be flat, plain, tree, or toggle")
+            }
+        }
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .sidebarFlaggedLayout, args: ControlArgs(mode: layout))
+        }
+    }
+
+    /// Sets every window's sidebar row spacing; app-wide, so no `--window`.
+    struct Density: RequestCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "density", abstract: "Sidebar density (default|compact|toggle).")
+        @Argument(help: "Density: default, compact, or toggle (default).") var density: String = "toggle"
+        @OptionGroup var options: BasicOptions
+
+        func validate() throws {
+            guard ControlSidebarDensityMode.parse(density) != nil else {
+                throw ValidationError("density must be default, compact, or toggle")
+            }
+        }
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .sidebarDensity, args: ControlArgs(mode: density))
         }
     }
 
@@ -749,7 +885,7 @@ struct Version: RequestCommand {
         _ = _NSGetExecutablePath(nil, &size)
         var buffer = [CChar](repeating: 0, count: Int(size))
         guard _NSGetExecutablePath(&buffer, &size) == 0 else { return nil }
-        guard let resolved = realpath(buffer, nil) else { return String(cString: buffer) }
+        guard let resolved = realpath(buffer, nil) else { return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self) }
         defer { free(resolved) }
         return String(cString: resolved)
     }

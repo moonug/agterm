@@ -56,6 +56,35 @@ struct ControlDispatcherZmxTests {
         #expect(actions.calls == [.zmxList])
     }
 
+    @Test(arguments: [(false, nil, false), (true, nil, true), (false, 5, true)] as [(Bool, Int?, Bool)])
+    func zmxScreenReadsTheFullBufferForAllOrLines(all: Bool, lines: Int?, fullBuffer: Bool) async throws {
+        let actions = MockControlActions()
+        let request = ControlRequest(cmd: .zmxScreen, args: ControlArgs(name: " agterm-a ", all: all, lines: lines))
+
+        let response = try #require(await dispatch(request, actions))
+
+        #expect(response.result?.text == "screen")
+        #expect(actions.calls == [.zmxScreen(name: "agterm-a", fullBuffer: fullBuffer, lines: lines)])
+    }
+
+    @Test(arguments: [
+        (ControlArgs(), "zmx.screen requires a daemon name"),
+        (ControlArgs(name: "  "), "zmx.screen requires a daemon name"),
+        (ControlArgs(name: "a\u{1b}[31m"), "zmx.screen requires a daemon name"),
+        (ControlArgs(name: "two words"), "zmx.screen requires a daemon name"),
+        (ControlArgs(name: "agterm-a", all: true, lines: 3), "use either --all or --lines, not both"),
+        (ControlArgs(name: "agterm-a", lines: 0), "--lines must be greater than 0"),
+    ])
+    func zmxScreenRefusesWithoutReachingTheHost(args: ControlArgs, error: String) async throws {
+        let actions = MockControlActions()
+
+        let response = try #require(await dispatch(ControlRequest(cmd: .zmxScreen, args: args), actions))
+
+        #expect(!response.ok)
+        #expect(response.error == error)
+        #expect(actions.calls.isEmpty)
+    }
+
     @Test func zmxPruneRoutesWithNoArgumentsToParse() async throws {
         let actions = MockControlActions()
         let response = try #require(await dispatch(ControlRequest(cmd: .zmxPrune), actions))
@@ -207,6 +236,28 @@ struct ControlDispatcherZmxTests {
         #expect(actions.calls == [.zmxAttach(host: "buildbox", session: "s1")])
     }
 
+    @Test func zmxPresentCarriesTheSession() async {
+        let actions = MockControlActions()
+
+        let response = await ControlDispatcher(actions: actions)
+            .dispatch(ControlRequest(cmd: .zmxPresent, target: " s1 "))
+
+        #expect(response?.ok == true)
+        #expect(actions.calls == [.zmxPresent(session: "s1")])
+    }
+
+    @Test(arguments: [(nil, "zmx.present requires a session"), ("  ", "zmx.present requires a session"),
+                      ("s1\u{1B}[31m", "invalid session"), ("s 1", "invalid session")])
+    func zmxPresentRefusesBeforeTheHostIsCalled(_ target: String?, _ error: String) async {
+        let actions = MockControlActions()
+
+        let response = await ControlDispatcher(actions: actions)
+            .dispatch(ControlRequest(cmd: .zmxPresent, target: target))
+
+        #expect(response?.error == error)
+        #expect(actions.calls.isEmpty)
+    }
+
     @Test func zmxAttachRefusesWithoutAHostOrASessionBeforeTheHostIsCalled() async {
         let actions = MockControlActions()
         let dispatcher = ControlDispatcher(actions: actions)
@@ -339,6 +390,45 @@ struct ControlDispatcherZmxTests {
         #expect(!response.ok)
         #expect(response.error == "zmx.attach --window is not supported on this platform")
         #expect(actions.calls.isEmpty)
+    }
+
+    @Test func aGroupAttachReachesTheGroupActionWhoseDefaultRefusesByName() async throws {
+        let actions = MockControlActions()
+        let response = try #require(await dispatch(ControlRequest(cmd: .zmxAttachGroup, target: " s1 ",
+            args: ControlArgs(host: "buildbox", window: "other")), actions))
+        #expect(!response.ok)
+        #expect(response.error == "zmx.attach.group is not supported on this platform")
+        #expect(actions.calls.isEmpty, "a host without group attach must not fall back to a one-row attach")
+    }
+
+    @Test(arguments: [
+        (nil as String?, nil as String?, "zmx.attach.group requires a host"),
+        ("s1", nil, "zmx.attach.group requires a host"),
+        (nil, "buildbox", "zmx.attach.group requires a remote session"),
+        ("s1\u{1B}[31m", "buildbox", "invalid remote session"),
+    ])
+    func aGroupAttachIsValidatedLikeAPlainOne(_ target: String?, _ host: String?, _ error: String) async {
+        let actions = MockControlActions()
+
+        let response = await ControlDispatcher(actions: actions).dispatch(
+            ControlRequest(cmd: .zmxAttachGroup, target: target, args: ControlArgs(host: host)))
+
+        #expect(response?.error == error)
+        #expect(actions.calls.isEmpty)
+    }
+
+    @Test func theGroupReceiptSurvivesTheWire() throws {
+        let group = ControlRemoteGroup(membershipKnown: false, companions: [
+            ControlRemoteGroupMember(origin: "c1", id: "L1"),
+            ControlRemoteGroupMember(origin: "c2", error: "unavailable on buildbox"),
+        ])
+        let response = ControlResponse(ok: false, result: ControlResult(id: "P", remoteGroup: group), error: "kept build")
+
+        let decoded = try JSONDecoder().decode(ControlResponse.self, from: JSONEncoder().encode(response))
+
+        #expect(decoded == response)
+        let raw = try #require(String(data: JSONEncoder().encode(ControlRemoteGroupMember(origin: "c1", id: "L1")), encoding: .utf8))
+        #expect(!raw.contains("error"), "an attached member carries no error key")
     }
 
     @Test func theUnsupportedRefusalNamesTheCommand() {

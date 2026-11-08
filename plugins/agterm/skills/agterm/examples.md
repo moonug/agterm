@@ -97,6 +97,13 @@ s=$(agtermctl zmx tree studio.local --json |
 The row is marked remote and carries `remoteHost` in the tree. Closing it ends only this side's connection,
 and it does not come back after a relaunch.
 
+Status, context, `notify` and HUD calls made by a program inside that session show on both Macs. Check the
+mirroring stream, which needs `agtermctl` on the far side's ssh PATH:
+
+```sh
+agtermctl tree --json | jq '.. | objects | select(.remoteHost) | {name, presentation}'
+```
+
 ## Read or change the local restore policy
 
 This is about THIS instance, not a remote one: `zmx attach` requires nothing of the local restore mode.
@@ -297,6 +304,9 @@ agtermctl session move --after "$anchor" --target "$server" --target "$logs"
 
 # close several sessions with one grace-period undo
 agtermctl session close --target "$server" --target "$logs"
+
+# close one session with ⌘W's undo grace: undo inside it brings the running shell back
+agtermctl session close --target "$server" --undoable
 ```
 
 `--after`/`--before` are mutually exclusive with each other, with `--to`, and with a destination
@@ -346,6 +356,8 @@ agtermctl session overlay open "revdiff HEAD~3" --target "$AGTERM_SESSION_ID" --
 agtermctl session overlay open "revdiff HEAD~3" --target "$AGTERM_SESSION_ID" --size-percent 80 --follow
 # resize the open overlay in place (the program keeps running): shrink to a floating panel, then back to full
 agtermctl session overlay resize --size-percent 60 --target "$AGTERM_SESSION_ID"
+# keep the 60% width but make the panel 240pt tall; read the laid-out size back as overlayWidth/overlayHeight
+agtermctl session overlay resize --height 240 --target "$AGTERM_SESSION_ID"
 agtermctl session overlay resize --full --target "$AGTERM_SESSION_ID"
 # ... later
 agtermctl session overlay close
@@ -357,6 +369,30 @@ Manual open + poll for status instead of `--block`:
 agtermctl session overlay open "make test" --target "$AGTERM_SESSION_ID"   # this session
 agtermctl session overlay result --json   # errors "still running" until it exits, then result.exitCode
 ```
+
+## Ask for a choice with an HTML page, and switch sessions from one
+
+A page is a richer `pick`: write the rows, open it with `--block`, and read the answer. The page needs no
+JavaScript; agterm handles the `data-agterm` tags.
+
+```bash
+page=$(mktemp /tmp/branchesXXXXXX)
+{
+  echo '<title>Pick a branch</title>'
+  git for-each-ref --format='%(refname:short)' refs/heads | while read -r b; do
+    esc=$(printf '%s' "$b" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/"/\&quot;/g')
+    printf '<form data-agterm="session.overlay.submit"><input type="hidden" name="value" value="%s"><button>%s</button></form>\n' "$esc" "$esc"
+  done
+} > "$page"
+if out=$(agtermctl session overlay open --html "$page" --block --target "$AGTERM_SESSION_ID" --follow); then
+  branch=$(printf '%s' "$out" | jq -r .value)
+fi
+rm -f "$page"
+```
+
+Exit 2 means the user closed the page without choosing. For a switcher that stays current, open a page with
+`--js` that builds its rows from `agterm.request('tree')` and switches with
+`agterm.request('session.select', {target: id})`; rows written into a no-JS page are a snapshot.
 
 ## Read what the user highlighted inside an overlay
 
@@ -453,7 +489,8 @@ Outside agterm (`AGTERM_ENABLED` unset) there is no overlay — fall back to `op
 
 A persistent backdrop behind the terminal grid (distinct from `show-image.sh`, which is a transient
 overlay). An image or rasterized-text watermark (auto-fitting the window, re-fitting on resize), or a
-solid terminal background color — per session, surviving a relaunch.
+solid terminal background color — per session, or per pane with `--pane`. The session default and left/right
+pane labels survive a relaunch; a scratch label ends with its scratch terminal.
 
 ```bash
 # rasterized text watermark on this session, faint
@@ -467,6 +504,11 @@ agtermctl session background color '#3a0d0d' --target "$AGTERM_SESSION_ID"
 
 # remove it
 agtermctl session background clear --target "$AGTERM_SESSION_ID"
+
+# label each agent of a two-agent split; a pane override wins over the session default
+agtermctl session background text "DRIVER" --opacity 0.12 --pane left --target "$AGTERM_SESSION_ID"
+agtermctl session background text "PEER" --opacity 0.12 --pane right --target "$AGTERM_SESSION_ID"
+agtermctl session background clear --pane right --target "$AGTERM_SESSION_ID"   # back to the default
 ```
 
 `--opacity` is 0.0–1.0; `--fit` is `contain` (default) / `cover` / `stretch` / `none`; `--position` is
@@ -479,7 +521,8 @@ translucency (solid when off, blurred/translucent when on).
 A third per-session full-coverage shell. Hide keeps it alive; `exit` in it recreates on next show.
 
 ```bash
-agtermctl session scratch on        # show (selects the target)
+agtermctl session scratch on        # show; a --target that is not on screen stays unselected
+agtermctl session scratch on --target "$AGTERM_SESSION_ID" --follow   # show and switch to it
 agtermctl session scratch off       # hide, shell stays alive
 agtermctl session scratch toggle
 agtermctl session scratch on --command "zsh -lc 'lazygit'"   # run a program instead of a shell (run-once); login-shell wrap so Homebrew's PATH is found (bare "lazygit" exits 127)
@@ -501,14 +544,19 @@ agtermctl tree --json | jq '.result.tree.quickVisible'  # is it open right now?
 
 ## Flag a working set and view just the flagged sessions
 
-Flag a few sessions across workspaces, then flip the sidebar to the flat flagged list (each row labeled
-`session : workspace`). The flag is durable (persisted per session); `sidebar mode` is per-window.
+Flag a few sessions across workspaces, then flip the sidebar to the flagged view: one flat list with each
+row labeled `session : workspace` (or by session name alone under the `plain` layout), or, under the tree
+layout, the flagged sessions nested under their workspace rows. The flag is durable (persisted per session); `sidebar mode` is per-window; the layout is
+app-wide.
 
 ```bash
 agtermctl session flag on --target "$AGTERM_SESSION_ID"   # flag this session
 agtermctl session flag on --target a1b2                   # flag another (any workspace)
 agtermctl sidebar mode flagged                            # show only the flagged sessions
+agtermctl sidebar flagged-layout tree                     # nest them under workspace rows, in every window
+agtermctl sidebar flagged-layout plain                    # or one flat list of session names, no workspace suffix
 agtermctl session go --to next                            # in flagged mode, nav steps the flagged set only
+agtermctl session flag move --target c3d4 --before a1b2   # flat/plain order: put c3d4 right above a1b2
 agtermctl sidebar mode tree                               # back to the full tree
 agtermctl session flag clear                              # unflag everything in the window
 ```
@@ -567,8 +615,9 @@ member with the whole tree still on screen and applied ONCE with `workspace filt
 filter off` suspends it WITHOUT losing the set, so peeking at everything and coming back costs one call
 each way. Membership reads back per workspace as `focused`, the flag as the tree-level
 `workspaceFilter`, and a workspace row renders iff
-`sidebarVisible && sidebarMode == "tree" && (!workspaceFilter || focused)` — no workspace row renders at
-all with the sidebar hidden or in `flagged` mode (that view is a flat flagged-session list); in `tree`
+`sidebarVisible && ((sidebarMode == "tree" && (!workspaceFilter || focused)) || (sidebarMode == "flagged" &&
+sidebarFlaggedLayout == "tree" && one of its sessions is flagged))` — no workspace row renders at
+all with the sidebar hidden or under the flat flagged list, and the flagged tree ignores the filter; in `tree`
 mode with the filter off the whole tree is on screen regardless of membership, and only with the filter
 on does visibility narrow to the members. `filter on` with nothing marked is refused, so an applied
 filter always has a visible member and the pair can never disagree with what is on screen.
@@ -599,7 +648,8 @@ if [ "$was" = "true" ]; then agtermctl workspace filter on; fi
 
 Open every workspace at once, or collapse all but the current one (the same resolution as
 `--target active`, which stays expanded and scrolled into view) to cut clutter. Defaults to the frontmost window; pass
-`--window` to target any open window. A no-op in flagged mode.
+`--window` to target any open window. A no-op under the flat flagged list. In either tree layout both
+apply to all workspaces, including those the view omits.
 
 ```bash
 agtermctl sidebar expand                                 # expand every workspace (frontmost window)
@@ -672,6 +722,13 @@ agtermctl session text --lines 50              # the last 50 lines of the buffer
 agtermctl session text --pane right            # the split pane (errors if there is no split)
 agtermctl session text --pane-id "$AGTERM_PANE_ID" # this shell's terminal, even after a swap
 agtermctl session text --pane scratch --all    # the scratch terminal's full buffer, even while it's hidden
+# drive the split pane's terminal by its stable id, wherever a swap moves it; an empty id counts as no id
+# and reaches the default pane, so stop when the lookup finds none (no split, or the session is in another window)
+id=$(agtermctl tree --json | jq -er --arg s "$AGTERM_SESSION_ID" \
+  '.result.tree.workspaces[].sessions[] | select(.id == $s) | .surfaces[] | select(.kind == "right") | .paneID | select(. != null and . != "")') &&
+  agtermctl session text --pane-id "$id" --target "$AGTERM_SESSION_ID" --lines 5 &&
+  agtermctl surface cursor --pane-id "$id" --target "$AGTERM_SESSION_ID" &&
+  agtermctl session type $'make test\n' --pane-id "$id" --target "$AGTERM_SESSION_ID"
 # extract every URL from the full scrollback:
 agtermctl session text --all --json | jq -r '.result.text' | grep -oE 'https?://[^ ]+'
 ```
@@ -708,18 +765,23 @@ agtermctl notify "tests failed" --target "$sid"               # a specific sessi
 
 ## Wait for a session status
 
-Subscribe before starting the work, then select the first matching status event. The initial read
-subscribes from now, so an old completed state is not mistaken for a new completion.
+From a project directory the agent already trusts, start a worker there and block until its agent
+finishes or asks for input, giving up after ten minutes:
 
 ```bash
-export target="$AGTERM_SESSION_ID"
-agtermctl events --json --kind status |
-  jq --unbuffered -e 'select(.session == env.target and .payload.status == "completed")' |
-  head -n 1
+id=$(agtermctl session new --cwd "$PWD" --command "zsh -lc 'claude \"fix the failing tests\"'" --no-select --json | jq -r '.result.id')
+status=$(agtermctl session wait --target "$id" --until completed --until blocked --timeout 600)
+case $? in
+  0) echo "worker $status" ;;
+  2) echo "worker session closed" ;;
+  124) echo "worker timed out" ;;
+  *) echo "wait failed" ;;
+esac
 ```
 
-The pipeline ends after the match. A transport or cursor failure makes `agtermctl events` exit
-non-zero; preserve pipeline status in automation that must distinguish a match from a failed stream.
+The wait returns at once when the status already matches, so a worker that finished before the call is
+not missed. That also means a reused session still showing the previous run's `completed` matches
+immediately: wait for `active` first when the session is not fresh.
 
 ## Relay accepted notifications
 
@@ -823,6 +885,10 @@ surface=$(agtermctl tree --json |
     | .id')
 agtermctl surface zoom show --target "$surface"
 agtermctl surface zoom hide --target "$surface"
+
+# Look at the session under a running overlay and come back; the overlay keeps running meanwhile.
+# The explicit id matters: with an overlay open, a bare `surface zoom` zooms the overlay itself.
+agtermctl surface zoom toggle --target "surface:$sid:left"
 
 # Read the current zoom back (the zoomed surface's control id; null when nothing is zoomed).
 agtermctl tree --json | jq -r '.result.tree.zoomedSurface'
@@ -1024,7 +1090,8 @@ agtermctl session hud "gathering options…" --spinner --position bottom-right \
 ```
 
 The stable pane ID wins when it resolves. `--pane` is the fallback for older or unknown IDs. The selected
-pane supplies the size, 80% cap, anchor, and 10% edge margin. A hidden pane keeps its HUD and shows it again
+pane supplies the size, 80% cap, anchor, and 10% edge margin; `--sticky` drops the margin and, off center,
+lifts the WIDTH cap to 100. A hidden pane keeps its HUD and shows it again
 when restored; closing the pane closes its HUD.
 
 `session hud update` repaints in place, no re-spawn and no blink, and it replaces the whole spec: `--detail`,
@@ -1053,11 +1120,38 @@ shared with `session overlay open`, which means a second `session hud` replaces 
 `no overlay result: the slot holds a hud`. A HUD over
 a RUNNING program is refused instead: a message is replaceable, a program is not.
 
+### Keep a status board in a HUD
+
+A controller agent driving worker sessions can keep a short status board in a corner of its own session
+instead of printing it into its chat. Write the board to a file and post it with `--markdown`; `--font-size`
+keeps it small, and a later `update` replaces it in place:
+
+```bash
+cat > /tmp/status.md <<'EOF'
+## Workers
+- **api** refactor: tests green
+- **web** login page: waiting on review
+- **infra** migration: *blocked*, needs a token
+EOF
+
+agtermctl session hud --file /tmp/status.md --markdown --font-size 11 --position top-right \
+  --target "$AGTERM_SESSION_ID"
+
+# after rewriting the file
+agtermctl session hud update --file /tmp/status.md --markdown --position top-right \
+  --target "$AGTERM_SESSION_ID"
+```
+
+An update replaces the whole spec, so repeat `--markdown` and `--position`; the font stays what the panel
+opened with. A single newline inside a paragraph is a space, so keep entries as list items or end a line with
+two spaces. A board taller than the panel is clipped, its excess rows giving way to a dim `… N more`. The
+file is read once per command; nothing watches it, so push each change with an `update`.
+
 ## Navigate and manage windows
 
 ```bash
 agtermctl session go --to next            # step selection to the next session
-agtermctl session go --to next-attention  # jump to the next blocked/completed session
+agtermctl session go --to next-attention  # jump to the next blocked/completed session (plus active when enabled)
 agtermctl workspace go --to next          # step a whole workspace, landing on its first session
 agtermctl workspace go --to prev          # wraps at both ends; no --target, it is relative
 w=$(agtermctl window new "scratch" --json | jq -r '.result.id')
@@ -1069,6 +1163,7 @@ agtermctl window zoom "$w"                 # maximize-to-screen toggle (call aga
 agtermctl window fullscreen "$w"           # native macOS full screen toggle (⌃⌘F / green button)
 agtermctl window minimize "$w" on          # park it in the Dock (off restores, toggle flips)
 agtermctl window select "$w"               # raise it, un-minimizing if it was parked
+agtermctl window go --to next              # raise the next OPEN window, wrapping (next|prev)
 ```
 
 `window new` returns only once the window is really on screen, so the `window resize` above works on the
@@ -1178,7 +1273,7 @@ agtermctl keymap list --json \
 ```
 
 If those disagree, the keymap is fine and the menu is stale or the chord was taken: SwiftUI rebuilds the
-menu only on the next app activation, so switch away and back before concluding anything, and relaunch if
+menu lazily (on activation or a key press), so switch away and back before concluding anything, and relaunch if
 it persists.
 
 A menu entry with `"enabled": false` holds the chord but is inert — AppKit consumes the key and fires

@@ -33,6 +33,19 @@ final class AppActionsPaletteTests: XCTestCase {
         try await super.tearDown()
     }
 
+    func testPaletteContextReportsWorkspaceRowsForTheOrdinaryTreeAndTheFlaggedTreeLayout() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        addTeardownBlock { @MainActor in GhosttyApp.shared.setFlaggedViewLayout(.flat) }
+        XCTAssertTrue(actions.paletteContext.sidebarShowsWorkspaceRows)
+
+        store.setSidebarMode(.flagged)
+        XCTAssertFalse(actions.paletteContext.sidebarShowsWorkspaceRows)
+
+        GhosttyApp.shared.setFlaggedViewLayout(.tree)
+        XCTAssertTrue(actions.paletteContext.sidebarShowsWorkspaceRows)
+        XCTAssertFalse(actions.paletteContext.sidebarShowsWorkspaceTree)
+    }
+
     private func moveDestinationIDs() -> [String] {
         actions.paletteActions().map(\.id).filter { $0.hasPrefix("move-") }
     }
@@ -59,6 +72,90 @@ final class AppActionsPaletteTests: XCTestCase {
         store.selectSession(nil)
 
         XCTAssertTrue(moveDestinationIDs().isEmpty, "there is no session to move")
+    }
+
+    func testMoveRowsMoveTheSessionSelectedWhenTheyRun() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let first = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        let second = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        let target = store.addWorkspace(name: "target")
+        store.selectSession(first.id)
+        let move = try XCTUnwrap(actions.paletteActions().first { $0.id == "move-\(target.id)" })
+
+        store.selectSession(second.id)
+        XCTAssertTrue(move.isEnabled())
+        move.run()
+
+        XCTAssertEqual(store.workspace(forSession: first.id)?.id, owner)
+        XCTAssertEqual(store.workspace(forSession: second.id)?.id, target.id)
+    }
+
+    func testAMoveRowGoesInertWhenTheSessionSelectedUnderItAlreadyLivesInItsTarget() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let first = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        let target = store.addWorkspace(name: "target")
+        let resident = try XCTUnwrap(store.addSession(toWorkspace: target.id, cwd: NSHomeDirectory()))
+        store.selectSession(first.id)
+        let move = try XCTUnwrap(actions.paletteActions().first { $0.id == "move-\(target.id)" })
+
+        store.selectSession(resident.id)
+        XCTAssertFalse(move.isEnabled())
+        store.selectSession(nil)
+        XCTAssertFalse(move.isEnabled())
+        move.run()
+
+        XCTAssertEqual(store.workspace(forSession: first.id)?.id, owner)
+        XCTAssertEqual(store.workspace(forSession: resident.id)?.id, target.id)
+    }
+
+    func testMoveRowsAreListedButInertForACompanion() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let parent = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        let child = try store.addCompanion(to: parent.id, options: CompanionOptions(name: "child")).get()
+        let target = store.addWorkspace(name: "target")
+        store.selectSession(child.id)
+        let move = try XCTUnwrap(actions.paletteActions().first { $0.id == "move-\(target.id)" })
+
+        XCTAssertFalse(move.isEnabled())
+        XCTAssertFalse(move.runIfEnabled())
+        XCTAssertEqual(store.workspace(forSession: child.id)?.id, owner)
+    }
+
+    func testAMoveRowGoesInertWhenItsTargetIsRemovedUnderIt() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let session = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        let target = store.addWorkspace(name: "target")
+        store.selectSession(session.id)
+        let move = try XCTUnwrap(actions.paletteActions().first { $0.id == "move-\(target.id)" })
+
+        store.removeWorkspace(target.id)
+
+        XCTAssertFalse(move.isEnabled())
+        XCTAssertFalse(move.runIfEnabled())
+    }
+
+    // the palette's rows outlive a selection change made while it is open, so the target is read at run.
+    func testTintRowsTintTheSessionSelectedWhenTheyRun() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let first = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        let second = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        store.selectSession(first.id)
+        let red = try XCTUnwrap(actions.paletteActions().first { $0.title == "Tint Session: Red" })
+
+        store.selectSession(second.id)
+        XCTAssertTrue(red.isEnabled())
+        red.run()
+
+        XCTAssertNil(first.tint)
+        XCTAssertEqual(second.tint, SidebarTint(color: .red))
+        let none = try XCTUnwrap(actions.paletteActions().first { $0.title == "Tint Session: None" })
+        none.run()
+        XCTAssertNil(second.tint)
     }
 
     private func actionRow(_ command: PaletteCommand) throws -> PaletteItem {
@@ -136,6 +233,24 @@ final class AppActionsPaletteTests: XCTestCase {
         XCTAssertTrue(actions.renamePending)
     }
 
+    func testASessionRowShowsTheStatusOfTheMomentUnderTheOpenPalette() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let workspace = try XCTUnwrap(store.currentWorkspaceID)
+        let session = try XCTUnwrap(store.addSession(toWorkspace: workspace, cwd: NSHomeDirectory()))
+        let row = try XCTUnwrap(actions.paletteSessions().first { $0.id == session.id.uuidString })
+        XCTAssertEqual(row.indicator(), AgentIndicator())
+
+        store.setAgentIndicator(AgentIndicator(status: .active), forSession: session.id)
+        XCTAssertEqual(row.indicator().status, .active)
+
+        let completed = AgentIndicator(status: .completed, color: "#00aa00", shape: .star)
+        store.setAgentIndicator(completed, forSession: session.id)
+        XCTAssertEqual(row.indicator(), completed)
+
+        store.setAgentIndicator(AgentIndicator(), forSession: session.id)
+        XCTAssertEqual(row.indicator().status, .idle)
+    }
+
     // an action neither a palette row nor `paletteLessHandler(for:)` covers can still be bound in
     // keymap.conf, where it would swallow its key and do nothing.
     func testEveryBuiltinActionReachesADispatchPath() {
@@ -144,5 +259,186 @@ final class AppActionsPaletteTests: XCTestCase {
 
         XCTAssertTrue(viaPalette.isDisjoint(with: paletteLess), "an action must have exactly one dispatch path")
         XCTAssertEqual(viaPalette.union(paletteLess), Set(BuiltinAction.allCases))
+    }
+
+    func testFlaggedEditorListsEverySessionInTreeOrderIncludingFocusHiddenOnes() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let first = try XCTUnwrap(store.currentWorkspaceID)
+        let seeded = store.workspaces[0].sessions
+        let a = try XCTUnwrap(store.addSession(toWorkspace: first, cwd: NSHomeDirectory()))
+        let other = store.addWorkspace(name: "other")
+        let b = try XCTUnwrap(store.addSession(toWorkspace: other.id, cwd: NSHomeDirectory(), select: false))
+        let c = try XCTUnwrap(store.addSession(toWorkspace: other.id, cwd: NSHomeDirectory(), select: false))
+        store.setFocusMembership(first, member: true)
+        store.setFocusEnabled(true)
+        XCTAssertFalse(store.visibleWorkspaces.contains { $0.id == other.id })
+
+        let rows = actions.paletteFlaggedEditor()
+        XCTAssertEqual(rows.map(\.id), (seeded + [a, b, c]).map(\.id.uuidString))
+        let firstName = store.workspaces[0].name
+        XCTAssertEqual(rows.map(\.subtitle), Array(repeating: firstName, count: seeded.count + 1) + ["other", "other"])
+        XCTAssertTrue(rows.allSatisfy { $0.mark?() == .flag(false) })
+    }
+
+    func testFlaggedEditorRowTogglesTheFlagAndItsMarkFollows() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let workspace = try XCTUnwrap(store.currentWorkspaceID)
+        let session = try XCTUnwrap(store.addSession(toWorkspace: workspace, cwd: NSHomeDirectory()))
+        let row = try XCTUnwrap(actions.paletteFlaggedEditor().first { $0.id == session.id.uuidString })
+
+        XCTAssertTrue(row.runIfEnabled())
+        XCTAssertTrue(session.flagged)
+        XCTAssertEqual(row.mark?(), .flag(true))
+
+        XCTAssertTrue(row.runIfEnabled())
+        XCTAssertFalse(session.flagged)
+        XCTAssertEqual(row.mark?(), .flag(false))
+    }
+
+    func testFlaggedEditorRowGoesInertWhenItsSessionCloses() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let workspace = try XCTUnwrap(store.currentWorkspaceID)
+        let session = try XCTUnwrap(store.addSession(toWorkspace: workspace, cwd: NSHomeDirectory()))
+        let row = try XCTUnwrap(actions.paletteFlaggedEditor().first { $0.id == session.id.uuidString })
+
+        store.closeSession(session.id)
+
+        XCTAssertFalse(row.isEnabled())
+        XCTAssertFalse(row.runIfEnabled())
+    }
+
+    func testFocusEditorTogglesMembershipWithoutEverEnablingTheFilter() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let first = try XCTUnwrap(store.currentWorkspaceID)
+        let other = store.addWorkspace(name: "other")
+        let rows = actions.paletteFocusEditor()
+        XCTAssertEqual(rows.map(\.id), store.workspaces.map(\.id.uuidString))
+        let firstRow = try XCTUnwrap(rows.first { $0.id == first.uuidString })
+        let otherRow = try XCTUnwrap(rows.first { $0.id == other.id.uuidString })
+
+        XCTAssertTrue(firstRow.runIfEnabled())
+        XCTAssertEqual(store.focusedWorkspaceIDs, [first])
+        XCTAssertEqual(firstRow.mark?(), .focus(true))
+        XCTAssertFalse(store.focusEnabled, "marking never turns the filter on")
+
+        XCTAssertTrue(firstRow.runIfEnabled())
+        XCTAssertTrue(firstRow.runIfEnabled())
+        XCTAssertEqual(store.focusedWorkspaceIDs, [first])
+        XCTAssertFalse(store.focusEnabled, "re-adding the last member leaves it off too")
+
+        store.setFocusEnabled(true)
+        XCTAssertTrue(otherRow.runIfEnabled())
+        XCTAssertTrue(firstRow.runIfEnabled())
+        XCTAssertEqual(store.focusedWorkspaceIDs, [other.id])
+        XCTAssertTrue(store.focusEnabled, "an applied filter stays on while members remain")
+        XCTAssertEqual(firstRow.mark?(), .focus(false))
+    }
+
+    func testEditorBuiltinsOpenTheirModeOnTheNextRunloopTick() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let workspace = try XCTUnwrap(store.currentWorkspaceID)
+        _ = try XCTUnwrap(store.addSession(toWorkspace: workspace, cwd: NSHomeDirectory(), select: false))
+        let palette = PaletteController()
+        actions.palette = palette
+
+        for (action, mode) in [(BuiltinAction.editFlaggedSessions, PaletteMode.flaggedEditor),
+                               (.editFocusedWorkspaces, .focusEditor)] {
+            palette.close()
+            actions.perform(action, in: nil)
+            XCTAssertNil(palette.mode, "\(action.rawValue) defers past the action palette's own close")
+            let opened = expectation(description: action.rawValue)
+            DispatchQueue.main.async { opened.fulfill() }
+            wait(for: [opened], timeout: 1)
+            XCTAssertEqual(palette.mode, mode)
+        }
+    }
+
+    func testSessionRowsGroupCompanionsUnderIdenticallyNamedParents() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let workspace = try XCTUnwrap(store.workspaces.first)
+        for session in workspace.sessions { store.renameSession(session.id, to: "zeta") }
+        let first = try XCTUnwrap(store.addSession(toWorkspace: workspace.id, cwd: "/tmp", name: "api"))
+        let second = try XCTUnwrap(store.addSession(toWorkspace: workspace.id, cwd: "/tmp", name: "api"))
+        _ = try store.addCompanion(to: first.id, options: CompanionOptions(name: "zz")).get()
+        _ = try store.addCompanion(to: second.id, options: CompanionOptions(name: "aa")).get()
+
+        let titles = actions.paletteSessions().map(\.title)
+
+        XCTAssertEqual(titles.prefix(4), ["api", "api › zz", "api", "api › aa"])
+        XCTAssertEqual(actions.paletteFlaggedEditor().map(\.title).suffix(4), ["api", "api › zz", "api", "api › aa"])
+    }
+
+    // a flagged child dragged ahead of its parent split the group in the empty session palette
+    func testAFlaggedChildAheadOfItsParentStillListsUnderItInTheSessionPalette() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let workspace = try XCTUnwrap(store.workspaces.first)
+        for session in workspace.sessions { store.renameSession(session.id, to: "zeta") }
+        let first = try XCTUnwrap(store.addSession(toWorkspace: workspace.id, cwd: "/tmp", name: "api"))
+        let second = try XCTUnwrap(store.addSession(toWorkspace: workspace.id, cwd: "/tmp", name: "api"))
+        let firstChild = try store.addCompanion(to: first.id, options: CompanionOptions(name: "a")).get()
+        let secondChild = try store.addCompanion(to: second.id, options: CompanionOptions(name: "b")).get()
+        store.setFlag(true, forSessions: [first.id, firstChild.id, second.id, secondChild.id])
+        XCTAssertTrue(store.moveFlagged([firstChild.id], to: .before, of: first.id))
+        store.setSidebarMode(.flagged)
+
+        let rows = CommandPalette.ranked(actions.paletteSessions(), query: "",
+                                         keepsSourceOrder: PaletteMode.sessions.keepsSourceOrder, callerSupplied: false)
+
+        XCTAssertEqual(rows.map(\.id), [first, firstChild, second, secondChild].map(\.id.uuidString))
+        XCTAssertEqual(CommandPalette.ranked(rows.reversed(), query: "", keepsSourceOrder: false, callerSupplied: false).map(\.title),
+                       ["api", "api", "api › a", "api › b"])
+    }
+
+    func testAnAttentionCompanionRowNamesItsParent() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let parent = try XCTUnwrap(store.addSession(toWorkspace: store.workspaces[0].id, cwd: "/tmp", name: "api"))
+        let companion = try store.addCompanion(to: parent.id, options: CompanionOptions(name: "logs")).get()
+        store.setAgentIndicator(AgentIndicator(status: .blocked), forSession: companion.id)
+
+        XCTAssertEqual(actions.paletteAttention().first { $0.id == companion.id.uuidString }?.title, "api › logs")
+    }
+
+    func testAttentionRowsNameTheirWindowAndFollowItsCover() throws {
+        let front = try XCTUnwrap(library.activeWindowID)
+        let back = library.newWindow(name: "back")
+        library.frontmostWindowID = front
+        let backStore = try XCTUnwrap(library.store(for: back.id))
+        let session = try XCTUnwrap(backStore.addSession(toWorkspace: backStore.workspaces[0].id, cwd: NSHomeDirectory(),
+                                                         select: false))
+        backStore.setAgentIndicator(AgentIndicator(status: .blocked), forSession: session.id)
+
+        let row = try XCTUnwrap(actions.paletteAttention().first { $0.id == session.id.uuidString })
+        XCTAssertEqual(row.subtitle?.hasPrefix("back · "), true)
+        XCTAssertEqual(row.indicator().status, .blocked)
+        XCTAssertTrue(row.isEnabled())
+
+        let zoom = TerminalZoomController()
+        TerminalZoomRegistry.shared.register(back.id, controller: zoom)
+        defer { TerminalZoomRegistry.shared.unregister(back.id) }
+        zoom.set(.on, target: .session(session.id, .primary))
+        XCTAssertFalse(row.isEnabled(), "the row asks the owning window's cover, not the frontmost one's")
+    }
+
+    func testAnAttentionRowGoesInertWhenItsWindowClosesUnderThePalette() throws {
+        let front = try XCTUnwrap(library.activeWindowID)
+        let back = library.newWindow(name: "back")
+        library.frontmostWindowID = front
+        let backStore = try XCTUnwrap(library.store(for: back.id))
+        let session = try XCTUnwrap(backStore.addSession(toWorkspace: backStore.workspaces[0].id, cwd: NSHomeDirectory(),
+                                                         select: false))
+        backStore.setAgentIndicator(AgentIndicator(status: .blocked), forSession: session.id)
+        let row = try XCTUnwrap(actions.paletteAttention().first { $0.id == session.id.uuidString })
+        let invalidated = expectation(description: "the row's enablement is invalidated by the close")
+        withObservationTracking {
+            XCTAssertTrue(row.isEnabled())
+        } onChange: {
+            invalidated.fulfill()
+        }
+
+        library.closeWindow(back.id)
+
+        wait(for: [invalidated], timeout: 1)
+        XCTAssertFalse(row.isEnabled())
+        XCTAssertFalse(row.runIfEnabled())
     }
 }

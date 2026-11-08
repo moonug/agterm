@@ -656,6 +656,11 @@ struct ControlDispatcherTests {
             target: "session",
             args: ControlArgs(mode: "on", command: "htop")
         ))
+        let followed = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionScratch,
+            target: "session",
+            args: ControlArgs(mode: "on", follow: true)
+        ))
         let focus = await dispatcher.dispatch(ControlRequest(
             cmd: .sessionFocus,
             target: "session",
@@ -670,12 +675,14 @@ struct ControlDispatcherTests {
         #expect(split == ControlResponse(ok: true))
         #expect(splitClose == ControlResponse(ok: true))
         #expect(scratch == ControlResponse(ok: true))
+        #expect(followed == ControlResponse(ok: true))
         #expect(focus == ControlResponse(ok: true))
         #expect(resize == ControlResponse(ok: true))
         #expect(actions.calls == [
             .sessionSplit(target: "session", window: "win", "off", .topBottom),
             .sessionSplitClose(target: "session", window: "win"),
-            .sessionScratch(target: "session", window: nil, "on", command: "htop"),
+            .sessionScratch(target: "session", window: nil, "on", command: "htop", follow: false),
+            .sessionScratch(target: "session", window: nil, "on", command: nil, follow: true),
             .sessionFocus(target: "session", window: nil, "right"),
             .sessionResize(target: "session", window: "win", .delta(-0.1))
         ])
@@ -693,6 +700,29 @@ struct ControlDispatcherTests {
 
         #expect(response == ControlResponse(ok: true, result: ControlResult(id: "session-id")))
         #expect(actions.calls == [.sessionSwap(target: "session", window: "win")])
+    }
+
+    @Test func sessionLeadParsesThePaneOnceAndRoutesIt() async {
+        let actions = MockControlActions()
+
+        let response = await ControlDispatcher(actions: actions).dispatch(ControlRequest(
+            cmd: .sessionLead, target: "session", args: ControlArgs(window: "win", pane: "split")))
+        let bare = await ControlDispatcher(actions: actions).dispatch(ControlRequest(cmd: .sessionLead, target: "active"))
+
+        #expect(response?.ok == true)
+        #expect(bare?.ok == true)
+        #expect(actions.calls == [.sessionLead(target: "session", window: "win", pane: .right),
+                                  .sessionLead(target: "active", window: nil, pane: nil)])
+    }
+
+    @Test func sessionLeadRejectsAnUnknownPaneBeforeDispatch() async {
+        let actions = MockControlActions()
+
+        let response = await ControlDispatcher(actions: actions).dispatch(ControlRequest(
+            cmd: .sessionLead, target: "session", args: ControlArgs(pane: "middle")))
+
+        #expect(response == ControlResponse(ok: false, error: "invalid pane: middle"))
+        #expect(actions.calls.isEmpty)
     }
 
     @Test func splitRejectsAnUnknownAxisBeforeDispatch() async {
@@ -845,6 +875,28 @@ struct ControlDispatcherTests {
         #expect(actions.calls == [.keymapReload, .configReload])
     }
 
+    @Test func keymapRunPassesTheNameUntrimmedWithItsTarget() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(
+            cmd: .keymapRun, target: "abc", args: ControlArgs(name: " lazy git ", window: "w1")))
+
+        #expect(response == ControlResponse(ok: true, result: ControlResult(id: "sess")))
+        #expect(actions.calls == [.keymapRun(name: " lazy git ", target: "abc", window: "w1")])
+    }
+
+    @Test(arguments: [nil, ControlArgs(), ControlArgs(name: "")] as [ControlArgs?])
+    func keymapRunRefusesAMissingName(args: ControlArgs?) async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(cmd: .keymapRun, args: args))
+
+        #expect(response == ControlResponse(ok: false, error: "keymap.run requires a command name"))
+        #expect(actions.calls.isEmpty)
+    }
+
     @Test func keymapListRoutesToActionsAndKeepsThePayload() async {
         let actions = MockControlActions()
         let dispatcher = ControlDispatcher(actions: actions)
@@ -870,6 +922,39 @@ struct ControlDispatcherTests {
 
         #expect(response?.ok == true)
         #expect(actions.calls == [.keymapList])
+    }
+
+    @Test func hooksReloadAndListRouteToActionsAndKeepPayloads() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        let payload = ControlHooks(path: "/tmp/hooks.conf", diagnostics: [],
+                                   hooks: [ControlHookEntry(kind: "status", command: "~/s.sh", line: 1)])
+        actions.nextHooksReloadResponse = ControlResponse(ok: true, result: ControlResult(count: 1))
+        actions.nextHooksListResponse = ControlResponse(ok: true, result: ControlResult(hooks: payload))
+
+        let reload = await dispatcher.dispatch(ControlRequest(cmd: .hooksReload))
+        let list = await dispatcher.dispatch(ControlRequest(cmd: .hooksList))
+
+        #expect(reload == ControlResponse(ok: true, result: ControlResult(count: 1)))
+        #expect(list == ControlResponse(ok: true, result: ControlResult(hooks: payload)))
+        #expect(actions.calls == [.hooksReload, .hooksList])
+    }
+
+    @Test func hooksCommandsRefuseATargetOrWindowBeforeAnyAction() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let targeted = await dispatcher.dispatch(ControlRequest(cmd: .hooksReload, target: "active"))
+        let windowed = await dispatcher.dispatch(ControlRequest(cmd: .hooksList, args: ControlArgs(window: "w1")))
+
+        #expect(targeted == ControlResponse(ok: false, error: "hooks.reload takes no target or --window"))
+        #expect(windowed == ControlResponse(ok: false, error: "hooks.list takes no target or --window"))
+        #expect(actions.calls.isEmpty)
+    }
+
+    @Test func unsupportedMessageNamesTheHooksCommand() {
+        #expect(ControlActionsUnsupported.message("hooks.reload") == "hooks.reload is not supported on this platform")
+        #expect(ControlActionsUnsupported.message("hooks.list") == "hooks.list is not supported on this platform")
     }
 
     @Test func versionRoutesToActionsAndKeepsTheIdentity() async {
@@ -1167,6 +1252,30 @@ struct ControlDispatcherTests {
         ])
     }
 
+    @Test(arguments: [("left", StatusPane.left), ("split", .right), ("bottom", .right), ("scratch", .scratch)])
+    func sessionBackgroundPassesTheParsedPane(raw: String, pane: StatusPane) async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        actions.nextSessionBackgroundResponse = ControlResponse(ok: true, result: ControlResult(id: "session"))
+
+        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionBackground, target: "session",
+                                                     args: ControlArgs(mode: "clear", pane: raw)))
+
+        #expect(actions.calls == [.sessionBackground(target: "session", window: nil,
+                                                     ControlSessionBackgroundOptions(watermark: nil, pane: pane))])
+    }
+
+    @Test func sessionBackgroundRejectsAnUnknownPaneBeforeCallingActions() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionBackground, args: ControlArgs(mode: "color", pane: "middle", color: "#102030")))
+
+        #expect(response == ControlResponse(ok: false, error: "--pane must be left, right, or scratch"))
+        #expect(actions.calls.isEmpty)
+    }
+
     @Test func sessionBackgroundRejectsInvalidInputsBeforeCallingActions() async {
         let actions = MockControlActions()
         let dispatcher = ControlDispatcher(actions: actions)
@@ -1454,6 +1563,21 @@ struct ControlDispatcherTests {
         #expect(actions.calls == [.surfaceCursor(target: nil, window: nil)])
     }
 
+    @Test func surfaceCursorAndSessionTypeForwardThePaneID() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        _ = await dispatcher.dispatch(ControlRequest(cmd: .surfaceCursor, target: "s1", args: ControlArgs(paneID: "tok")))
+        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionType, target: "s1",
+                                                     args: ControlArgs(text: "x", pane: "right", paneID: "tok")))
+
+        #expect(actions.calls == [
+            .surfaceCursor(target: "s1", window: nil, paneID: "tok"),
+            .sessionType(target: "s1", window: nil,
+                         ControlSessionTypeOptions(text: "x", select: false, pane: .right, paneID: "tok")),
+        ])
+    }
+
     @Test func dashboardOpenRoutesTargetsWindowAndFixedFontMode() async {
         let actions = MockControlActions()
         let dispatcher = ControlDispatcher(actions: actions)
@@ -1612,6 +1736,40 @@ struct ControlDispatcherTests {
             .windowClose(target: "win-b"),
             .windowDelete(target: "win-b")
         ])
+    }
+
+    @Test func windowGoRoutesBothDirectionsThroughActions() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        actions.nextWindowGoResponse = ControlResponse(ok: true, result: ControlResult(id: "win-b"))
+
+        let next = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(to: "next")))
+        let prev = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(to: "prev")))
+        let spelled = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(to: "previous")))
+
+        #expect(next == ControlResponse(ok: true, result: ControlResult(id: "win-b")))
+        #expect(prev == next)
+        #expect(spelled == next)
+        #expect(actions.calls == [.windowGo(.next), .windowGo(.previous), .windowGo(.previous)])
+    }
+
+    @Test func windowGoIgnoresAWindowArgumentAndRejectsABadDirection() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        // app-global: there is no per-window scope to carry, so `--window` cannot narrow the step
+        let scoped = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(window: "win", to: "next")))
+        #expect(actions.calls == [.windowGo(.next)])
+
+        let missing = await dispatcher.dispatch(ControlRequest(cmd: .windowGo))
+        let unknown = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(to: "sideways")))
+        let sessionOnly = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(to: "first")))
+
+        #expect(scoped == ControlResponse(ok: true))
+        #expect(missing == ControlResponse(ok: false, error: "window.go requires --to next|prev"))
+        #expect(unknown == missing)
+        #expect(sessionOnly == missing)
+        #expect(actions.calls == [.windowGo(.next)])
     }
 
     @Test func windowCommandsRouteParsedInputsAndKeepActionResponses() async {

@@ -2,6 +2,8 @@
 
 Let any two configured coding agents hold a conversation with each other in one agterm split. A generalization of [two-agent-chat](../two-agent-chat): instead of two hardcoded profiles (Claude Code left, Codex right), agents come from a JSON config — `claude`, `claude-zai`, `claude-minimax`, `codex`, `opencode`, or anything you add — each with a composer kind that tells the transport how to read its UI.
 
+Author: [@moonug](https://github.com/moonug)
+
 ## What it does
 
 Two agents run side by side in a split, one per pane, and talk to each other. Each side sends messages through `peer-chat.py`, which verifies the target pane's composer before typing, sends the body as bounded observed chunks, and confirms submission. You watch both halves; your part is naming the peer ("work with codex") and stepping in when a decision is yours.

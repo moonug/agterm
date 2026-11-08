@@ -13,8 +13,9 @@ import sys
 import tempfile
 import time
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -33,20 +34,39 @@ RETRY_DELAY = 10.0
 BOX_LINES = 80
 EMPTY_CURSOR_COLUMN = 2
 MAX_MESSAGE_BYTES = 64 * 1024
+# Claude Code rewrites a draft over this many UTF-16 units into its first and last 500
+# characters around a "[...Truncated text...]" marker, which no read-back can verify.
+CLAUDE_DRAFT_LIMIT = 10_000
 # Claude can put a short context label inside the top composer rule, for example `e2e`.
 RULE_RE = re.compile(r"^\s*[─\u2014-]{10,}(?:\s+[^─\u2014-].*?\s+[─\u2014-]+)?\s*$")
 # Codex draws the composer prompt as `›`; with reasoning effort set to ultra it upgrades
 # the glyph to `»` (codex-rs/tui/src/bottom_pane/effort_ignition.rs). Both prompt patterns
 # are anchored at column zero so prompt-shaped output cannot be mistaken for live input.
 # Shell mode shows `!` and is deliberately not matched, so nothing is ever typed there.
-CODEX_PROMPT_RE = re.compile(r"^[›»][\s ]*(.*?)\s*$")
+CODEX_PROMPT_RE = re.compile(r"^[›»][\s \u2800-\u28FF]?[\s ]*(.*?)\s*$")
 CODEX_SHELL_PROMPT_RE = re.compile(r"^![\s ]*(.*?)\s*$")
 CODEX_CHOICE_RE = re.compile(r"^\d+\.\s")
+# Codex sprays an idle animation of braille particles (U+2800-U+28FF) across the composer
+# box, prompt row included, and a single particle can sit in one cell for seconds, so no
+# burst of reads sees the text underneath. For the Codex pane only: rows that hold nothing
+# but particles count as blank, so they neither hide the prompt row nor glue a notice to
+# it; the cell after the prompt marker and the two-cell indent of wrapped rows are
+# decoration; everywhere else a particle stands for the one cell it covers, or for an
+# empty cell when it trails the text (row_matches, trailing_particle_variants), and the
+# empty placeholder is read the same way. A particle can hide a wrong character until it
+# moves, which is why send() verifies the whole body again just before Return. Claude's
+# composer shows no animation and is compared verbatim.
+CODEX_PARTICLE_RE = re.compile(r"[\u2800-\u28FF]")
+CODEX_INDENT_RE = re.compile(r"^[\s\u2800-\u28FF]{0,2}")
 CODEX_EMPTY_PROMPT = "Ask Codex to do anything"
-# Codex prefixes footer rows with two spaces. Only the final row is stripped: a
-# multi-row shortcut overlay is indistinguishable from indented modal choices and
-# therefore fails closed instead of weakening the live-prompt guard.
+# Codex prefixes footer rows with two spaces. The final row is stripped, and the one
+# above it too when a blank row sets the pair apart: without that blank it may be a
+# wrapped draft's continuation. In that pair the final row may also be indented
+# further, as when a draft hides the shortcut hint and leaves only its right-aligned
+# notice. A longer indented region is never stripped, because shortcut rows and modal
+# choices share its shape, so it fails closed instead of weakening the live-prompt guard.
 CODEX_FOOTER_RE = re.compile(r"^ {2}\S.*$")
+CODEX_NOTICE_RE = re.compile(r"^ {3,}\S.*$")
 CLAUDE_PROMPT_RE = re.compile(r"^\s*❯[\s ]*(.*?)\s*$")
 # status-line commands can add padding beyond Claude Code's two-space indent.
 CLAUDE_FOOTER_RE = re.compile(r"^ {2,}\S.*$")
@@ -91,6 +111,9 @@ PROFILES = {
     "claude": Profile("left", "claude", "claude", "Chat from Codex: ", "\n"),
     "codex": Profile("right", "codex", "codex", "Chat from Claude: ", "\n"),
 }
+PANE_FIELDS = {"left": "foreground", "right": "splitForeground"}
+# a pane whose first word is one of these runs a script, and the script names the agent.
+INTERPRETER_RE = re.compile(r"node|bun|deno|python[0-9.]*|ruby|perl|sh|bash|zsh")
 
 
 class PromptBlocked(RuntimeError):
@@ -227,14 +250,23 @@ def command_name(value: str) -> str:
     return name
 
 
+def configured_command(agent: str, explicit: str | None = None) -> str:
+    env_name = f"PEER_CHAT_{agent.upper()}_COMMAND"
+    return command_name(
+        explicit or os.environ.get(env_name) or PROFILES[agent].command
+    )
+
+
 def target_profile(
     target: str, explicit_command: str | None, queue: bool = False
 ) -> Profile:
     profile = PROFILES[target]
-    env_name = f"PEER_CHAT_{profile.agent.upper()}_COMMAND"
-    configured = explicit_command or os.environ.get(env_name) or profile.command
     submit = "\t" if queue else profile.submit
-    return replace(profile, command=command_name(configured), submit=submit)
+    return replace(
+        profile,
+        command=configured_command(target, explicit_command),
+        submit=submit,
+    )
 
 
 def runs(foreground: Any, command: str) -> bool:
@@ -244,11 +276,88 @@ def runs(foreground: Any, command: str) -> bool:
     return any(pattern.search(str(part)) for part in foreground)
 
 
+def pane_runs(info: dict[str, Any], pane: str, command: str) -> bool:
+    return bool(info.get("hasSplit")) and runs(info.get(PANE_FIELDS[pane]), command)
+
+
+def peer_agent(profile: Profile) -> str:
+    return next(agent for agent in PROFILES if agent != profile.agent)
+
+
+def peer_command(profile: Profile) -> str | None:
+    try:
+        return configured_command(peer_agent(profile))
+    except ValueError:
+        return None
+
+
+def peer_runs(info: dict[str, Any], pane: str, profile: Profile) -> bool:
+    """Whether the pane runs the other agent of the pair, by that agent's own command."""
+    command = peer_command(profile)
+    return command is not None and pane_runs(info, pane, command)
+
+
+def leading_command(foreground: Any) -> str | None:
+    """Name the program a pane runs, only when its command line leaves no doubt."""
+    if not isinstance(foreground, list) or not foreground:
+        return None
+    parts = [str(part) for part in foreground]
+    name = os.path.basename(parts[0])
+    if not INTERPRETER_RE.fullmatch(name):
+        return name
+    # an interpreter option can take a value, so only a script given straight after it counts.
+    if len(parts) > 1 and not parts[1].startswith("-"):
+        return os.path.basename(parts[1])
+    return None
+
+
+def target_pane(info: dict[str, Any], profile: Profile) -> str | None:
+    home = profile.pane
+    away = "right" if home == "left" else "left"
+    home_runs = pane_runs(info, home, profile.command)
+    away_runs = pane_runs(info, away, profile.command)
+    peer_home = peer_runs(info, home, profile)
+    peer = peer_command(profile)
+    if home_runs and away_runs and peer_home and peer != profile.command:
+        # the usual pane names both agents, as a prompt or a path among its arguments can. It yields
+        # only when the program it runs is plainly the other agent; any doubt keeps it, as before.
+        home_runs = leading_command(info.get(PANE_FIELDS[home])) != peer
+    if home_runs:
+        return home
+    # agterm addresses panes by position, so the far pane is taken only when the profile's own pane
+    # demonstrably holds the other agent; anything else there could be the caller itself.
+    if away_runs and peer_home:
+        return away
+    return None
+
+
 def has_target(info: dict[str, Any], profile: Profile) -> bool:
+    return target_pane(info, profile) is not None
+
+
+def missing_target(sid: str, info: dict[str, Any], profile: Profile) -> RuntimeError:
     if not info.get("hasSplit"):
-        return False
-    field = "foreground" if profile.pane == "left" else "splitForeground"
-    return runs(info.get(field), profile.command)
+        return RuntimeError(f"session {sid} has no split")
+    away = "right" if profile.pane == "left" else "left"
+    if pane_runs(info, away, profile.command):
+        peer = peer_agent(profile)
+        return RuntimeError(
+            f"{profile.agent} runs only in the {away} pane and the {profile.pane} pane "
+            f"is not running {peer}, so it could be the sender; if {peer} runs there "
+            f"through a wrapper, set PEER_CHAT_{peer.upper()}_COMMAND to its name"
+        )
+    return RuntimeError(
+        f"{profile.agent} target pane is not running {profile.command!r}; "
+        "for a wrapper, pass --target-command NAME"
+    )
+
+
+def bind_pane(info: dict[str, Any], profile: Profile) -> Profile:
+    """Fix the pane the target runs in before any pane is read or typed into."""
+    pane = target_pane(info, profile)
+    if pane is None:
+        raise missing_target(str(info.get("id", "")), info, profile)
+    return replace(profile, pane=pane)
 
 
 def find_node(sid: str, window: str | None = None) -> dict[str, Any]:
@@ -268,14 +377,24 @@ def find_node(sid: str, window: str | None = None) -> dict[str, Any]:
 def require_target(
     sid: str, profile: Profile, window: str | None = None
 ) -> str:
+    """Check the exact pane about to be read or typed into still runs the target."""
     info = find_node(sid, window)
     if not info.get("hasSplit"):
         raise RuntimeError(f"session {sid} has no split")
-    if not has_target(info, profile):
+    if not pane_runs(info, profile.pane, profile.command):
         raise RuntimeError(
             f"{profile.agent} target pane is not running {profile.command!r}; "
             "for a wrapper, pass --target-command NAME"
         )
+    return str(info["id"])
+
+
+def require_session(
+    sid: str, profile: Profile, window: str | None = None
+) -> str:
+    info = find_node(sid, window)
+    if not has_target(info, profile):
+        raise missing_target(sid, info, profile)
     return str(info["id"])
 
 
@@ -284,7 +403,7 @@ def resolve_session(
 ) -> str:
     sid = configured_selector(explicit, "AGTERM_SESSION_ID", "session")
     if sid:
-        return require_target(sid, profile, window)
+        return require_session(sid, profile, window)
     wanted = checkout_key(os.getcwd())
     matches = [
         str(info["id"])
@@ -297,9 +416,10 @@ def resolve_session(
         return matches[0]
     if not matches:
         raise RuntimeError(
-            "this checkout maps to no session running the expected "
-            f"{profile.agent}-{profile.pane} layout; "
-            "for a wrapper, pass --target-command NAME"
+            "this checkout maps to no session running "
+            f"{profile.agent} beside the other agent; "
+            "for a wrapped target, pass --target-command NAME, and for a wrapped sender "
+            f"in a reversed split, set PEER_CHAT_{peer_agent(profile).upper()}_COMMAND"
         )
     raise RuntimeError(
         "more than one session shares this checkout; pass --session ID or launch "
@@ -342,13 +462,8 @@ def resolve_target(
         raise RuntimeError(f"no such session: {session}")
     window, info = matches[0]
     sid = str(info["id"])
-    if not info.get("hasSplit"):
-        raise RuntimeError(f"session {sid} has no split")
     if not has_target(info, profile):
-        raise RuntimeError(
-            f"{profile.agent} target pane is not running {profile.command!r}; "
-            "for a wrapper, pass --target-command NAME"
-        )
+        raise missing_target(sid, info, profile)
     return window, sid
 
 
@@ -373,6 +488,8 @@ def _pane_text_unchecked(
         str(BOX_LINES),
         *window_option(window),
     )
+
+
 
 
 def cursor_column(
@@ -459,16 +576,29 @@ def composer_probe_marker(text: str) -> str:
         index += 1
 
 
+def codex_row_is_blank(line: str) -> bool:
+    """A row holding nothing but whitespace and idle-animation particles."""
+    return not CODEX_PARTICLE_RE.sub(" ", line).strip()
+
+
 def trailing_input_block(text: str) -> list[str]:
     lines = text.splitlines()[-BOX_LINES:]
-    while lines and not lines[-1].strip():
+    while lines and codex_row_is_blank(lines[-1]):
         lines.pop()
-    if lines and CODEX_FOOTER_RE.match(lines[-1]):
-        lines.pop()
-        while lines and not lines[-1].strip():
+    footer_rows = 1 if lines and CODEX_FOOTER_RE.match(lines[-1]) else 0
+    if (
+        len(lines) > 2
+        and codex_row_is_blank(lines[-3])
+        and CODEX_FOOTER_RE.match(lines[-2])
+        and (CODEX_FOOTER_RE.match(lines[-1]) or CODEX_NOTICE_RE.match(lines[-1]))
+    ):
+        footer_rows = 2
+    if footer_rows:
+        del lines[-footer_rows:]
+        while lines and codex_row_is_blank(lines[-1]):
             lines.pop()
     start = len(lines)
-    while start and lines[start - 1].strip():
+    while start and not codex_row_is_blank(lines[start - 1]):
         start -= 1
     return lines[start:]
 
@@ -477,14 +607,28 @@ def codex_live_prompt_text(text: str) -> str | None:
     block = trailing_input_block(text)
     if not block or any(CODEX_SHELL_PROMPT_RE.match(line) for line in block):
         return None
+    block = [line for line in block if not codex_row_is_blank(line)]
+    if not block:
+        return None
     match = CODEX_PROMPT_RE.match(block[0])
     if (
         not match
         or CODEX_CHOICE_RE.match(match.group(1))
-        or any(not line[:1].isspace() for line in block[1:])
+        or any(
+            not (line[:1].isspace() or CODEX_PARTICLE_RE.match(line[:1]))
+            for line in block[1:]
+        )
     ):
         return None
-    content = [match.group(1), *(line.strip() for line in block[1:])]
+    # Wrapped rows carry a two-cell indent, and whatever the animation drew there is
+    # decoration. A particle on the first text cell may cover a character, so it stays
+    # for row_matches to judge, and trailing particles stay for the same reason. A row
+    # whose only character is covered looks like an animation row and is dropped, so
+    # such a send fails closed until the particle moves; nothing tells the two apart.
+    content = [
+        match.group(1),
+        *(CODEX_INDENT_RE.sub("", line).strip() for line in block[1:]),
+    ]
     return "\n".join(part for part in content if part)
 
 
@@ -518,11 +662,39 @@ def live_prompt_text(profile: Profile, text: str) -> str | None:
     return claude_live_prompt_text(text)
 
 
+def codex_placeholder_shown(content: str) -> bool:
+    """The empty-composer placeholder, read through the idle animation.
+
+    Rows are joined with the space that wrapping consumed. A particle may stand for
+    the placeholder character under it or for an empty cell beside the text, so the
+    walk lets every particle take either role and every other cell must match.
+    """
+    shown = " ".join(row.strip() for row in content.splitlines())
+    expected = CODEX_EMPTY_PROMPT
+    reached = {0}
+    for char in shown:
+        advanced = set()
+        for index in reached:
+            if CODEX_PARTICLE_RE.match(char):
+                advanced.add(index)
+                if index < len(expected):
+                    advanced.add(index + 1)
+            elif index < len(expected) and expected[index] == char:
+                advanced.add(index + 1)
+            elif index == len(expected) and char == " ":
+                # Spaces between the particles that trail the placeholder.
+                advanced.add(index)
+        reached = advanced
+        if not reached:
+            return False
+    return len(expected) in reached
+
+
 def composer_is_empty(profile: Profile, content: str) -> bool:
     """Recognise known empty-input content for cleanup, acceptance and Codex preflight."""
-    joined = " ".join(content.splitlines())
     if profile.agent == "codex":
-        return joined == CODEX_EMPTY_PROMPT
+        return codex_placeholder_shown(content)
+    joined = " ".join(content.splitlines())
     return joined in CLAUDE_EMPTY_PROMPTS or bool(
         CLAUDE_STARTUP_HINT_RE.fullmatch(joined)
     )
@@ -546,19 +718,36 @@ def wait_for_composer_change(
     previous: tuple[str, int],
     settle_delay: float,
     window: str | None = None,
+    matches: Callable[[str], bool] | None = None,
 ) -> tuple[str, int] | None:
-    """Wait for a changed composer state to remain stable."""
+    """Wait for a changed composer state to remain stable.
+
+    With ``matches`` the composer counts as settled once the predicate has held
+    for ``settle_delay``, whatever the idle animation does to the text meanwhile.
+    Without it, a state that differs from ``previous`` has to stay the same for
+    that long, a particle on either side standing for the cell it covers.
+    """
     deadline = time.monotonic() + PROBE_TIMEOUT
+    tolerant = profile.agent == "codex"
     stable_state: tuple[str, int] | None = None
     stable_since: float | None = None
     while True:
         state = composer_state(sid, profile, window)
         now = time.monotonic()
-        if state is not None and state != previous:
-            if state != stable_state:
+        if matches is not None:
+            good = state is not None and matches(state[0])
+        else:
+            good = state is not None and not same_composer_state(
+                state, previous, tolerant
+            )
+        if good:
+            if stable_since is None or (
+                matches is None
+                and not same_composer_state(state, stable_state, tolerant)
+            ):
                 stable_state = state
                 stable_since = now
-            elif stable_since is not None and now - stable_since >= settle_delay:
+            elif now - stable_since >= settle_delay:
                 return state
         else:
             stable_state = None
@@ -580,6 +769,7 @@ def type_body(
     if progress is None:
         progress = BodyProgress()
     marker = composer_probe_marker(text)
+    tolerant = profile.agent == "codex"
     chunks = text_chunks(text, TYPE_CHUNK_BYTES - len(marker.encode("utf-8")))
     state = initial
     expected = ""
@@ -591,7 +781,17 @@ def type_body(
             try:
                 type_text(sid, profile, chunk + marker, window)
                 changed = wait_for_composer_change(
-                    sid, profile, state, CHUNK_SETTLE_DELAY, window
+                    sid,
+                    profile,
+                    state,
+                    CHUNK_SETTLE_DELAY,
+                    window,
+                    matches=partial(
+                        chunk_is_visible,
+                        expected=marked,
+                        chunk=chunk + marker,
+                        tolerant=tolerant,
+                    ),
                 )
                 if changed is None:
                     raise ComposerDirty(
@@ -600,7 +800,7 @@ def type_body(
                         marked,
                     )
                 if not composer_has_expected_tail(
-                    changed[0], marked, chunk + marker
+                    changed[0], marked, chunk + marker, tolerant
                 ):
                     raise ComposerDirty(
                         f"message chunk {index + 1}/{len(chunks)} is incomplete in "
@@ -614,7 +814,18 @@ def type_body(
                     else CHUNK_SETTLE_DELAY
                 )
                 unmarked = wait_for_composer_change(
-                    sid, profile, changed, settle_delay, window
+                    sid,
+                    profile,
+                    changed,
+                    settle_delay,
+                    window,
+                    matches=partial(
+                        chunk_is_visible,
+                        expected=attempted,
+                        chunk=chunk,
+                        tolerant=tolerant,
+                        marker=marker,
+                    ),
                 )
                 if unmarked is None or marker in unmarked[0]:
                     raise ComposerDirty(
@@ -622,7 +833,9 @@ def type_body(
                         "not confirmably removed; submit withheld",
                         marked,
                     )
-                if not composer_has_expected_tail(unmarked[0], attempted, chunk):
+                if not composer_has_expected_tail(
+                    unmarked[0], attempted, chunk, tolerant
+                ):
                     raise ComposerDirty(
                         f"message chunk {index + 1}/{len(chunks)} changed during "
                         "marker removal; submit withheld",
@@ -654,20 +867,131 @@ def type_body(
     return state
 
 
+def trailing_particle_variants(row: str) -> list[str]:
+    """The row as shown, then with one more trailing particle removed each time.
+
+    A trailing particle may cover the last typed character or an empty cell beside
+    the text, and only the source text tells which, so every reading is offered.
+    """
+    row = row.rstrip()
+    variants = [row]
+    while row and CODEX_PARTICLE_RE.match(row[-1]):
+        # Particles drawn beyond the text sit after the spaces of empty cells.
+        row = row[:-1].rstrip()
+        variants.append(row)
+    return variants
+
+
+def row_readings(row: str, tolerant: bool) -> list[str]:
+    return trailing_particle_variants(row) if tolerant else [row]
+
+
+def composer_row_readings(
+    rows: list[str], index: int, tolerant: bool
+) -> list[tuple[str, bool]]:
+    """Offer a literal row and Codex's top-margin scroll decoration reading.
+
+    Codex 0.162.1 renders one ↑ in the reserved right margin of the first
+    visible textarea row when earlier rows are hidden (chat_composer.rs).
+    Keep the parser lossless and always try the literal reading too. The
+    decorated reading is valid only at a nonzero source offset, enforced by
+    both callers. Never treat a bottom/down arrow as permission to submit
+    while the message tail is hidden, or strip arrows from arbitrary rows.
+    """
+    row = rows[index]
+    readings = [(reading, False) for reading in row_readings(row, tolerant)]
+    if tolerant and index == 0 and len(rows) > 1 and row.endswith("↑"):
+        readings.extend(
+            (reading, True)
+            for reading in row_readings(row[:-1].rstrip(), tolerant)
+            if reading
+        )
+    return readings
+
+
+def row_matches(expected: str, row: str, tolerant: bool = False) -> bool:
+    """Compare one screen row with source text of the same length.
+
+    Codex draws its idle animation over the composer, so with ``tolerant`` a braille
+    particle stands for the one cell it covers; every other cell must match exactly,
+    and a row of the wrong length never matches. Claude's composer shows no
+    animation, so its rows are compared verbatim.
+    """
+    if not tolerant:
+        return expected == row
+    if len(expected) != len(row):
+        return False
+    return all(
+        wanted == seen or CODEX_PARTICLE_RE.match(seen) is not None
+        for wanted, seen in zip(expected, row)
+    )
+
+
+def same_composer_text(first: str, second: str, tolerant: bool = False) -> bool:
+    """Equal composer text; with ``tolerant`` a particle on either side is its cell."""
+    if not tolerant:
+        return first == second
+    rows_first = first.splitlines() or [first]
+    rows_second = second.splitlines() or [second]
+    if len(rows_first) != len(rows_second):
+        return False
+    return all(
+        any(
+            len(one) == len(other)
+            and all(
+                left == right
+                or CODEX_PARTICLE_RE.match(left) is not None
+                or CODEX_PARTICLE_RE.match(right) is not None
+                for left, right in zip(one, other)
+            )
+            for one in trailing_particle_variants(row_one)
+            for other in trailing_particle_variants(row_other)
+        )
+        for row_one, row_other in zip(rows_first, rows_second)
+    )
+
+
+def same_composer_state(
+    first: tuple[str, int] | None,
+    second: tuple[str, int] | None,
+    tolerant: bool = False,
+) -> bool:
+    if first is None or second is None:
+        return first is second
+    return first[1] == second[1] and same_composer_text(first[0], second[0], tolerant)
+
+
+def chunk_is_visible(
+    content: str,
+    expected: str,
+    chunk: str,
+    tolerant: bool = False,
+    marker: str = "",
+) -> bool:
+    """The typed chunk shows in the composer, without a marker that should be gone."""
+    if marker and marker in content:
+        return False
+    return composer_has_expected_tail(content, expected, chunk, tolerant)
+
+
 def composer_has_expected_tail(
     content: str,
     expected: str,
     chunk: str,
+    tolerant: bool = False,
 ) -> bool:
     """Match a source suffix while allowing visual line wrapping."""
     positions = {len(expected)}
     rows = content.splitlines() or [content]
     for index in range(len(rows) - 1, -1, -1):
-        row = rows[index]
+        readings = composer_row_readings(rows, index, tolerant)
         matched = {
             end - len(row)
             for end in positions
-            if end >= len(row) and expected[end - len(row) : end] == row
+            for row, scrolled in readings
+            if end >= len(row)
+            and (not scrolled or end > len(row))
+            and row_matches(expected[end - len(row) : end], row, tolerant)
         }
         if not matched:
             return False
@@ -714,7 +1038,10 @@ def chunk_tail_is_ambiguous(expected: str, chunk: str) -> bool:
 
 
 def composer_owned_spans(
-    content: str, owned_text: str, allowed_ends: set[int]
+    content: str,
+    owned_text: str,
+    allowed_ends: set[int],
+    tolerant: bool = False,
 ) -> set[tuple[int, int]]:
     """Locate visible contiguous owned text ending at an allowed prefix boundary."""
     if not content:
@@ -730,12 +1057,14 @@ def composer_owned_spans(
     )
     rows = content.splitlines() or [content]
     for index in range(len(rows) - 1, -1, -1):
-        row = rows[index]
+        readings = composer_row_readings(rows, index, tolerant)
         matched = {
             (position - len(row), end)
             for position, end in positions
+            for row, scrolled in readings
             if position >= len(row)
-            and owned_text[position - len(row) : position] == row
+            and (not scrolled or position > len(row))
+            and row_matches(owned_text[position - len(row) : position], row, tolerant)
         }
         if not matched:
             return set()
@@ -761,9 +1090,8 @@ def wait_for_cleanup_state(
 ) -> tuple[tuple[str, int], set[tuple[int, int]]] | None:
     """Wait for a backspace batch to reach a stable observable state."""
     deadline = time.monotonic() + PROBE_TIMEOUT
-    stable: tuple[
-        tuple[str, int] | None, frozenset[tuple[int, int]]
-    ] | None = None
+    tolerant = profile.agent == "codex"
+    stable: tuple[int | None, frozenset[tuple[int, int]]] | None = None
     stable_since: float | None = None
     while True:
         state = composer_state(sid, profile, window)
@@ -775,15 +1103,17 @@ def wait_for_cleanup_state(
         if is_empty and accept_empty:
             return state, set()
         spans = (
-            composer_owned_spans(state[0], owned_text, allowed_ends)
+            composer_owned_spans(state[0], owned_text, allowed_ends, tolerant)
             if state is not None
             else set()
         )
-        if state == previous or (is_empty and not accept_empty):
+        if same_composer_state(state, previous, tolerant) or (
+            is_empty and not accept_empty
+        ):
             stable = None
             stable_since = None
         else:
-            candidate = state, frozenset(spans)
+            candidate = (state[1] if state is not None else None), frozenset(spans)
             if candidate != stable:
                 stable = candidate
                 stable_since = now
@@ -866,7 +1196,6 @@ def wait_for_accepted(
 ) -> bool:
     """Wait until submission clears the composed state and restores column 2."""
     deadline = time.monotonic() + PROBE_TIMEOUT
-    stable_state: tuple[str, int] | None = None
     stable_since: float | None = None
     while True:
         state = composer_state(sid, profile, window)
@@ -878,16 +1207,11 @@ def wait_for_accepted(
             and composer_is_empty(profile, state[0])
         )
         if accepted:
-            if state != stable_state:
-                stable_state = state
+            if stable_since is None:
                 stable_since = now
-            elif (
-                stable_since is not None
-                and now - stable_since >= CHUNK_SETTLE_DELAY
-            ):
+            elif now - stable_since >= CHUNK_SETTLE_DELAY:
                 return True
         else:
-            stable_state = None
             stable_since = None
         if now >= deadline:
             return False
@@ -903,6 +1227,19 @@ def normalize(profile: Profile, message: str) -> str:
         line = line[len(prefix) :].lstrip(": ").strip()
     if not line:
         raise ValueError("chat message is empty")
+    if profile.agent == "claude":
+        if line.endswith("\\"):
+            raise ValueError(
+                "chat message ends with a backslash, which Claude's composer reads "
+                "as a line continuation instead of a submit"
+            )
+        typed = profile.label + line
+        units = len(typed.encode("utf-16-le")) // 2
+        if units + len(composer_probe_marker(typed)) > CLAUDE_DRAFT_LIMIT:
+            raise ValueError(
+                f"chat message is longer than the {CLAUDE_DRAFT_LIMIT:,} characters "
+                "Claude's composer keeps verbatim"
+            )
     return profile.label + line
 
 
@@ -986,8 +1323,24 @@ def send(
             composed = type_body(
                 sid, profile, typed, initial, window, progress
             )
+            # A particle can hide a wrong character until it moves, so the visible
+            # body is verified against the intended text once more with the latest
+            # reading. A long body may have scrolled its beginning out of the
+            # composer, so the check asks for the visible suffix the final chunk
+            # needed, no more.
             before_submit = composer_state(sid, profile, window)
-            if before_submit != composed:
+            tolerant = profile.agent == "codex"
+            final_chunk = text_chunks(
+                typed,
+                TYPE_CHUNK_BYTES
+                - len(composer_probe_marker(typed).encode("utf-8")),
+            )[-1]
+            if before_submit is None or not (
+                same_composer_state(before_submit, composed, tolerant)
+                and composer_has_expected_tail(
+                    before_submit[0], typed, final_chunk, tolerant
+                )
+            ):
                 raise ComposerDirty(
                     "target composer changed before submit; submit withheld",
                     typed,
@@ -1138,6 +1491,38 @@ def prepare_message(name: str) -> Path:
     return MESSAGE_SPOOL / name
 
 
+def message_claim(name: str) -> str:
+    return f"{name}.claimed-{os.getpid()}"
+
+
+def settle_message(name: str | None, keep: bool) -> None:
+    """Return a claimed message to its name when keep is set, otherwise consume it.
+
+    A failure here is reported, never raised, so it cannot mask the send's own error.
+    """
+    if name is None:
+        return
+    claim = message_claim(name)
+    try:
+        spool_fd = private_spool_fd(create=False)
+        try:
+            if keep:
+                os.rename(claim, name, src_dir_fd=spool_fd, dst_dir_fd=spool_fd)
+                print(
+                    f"peer-chat: message kept; resend it with --message-file {name}",
+                    file=sys.stderr,
+                )
+                return
+            os.unlink(claim, dir_fd=spool_fd)
+        finally:
+            os.close(spool_fd)
+    except (OSError, ValueError) as err:
+        print(
+            f"peer-chat: cannot settle {MESSAGE_SPOOL / claim}: {err}",
+            file=sys.stderr,
+        )
+
+
 def read_message(use_stdin: bool, message_file: str | None) -> str:
     if use_stdin:
         binary = getattr(sys.stdin, "buffer", None)
@@ -1171,29 +1556,34 @@ def read_message(use_stdin: bool, message_file: str | None) -> str:
             and info.st_uid == os.getuid()
             and info.st_nlink == 1
         )
-        if is_owned_regular:
-            os.unlink(message_file, dir_fd=spool_fd)
         if not is_owned_regular:
             raise ValueError("message file must be an owned regular file with one link")
-        if stat.S_IMODE(info.st_mode) & 0o077:
-            raise ValueError(
-                "message file is accessible by other users and was consumed; "
-                "run --prepare-message again"
-            )
-        if info.st_size > MAX_MESSAGE_BYTES:
-            raise ValueError(
-                f"message file exceeds {MAX_MESSAGE_BYTES} bytes and was consumed; "
-                "run --prepare-message again"
-            )
-
-        with os.fdopen(message_fd, encoding="utf-8") as stream:
-            message_fd = -1
-            message = stream.read(MAX_MESSAGE_BYTES + 1)
-        if len(message.encode("utf-8")) > MAX_MESSAGE_BYTES:
-            raise ValueError(
-                f"message file exceeds {MAX_MESSAGE_BYTES} bytes and was consumed; "
-                "run --prepare-message again"
-            )
+        # the rename is the claim: a second send of this name finds no entry, and the
+        # claim name fails MESSAGE_NAME_RE, so a stranded claim can never be resent
+        claim = message_claim(message_file)
+        os.rename(message_file, claim, src_dir_fd=spool_fd, dst_dir_fd=spool_fd)
+        try:
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                raise ValueError(
+                    "message file is accessible by other users and was consumed; "
+                    "run --prepare-message again"
+                )
+            if info.st_size > MAX_MESSAGE_BYTES:
+                raise ValueError(
+                    f"message file exceeds {MAX_MESSAGE_BYTES} bytes and was consumed; "
+                    "run --prepare-message again"
+                )
+            with os.fdopen(message_fd, encoding="utf-8") as stream:
+                message_fd = -1
+                message = stream.read(MAX_MESSAGE_BYTES + 1)
+            if len(message.encode("utf-8")) > MAX_MESSAGE_BYTES:
+                raise ValueError(
+                    f"message file exceeds {MAX_MESSAGE_BYTES} bytes and was consumed; "
+                    "run --prepare-message again"
+                )
+        except BaseException:
+            os.unlink(claim, dir_fd=spool_fd)
+            raise
         return message
     finally:
         if message_fd >= 0:
@@ -1260,8 +1650,18 @@ def run_main(progress: DeliveryProgress) -> int:
         return 0
     profile = target_profile(args.to, args.target_command, args.queue)
     window, sid = resolve_target(args.session, args.window, profile)
+    profile = bind_pane(find_node(sid, window), profile)
     message = read_message(args.stdin, args.message_file)
-    sent = send_with_retry(sid, profile, message, window, progress)
+    keep = False
+    try:
+        sent = send_with_retry(sid, profile, message, window, progress)
+    except (RuntimeError, KeyboardInterrupt):
+        # a refusal by the target can clear on a resend; a body normalize rejects
+        # (ValueError) never will, so it is consumed like the read-time rejections
+        keep = progress.phase == "not_started"
+        raise
+    finally:
+        settle_message(args.message_file, keep)
     progress.phase = "confirmed"
     report_success(sent)
     return 0

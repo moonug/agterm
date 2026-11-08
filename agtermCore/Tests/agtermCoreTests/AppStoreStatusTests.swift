@@ -28,18 +28,23 @@ struct AppStoreStatusTests {
         #expect(stamp > now - 60 && stamp <= now)
     }
 
-    @Test func controlTreeNilsStatusChangedAtWhenIdle() throws {
+    @Test func controlTreeReportsStatusChangedAtWhenIdle() throws {
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
         let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        #expect(store.controlTree().workspaces[0].sessions[0].statusChangedAt == nil)
         store.setAgentIndicator(AgentIndicator(status: .active), forSession: session.id)
         #expect(store.controlTree().workspaces[0].sessions[0].statusChangedAt != nil)
 
+        session.statusChangedAt = Date(timeIntervalSince1970: 0)
+        let before = Date().timeIntervalSince1970
         store.setAgentIndicator(AgentIndicator(status: .idle), forSession: session.id)
 
         let node = try #require(store.controlTree().workspaces[0].sessions.first)
         #expect(node.status == nil)
-        #expect(node.statusChangedAt == nil)
+        let stamp = try #require(node.statusChangedAt)
+        #expect(stamp == session.statusChangedAt?.timeIntervalSince1970)
+        #expect(stamp >= before)
     }
 
     @Test func controlTreeRefreshesStatusChangedAtOnARePushOfTheSameStatus() throws {
@@ -139,6 +144,73 @@ struct AppStoreStatusTests {
         #expect(session.agentIndicator.status == .active)
     }
 
+    @Test func markForAttentionSetsAPlainCompletedOnAnIdleSession() throws {
+        let drafts = DraftCollector()
+        let store = AppStore(persistence: PersistenceStore(directory: FileManager.default.temporaryDirectory
+                                 .appendingPathComponent("agterm-tests-\(UUID().uuidString)")),
+                             controlEventSink: { drafts.kinds.append($0.kind) })
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        drafts.kinds.removeAll()
+
+        store.markForAttention([session.id])
+
+        #expect(session.agentIndicator == AgentIndicator(status: .completed))
+        #expect(store.attentionSessions.map(\.id) == [session.id])
+        #expect(drafts.kinds == [.status])
+        let node = try #require(store.controlTree().workspaces[0].sessions.first)
+        #expect(node.status == "completed")
+        #expect(node.statusChangedAt == session.statusChangedAt?.timeIntervalSince1970)
+        #expect(node.statusChangedAt != nil)
+    }
+
+    @Test func markForAttentionSurvivesLeavingAndRevisitingTheSession() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let marked = try #require(store.addSession(toWorkspace: ws.id, cwd: "/marked"))
+        let other = try #require(store.addSession(toWorkspace: ws.id, cwd: "/other"))
+        store.selectSession(marked.id)
+
+        store.markForAttention([marked.id])
+        store.selectSession(other.id)
+        store.selectSession(marked.id)
+
+        #expect(marked.agentIndicator.status == .completed)
+    }
+
+    @Test(arguments: [AgentStatus.active, .completed, .blocked])
+    func markForAttentionLeavesANonIdleSessionAlone(_ status: AgentStatus) throws {
+        let drafts = DraftCollector()
+        let store = AppStore(persistence: PersistenceStore(directory: FileManager.default.temporaryDirectory
+                                 .appendingPathComponent("agterm-tests-\(UUID().uuidString)")),
+                             controlEventSink: { drafts.kinds.append($0.kind) })
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        let standing = AgentIndicator(status: status, blink: true, color: "#112233", statusPane: .left)
+        store.setAgentIndicator(standing, forSession: session.id)
+        let stamp = session.statusChangedAt
+        drafts.kinds.removeAll()
+
+        store.markForAttention([session.id])
+
+        #expect(session.agentIndicator == standing)
+        #expect(session.statusChangedAt == stamp)
+        #expect(drafts.kinds.isEmpty)
+    }
+
+    @Test func markForAttentionMarksOnlyTheIdleMembersOfABatch() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let idle = try #require(store.addSession(toWorkspace: ws.id, cwd: "/idle"))
+        let blocked = try #require(store.addSession(toWorkspace: ws.id, cwd: "/blocked"))
+        store.setAgentIndicator(AgentIndicator(status: .blocked), forSession: blocked.id)
+
+        store.markForAttention([idle.id, blocked.id, UUID()])
+
+        #expect(idle.agentIndicator.status == .completed)
+        #expect(blocked.agentIndicator.status == .blocked)
+    }
+
     @Test func aRefusedWriteEmitsNoStatusEvent() {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("agterm-tests-\(UUID().uuidString)")
         let drafts = DraftCollector()
@@ -155,5 +227,95 @@ struct AppStoreStatusTests {
         store.applyControlStatus(AgentIndicator(status: .active, statusPane: .right), forSession: session.id)
 
         #expect(drafts.kinds.isEmpty)
+    }
+
+    @MainActor
+    private final class RecordingSink: PresentationSink {
+        var frames: [PresentationFrame] = []
+        func offer(_ frame: PresentationFrame) -> Bool {
+            frames.append(frame)
+            return true
+        }
+        func close(_ reason: PresentationHub.CloseReason) {}
+
+        var statuses: [PresentationStatus?] {
+            frames.compactMap { if case .status(let status) = $0.body { return .some(status) } else { return nil } }
+        }
+    }
+
+    private func mirroredStore() throws -> (AppStore, Session, RecordingSink) {
+        let store = makeStore()
+        let hub = PresentationHub(staleTimeout: 30)
+        store.presentationHub = hub
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        store.toggleSplit(session.id)
+        let sink = RecordingSink()
+        try hub.subscribe(session: session.id, hello: PresentationHello(version: 1, kinds: [], mode: .mirror),
+                          sink: sink) { store.presentationSnapshot(forSession: session.id) }
+        return (store, session, sink)
+    }
+
+    @Test func aStatusWriteReachesTheHubAsFullStateWithItsOwnerPaneAndGlyphOverrides() throws {
+        let (store, session, sink) = try mirroredStore()
+        let split = try #require(session.splitPaneIdentity)
+
+        store.applyControlStatus(AgentIndicator(status: .blocked, blink: true, color: "#ff8800", shape: .star,
+                                                statusPane: .right), forSession: session.id)
+
+        let status = try #require(sink.statuses.last ?? nil)
+        #expect(status.status == .blocked)
+        #expect(status.blink)
+        #expect(status.color == "#ff8800")
+        #expect(status.shape == .star)
+        #expect(status.pane == .identity(split))
+        #expect(status.changedAt == session.statusChangedAt?.timeIntervalSince1970)
+    }
+
+    @Test(arguments: [StatusPane.left, .scratch, nil])
+    func theOwnerPaneTravelsAsAnIdentityOrScratch(_ pane: StatusPane?) throws {
+        let (store, session, sink) = try mirroredStore()
+
+        store.applyControlStatus(AgentIndicator(status: .active, statusPane: pane), forSession: session.id)
+
+        let expected: PresentationPane = pane == .scratch ? .scratch : .identity(session.paneIdentity)
+        #expect((sink.statuses.last ?? nil)?.pane == expected)
+    }
+
+    @Test func idleReachesTheHubAsAnAbsentStatus() throws {
+        let (store, session, sink) = try mirroredStore()
+        store.applyControlStatus(AgentIndicator(status: .active), forSession: session.id)
+
+        store.applyControlStatus(AgentIndicator(status: .idle), forSession: session.id)
+
+        #expect(sink.statuses.count == 2)
+        #expect(sink.statuses.last == .some(nil))
+    }
+
+    @Test func aRefusedWritePublishesNothing() throws {
+        let (store, session, sink) = try mirroredStore()
+        store.applyControlStatus(AgentIndicator(status: .blocked, statusPane: .left), forSession: session.id)
+
+        store.applyControlStatus(AgentIndicator(status: .active, statusPane: .right), forSession: session.id)
+
+        #expect(sink.statuses.count == 1)
+    }
+
+    @Test func aRepeatedIdenticalWriteRepublishesTheRestampedState() throws {
+        let (store, session, sink) = try mirroredStore()
+
+        store.applyControlStatus(AgentIndicator(status: .active), forSession: session.id)
+        session.statusChangedAt = Date(timeIntervalSince1970: 1)
+        store.applyControlStatus(AgentIndicator(status: .active), forSession: session.id)
+
+        #expect(sink.statuses.count == 2)
+        #expect((sink.statuses.last ?? nil)?.changedAt == session.statusChangedAt?.timeIntervalSince1970)
+        #expect((sink.statuses.last ?? nil)?.changedAt != 1)
+    }
+
+    @Test func theSnapshotOfAnIdleSessionHasNoStatus() throws {
+        let (store, session, _) = try mirroredStore()
+
+        #expect(store.presentationSnapshot(forSession: session.id).status == nil)
     }
 }

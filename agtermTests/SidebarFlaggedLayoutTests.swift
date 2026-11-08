@@ -1,0 +1,517 @@
+import AppKit
+import XCTest
+@testable import agterm
+import agtermCore
+
+@MainActor
+final class SidebarFlaggedLayoutTests: XCTestCase {
+    /// Counts full reloads, the only outward sign of a rebuild: node identity and expansion survive one.
+    private final class CountingOutlineView: NSOutlineView {
+        var reloads = 0
+
+        override func reloadData() {
+            reloads += 1
+            super.reloadData()
+        }
+    }
+
+    @MainActor
+    private struct Sidebar {
+        let window: NSWindow
+        let outline: CountingOutlineView
+        let coordinator: WorkspaceSidebar.Coordinator
+
+        /// What `updateNSView` does on every observed store change.
+        func update() {
+            coordinator.reconcile()
+            coordinator.syncSelection()
+        }
+
+        var selectedSessionIDs: [UUID] {
+            outline.selectedRowIndexes.compactMap { (outline.item(atRow: $0) as? SidebarNode)?.id }
+        }
+
+        func badge(ofWorkspace id: UUID) -> Int? {
+            let row = (0..<outline.numberOfRows).first { (outline.item(atRow: $0) as? SidebarNode)?.id == id }
+            return row.flatMap { outline.view(atColumn: 0, row: $0, makeIfNecessary: true) as? SidebarCellView }?.badge.count
+        }
+
+        var rows: [String] {
+            (0..<outline.numberOfRows).map { row in
+                let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: true) as? SidebarCellView
+                let kind = (outline.item(atRow: row) as? SidebarNode)?.kind == .workspace ? "ws" : "s"
+                return "\(kind):\(cell?.textField?.stringValue ?? "")"
+            }
+        }
+    }
+
+    private var stateDir: URL!
+    private var library: WindowLibrary!
+    private var actions: AppActions!
+    private var model: SettingsModel!
+    private var sidebars: [Sidebar] = []
+
+    override func setUp() async throws {
+        try await super.setUp()
+        await MainActor.run {
+            stateDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("agterm-flagged-layout-tests-\(UUID().uuidString)", isDirectory: true)
+            library = WindowLibrary(directory: stateDir)
+            actions = AppActions(library: library)
+            model = SettingsModel(library: library, settingsStore: SettingsStore(directory: stateDir))
+        }
+    }
+
+    override func tearDown() async throws {
+        await MainActor.run {
+            for sidebar in sidebars { sidebar.window.orderOut(nil) }
+            sidebars = []
+            GhosttyApp.shared.setFlaggedViewLayout(.flat)
+            model = nil
+            actions = nil
+            library = nil
+            try? FileManager.default.removeItem(at: stateDir)
+            stateDir = nil
+        }
+        try await super.tearDown()
+    }
+
+    func testEmptyFlaggedViewLinkOpensTheSessionEditorAndHidesOnceSomethingIsFlagged() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        store.setSidebarMode(.flagged)
+        let sidebar = mount(store)
+        let add = try installedEmptyStateLink(in: sidebar)
+        XCTAssertFalse(add.isHiddenOrHasHiddenAncestor)
+        let palette = PaletteController()
+        actions.palette = palette
+
+        add.performClick(nil)
+        let opened = expectation(description: "the editor opens a tick after the click")
+        DispatchQueue.main.async { opened.fulfill() }
+        wait(for: [opened], timeout: 1)
+        XCTAssertEqual(palette.mode, .flaggedEditor)
+
+        let session = try XCTUnwrap(store.workspaces.first?.sessions.first)
+        store.setFlag(true, forSession: session.id)
+        sidebar.update()
+        XCTAssertTrue(add.isHiddenOrHasHiddenAncestor)
+    }
+
+    // regression: the scroll view never applied constraints to the hint, so it drew at its origin over the titlebar.
+    func testEmptyFlaggedViewHintSitsCenteredBelowTheTopWithTheLinkUnderIt() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        store.setSidebarMode(.flagged)
+        let sidebar = mount(store)
+        let add = try installedEmptyStateLink(in: sidebar)
+        let scroll = try XCTUnwrap(sidebar.window.contentView as? SidebarScrollView)
+        scroll.layoutSubtreeIfNeeded()
+
+        let stack = try XCTUnwrap(add.superview)
+        let label = try XCTUnwrap(stack.subviews.first { $0 is NSTextField })
+        XCTAssertGreaterThan(stack.frame.width, 0)
+        XCTAssertEqual(stack.frame.midX, scroll.bounds.midX, accuracy: 1)
+        let topGap = scroll.isFlipped ? stack.frame.minY : scroll.bounds.height - stack.frame.maxY
+        XCTAssertEqual(topGap, scroll.safeAreaInsets.top + 40, accuracy: 1)
+        let labelFrame = label.convert(label.bounds, to: scroll)
+        let linkFrame = add.convert(add.bounds, to: scroll)
+        XCTAssertFalse(labelFrame.intersects(linkFrame), "the link sits under the hint, not on it")
+        XCTAssertEqual(labelFrame.midX, linkFrame.midX, accuracy: 1)
+    }
+
+    func testEmptyFlaggedViewLinkDoesNotTakeFirstMouse() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        store.setSidebarMode(.flagged)
+        let add = try installedEmptyStateLink(in: mount(store))
+        XCTAssertFalse(add.acceptsFirstMouse(for: nil))
+    }
+
+    func testTreeLayoutNestsFlaggedSessionsUnderTheirWorkspaces() throws {
+        let store = try seededStore()
+        store.setSidebarMode(.flagged)
+        model.setFlaggedViewLayout(.tree)
+
+        let sidebar = mount(store)
+
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "s:a1", "ws:Gamma", "s:c1"])
+    }
+
+    func testFlatLayoutKeepsTheWorkspaceSuffix() throws {
+        let store = try seededStore()
+        store.setSidebarMode(.flagged)
+
+        let sidebar = mount(store)
+
+        XCTAssertEqual(sidebar.rows, ["s:a1 : Alpha", "s:c1 : Gamma"])
+    }
+
+    func testPlainLayoutListsSessionNamesAlone() throws {
+        let store = try seededStore()
+        store.setSidebarMode(.flagged)
+        model.setFlaggedViewLayout(.plain)
+
+        let sidebar = mount(store)
+
+        XCTAssertEqual(sidebar.rows, ["s:a1", "s:c1"])
+    }
+
+    func testEveryFlaggedLayoutNamesACompanionAfterItsParentAndTheTreeDoesNot() throws {
+        let store = try seededStore()
+        let a1 = try XCTUnwrap(store.workspaces.first?.sessions.first)
+        let log = try store.addCompanion(to: a1.id, options: CompanionOptions(name: "log", select: false)).get()
+        store.setFlag(true, forSession: log.id)
+        let sidebar = mount(store)
+        XCTAssertTrue(sidebar.rows.contains("s:log"), "\(sidebar.rows)")
+
+        store.setSidebarMode(.flagged)
+        for (layout, row) in [(FlaggedViewLayout.plain, "s:a1 › log"), (.flat, "s:a1 › log : Alpha"), (.tree, "s:a1 › log")] {
+            model.setFlaggedViewLayout(layout)
+            sidebar.update()
+            XCTAssertTrue(sidebar.rows.contains(row), "\(layout): \(sidebar.rows)")
+        }
+    }
+
+    func testSwitchBetweenTheFlatFormsRelabelsAMountedSidebar() throws {
+        let store = try seededStore()
+        store.setSidebarMode(.flagged)
+        let sidebar = mount(store)
+
+        model.setFlaggedViewLayout(.plain)
+
+        XCTAssertEqual(sidebar.rows, ["s:a1", "s:c1"])
+
+        model.setFlaggedViewLayout(.flat)
+
+        XCTAssertEqual(sidebar.rows, ["s:a1 : Alpha", "s:c1 : Gamma"])
+    }
+
+    func testTreeLayoutIgnoresTheFocusFilter() throws {
+        let store = try seededStore()
+        let beta = try XCTUnwrap(store.workspaces.first { $0.name == "Beta" })
+        store.setFocusMembership(beta.id, member: true)
+        store.setFocusEnabled(true)
+        store.setSidebarMode(.flagged)
+        model.setFlaggedViewLayout(.tree)
+
+        let sidebar = mount(store)
+
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "s:a1", "ws:Gamma", "s:c1"])
+    }
+
+    func testLayoutChangeRebuildsAMountedFlaggedSidebar() throws {
+        let store = try seededStore()
+        store.setSidebarMode(.flagged)
+        let sidebar = mount(store)
+
+        model.setFlaggedViewLayout(.tree)
+
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "s:a1", "ws:Gamma", "s:c1"])
+
+        model.setFlaggedViewLayout(.flat)
+
+        XCTAssertEqual(sidebar.rows, ["s:a1 : Alpha", "s:c1 : Gamma"])
+    }
+
+    func testLayoutChangeLeavesAnOrdinaryTreeSidebarAlone() throws {
+        let store = try seededStore()
+        let sidebar = mount(store)
+        let reloads = sidebar.outline.reloads
+
+        model.setFlaggedViewLayout(.tree)
+
+        XCTAssertEqual(sidebar.outline.reloads, reloads)
+    }
+
+    func testEnteringFlaggedModeReadsALayoutSetUnderTheOrdinaryTree() throws {
+        let store = try seededStore()
+        let sidebar = mount(store)
+        model.setFlaggedViewLayout(.tree)
+
+        store.setSidebarMode(.flagged)
+        sidebar.update()
+
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "s:a1", "ws:Gamma", "s:c1"])
+    }
+
+    func testGroupLeavesWithItsLastFlagAndReturnsWhenReflagged() throws {
+        let store = try seededStore()
+        let c1 = try XCTUnwrap(store.flaggedSessions.last)
+        store.setSidebarMode(.flagged)
+        model.setFlaggedViewLayout(.tree)
+        let sidebar = mount(store)
+
+        store.setFlag(false, forSession: c1.id)
+        sidebar.update()
+
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "s:a1"])
+
+        store.setFlag(true, forSession: c1.id)
+        sidebar.update()
+
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "s:a1", "ws:Gamma", "s:c1"])
+    }
+
+    // regression: a structure switch under an unchanged selection left the active session hidden under its
+    // collapsed workspace, because the reveal only fired when the selected id changed.
+    func testViewToggleToTreeRevealsTheActiveSessionUnderACollapsedWorkspace() throws {
+        let store = try seededStore()
+        let alpha = try XCTUnwrap(store.workspaces.first)
+        store.setWorkspaceExpanded(alpha.id, expanded: false)
+        store.setSidebarMode(.flagged)
+        let sidebar = mount(store)
+
+        store.setSidebarMode(.tree)
+        sidebar.update()
+
+        XCTAssertEqual(sidebar.selectedSessionIDs, [alpha.sessions[0].id])
+        XCTAssertEqual(store.workspaces.first?.isExpanded, false)
+    }
+
+    // regression: same defect through the layout switch, which arrives by notification, not `updateNSView`.
+    func testLayoutSwitchToTreeRevealsTheActiveSessionUnderACollapsedWorkspace() throws {
+        let store = try seededStore()
+        let alpha = try XCTUnwrap(store.workspaces.first)
+        store.setWorkspaceExpanded(alpha.id, expanded: false)
+        store.setSidebarMode(.flagged)
+        let sidebar = mount(store)
+
+        model.setFlaggedViewLayout(.tree)
+
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "s:a1", "ws:Gamma", "s:c1"])
+        XCTAssertEqual(sidebar.selectedSessionIDs, [alpha.sessions[0].id])
+        XCTAssertEqual(store.workspaces.first?.isExpanded, false)
+    }
+
+    func testARevealedWorkspaceStaysOpenWhenAnotherGroupsMembershipChanges() throws {
+        let store = try seededStore()
+        let c1 = try XCTUnwrap(store.flaggedSessions.last)
+        store.setWorkspaceExpanded(try XCTUnwrap(store.workspaces.first).id, expanded: false)
+        store.setSidebarMode(.flagged)
+        let sidebar = mount(store)
+        model.setFlaggedViewLayout(.tree)
+
+        store.setFlag(false, forSession: c1.id)
+        sidebar.update()
+
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "s:a1"])
+        XCTAssertEqual(store.workspaces.first?.isExpanded, false)
+    }
+
+    func testUnrelatedUpdatesAfterMountLeaveADeliberateFoldAlone() throws {
+        let store = try seededStore()
+        let a1 = try XCTUnwrap(store.flaggedSessions.first)
+        store.setSidebarMode(.flagged)
+        model.setFlaggedViewLayout(.tree)
+        let sidebar = mount(store)
+        sidebar.outline.collapseItem(sidebar.outline.item(atRow: 0))
+        let folded = ["ws:Alpha", "ws:Gamma", "s:c1"]
+        XCTAssertEqual(sidebar.rows, folded)
+
+        NotificationCenter.default.post(name: .agtermAppearanceChanged, object: nil)
+        XCTAssertEqual(sidebar.rows, folded)
+
+        store.renameSession(a1.id, to: "a1 renamed")
+        sidebar.update()
+        XCTAssertEqual(sidebar.rows, folded)
+    }
+
+    func testSelectionAndMultiSelectionSurviveBothLayoutDirections() throws {
+        let store = try seededStore()
+        let ids = store.flaggedSessions.map(\.id)
+        store.setSidebarSelection(ids)
+        store.setSidebarMode(.flagged)
+        let sidebar = mount(store)
+        XCTAssertEqual(sidebar.selectedSessionIDs, ids)
+
+        model.setFlaggedViewLayout(.tree)
+        XCTAssertEqual(sidebar.selectedSessionIDs, ids)
+
+        model.setFlaggedViewLayout(.flat)
+        XCTAssertEqual(sidebar.selectedSessionIDs, ids)
+        XCTAssertEqual(store.selectedSessionID, ids.first)
+        XCTAssertEqual(store.sidebarSelectionIDs, ids)
+    }
+
+    func testOneSettingChangeReachesEveryFlaggedSidebarAndALaterMount() throws {
+        let first = try seededStore()
+        first.setSidebarMode(.flagged)
+        let second = try XCTUnwrap(library.loadStore(for: library.newWindow().id))
+        let session = try XCTUnwrap(second.workspaces.first?.sessions.first)
+        second.renameWorkspace(try XCTUnwrap(second.workspaces.first).id, to: "Delta")
+        second.renameSession(session.id, to: "d1")
+        second.setFlag(true, forSession: session.id)
+        second.setSidebarMode(.flagged)
+        let sidebars = [mount(first), mount(second)]
+
+        model.setFlaggedViewLayout(.tree)
+
+        XCTAssertEqual(sidebars[0].rows, ["ws:Alpha", "s:a1", "ws:Gamma", "s:c1"])
+        XCTAssertEqual(sidebars[1].rows, ["ws:Delta", "s:d1"])
+        XCTAssertEqual(mount(second).rows, ["ws:Delta", "s:d1"])
+    }
+
+    func testCollapseOthersActsInTheTreeLayoutAndWritesOmittedWorkspaces() throws {
+        let store = try seededStore()
+        store.setSidebarMode(.flagged)
+        model.setFlaggedViewLayout(.tree)
+        let sidebar = mount(store)
+
+        actions.collapseOtherWorkspaces(in: store)
+
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "s:a1", "ws:Gamma"])
+        XCTAssertEqual(store.workspaces.map(\.isExpanded), [true, false, false])
+    }
+
+    func testCollapseOthersStaysANoOpUnderTheFlatList() throws {
+        let store = try seededStore()
+        store.setSidebarMode(.flagged)
+        let sidebar = mount(store)
+
+        actions.collapseOtherWorkspaces(in: store)
+
+        XCTAssertEqual(sidebar.rows, ["s:a1 : Alpha", "s:c1 : Gamma"])
+        XCTAssertEqual(store.workspaces.map(\.isExpanded), [true, true, true])
+    }
+
+    func testFoldMadeInTheTreeLayoutShowsInTheOrdinaryTree() throws {
+        let store = try seededStore()
+        let gamma = try XCTUnwrap(store.workspaces.last)
+        store.setSidebarMode(.flagged)
+        model.setFlaggedViewLayout(.tree)
+        let sidebar = mount(store)
+
+        actions.setWorkspaceExpanded(gamma.id, expanded: false, in: store)
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "s:a1", "ws:Gamma"])
+
+        store.setSidebarMode(.tree)
+        sidebar.update()
+
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "s:a1", "s:a2", "ws:Beta", "s:b1", "ws:Gamma"])
+    }
+
+    func testToggleActiveWorkspaceCollapseActsInTheTreeLayout() throws {
+        let store = try seededStore()
+        store.setSidebarMode(.flagged)
+        model.setFlaggedViewLayout(.tree)
+        let sidebar = mount(store)
+
+        actions.toggleActiveWorkspaceCollapse()
+
+        XCTAssertEqual(sidebar.rows, ["ws:Alpha", "ws:Gamma", "s:c1"])
+    }
+
+    func testTreeLayoutHeaderBadgeCountsOnlyFlaggedChildren() throws {
+        let store = try seededStore()
+        let alpha = try XCTUnwrap(store.workspaces.first)
+        alpha.sessions[0].unseenCount = 2
+        alpha.sessions[1].unseenCount = 5
+        store.setSidebarMode(.flagged)
+        model.setFlaggedViewLayout(.tree)
+
+        let sidebar = mount(store)
+
+        XCTAssertEqual(sidebar.badge(ofWorkspace: alpha.id), 2)
+    }
+
+    func testOrdinaryTreeHeaderBadgeStillCountsEverySession() throws {
+        let store = try seededStore()
+        let alpha = try XCTUnwrap(store.workspaces.first)
+        alpha.sessions[0].unseenCount = 2
+        alpha.sessions[1].unseenCount = 5
+        model.setFlaggedViewLayout(.tree)
+
+        let sidebar = mount(store)
+
+        XCTAssertEqual(sidebar.badge(ofWorkspace: alpha.id), 7)
+    }
+
+    func testFlagFlipUpdatesTheTreeLayoutHeaderBadge() throws {
+        let store = try seededStore()
+        let alpha = try XCTUnwrap(store.workspaces.first)
+        alpha.sessions[0].unseenCount = 2
+        alpha.sessions[1].unseenCount = 5
+        store.setSidebarMode(.flagged)
+        model.setFlaggedViewLayout(.tree)
+        let sidebar = mount(store)
+
+        store.setFlag(true, forSession: alpha.sessions[1].id)
+        sidebar.update()
+
+        XCTAssertEqual(sidebar.badge(ofWorkspace: alpha.id), 7)
+    }
+
+    func testUnseenChangeUpdatesTheTreeLayoutHeaderBadgeWithoutARebuild() throws {
+        let store = try seededStore()
+        let alpha = try XCTUnwrap(store.workspaces.first)
+        store.setSidebarMode(.flagged)
+        model.setFlaggedViewLayout(.tree)
+        let sidebar = mount(store)
+        XCTAssertEqual(sidebar.badge(ofWorkspace: alpha.id), 0)
+        let reloads = sidebar.outline.reloads
+
+        alpha.sessions[0].unseenCount = 3
+        alpha.sessions[1].unseenCount = 9
+        sidebar.update()
+
+        XCTAssertEqual(sidebar.badge(ofWorkspace: alpha.id), 3)
+        XCTAssertEqual(sidebar.outline.reloads, reloads)
+    }
+
+    /// Alpha [a1 flagged, a2], Beta [b1], Gamma [c1 flagged], with a1 selected.
+    private func seededStore() throws -> AppStore {
+        let store = try XCTUnwrap(library.activeStore)
+        let alpha = try XCTUnwrap(store.workspaces.first)
+        store.renameWorkspace(alpha.id, to: "Alpha")
+        let a1 = try XCTUnwrap(alpha.sessions.first)
+        store.renameSession(a1.id, to: "a1")
+        let a2 = try XCTUnwrap(store.addSession(toWorkspace: alpha.id, cwd: "/tmp"))
+        store.renameSession(a2.id, to: "a2")
+        let beta = store.addWorkspace(name: "Beta")
+        let b1 = try XCTUnwrap(store.addSession(toWorkspace: beta.id, cwd: "/tmp"))
+        store.renameSession(b1.id, to: "b1")
+        let gamma = store.addWorkspace(name: "Gamma")
+        let c1 = try XCTUnwrap(store.addSession(toWorkspace: gamma.id, cwd: "/tmp"))
+        store.renameSession(c1.id, to: "c1")
+        store.setFlag(true, forSession: a1.id)
+        store.setFlag(true, forSession: c1.id)
+        store.selectSession(a1.id)
+        return store
+    }
+
+    /// Mounts a real outline + Coordinator with the same first-build sequence as `makeNSView`.
+    private func mount(_ store: AppStore) -> Sidebar {
+        let outline = CountingOutlineView()
+        let coordinator = WorkspaceSidebar.Coordinator(store: store, actions: actions)
+        outline.dataSource = coordinator
+        outline.delegate = coordinator
+        outline.headerView = nil
+        outline.rowSizeStyle = .custom
+        outline.rowHeight = AppSettings.sidebarRowHeight(fontSize: GhosttyApp.shared.sidebarFontSize)
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("main"))
+        column.resizingMask = .autoresizingMask
+        outline.addTableColumn(column)
+        outline.outlineTableColumn = column
+
+        let scroll = SidebarScrollView(frame: NSRect(x: 0, y: 0, width: 240, height: 400))
+        scroll.documentView = outline
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 240, height: 400),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false // see SidebarStatusBlinkTests for why
+        window.contentView = scroll
+
+        coordinator.outlineView = outline
+        coordinator.renameController.outlineView = outline
+        coordinator.seedExpansionFromModel()
+        coordinator.rebuildAndReload()
+        coordinator.syncSelection()
+        let sidebar = Sidebar(window: window, outline: outline, coordinator: coordinator)
+        sidebars.append(sidebar)
+        return sidebar
+    }
+
+    private func installedEmptyStateLink(in sidebar: Sidebar) throws -> NSButton {
+        let scroll = try XCTUnwrap(sidebar.window.contentView as? SidebarScrollView)
+        sidebar.coordinator.installEmptyState(in: scroll)
+        let buttons = scroll.subviews.flatMap(\.subviews).compactMap { $0 as? NSButton }
+        return try XCTUnwrap(buttons.first { $0.accessibilityIdentifier() == "flagged-empty-add" })
+    }
+}

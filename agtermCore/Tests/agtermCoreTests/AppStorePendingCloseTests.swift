@@ -48,6 +48,32 @@ struct AppStorePendingCloseTests {
         }
     }
 
+    @Test(arguments: ["session", "batch", "workspace"])
+    func softCloseDropsATimedInfoLineAndUndoKeepsAnUntimedOne(path: String) throws {
+        let store = store()
+        let timed = addSession(store, name: "timed")
+        let untimed = addSession(store, name: "untimed")
+        let workspaceID = store.workspaces[0].id
+        store.workspaces.append(Workspace(name: "staying", sessions: []))
+        store.setInfo(try SessionInfo.make(source: "brief", markdown: false, hideAfter: 30).get(), forSession: timed.id)
+        store.setInfo(try SessionInfo.make(source: "kept", markdown: false, hideAfter: 0).get(), forSession: untimed.id)
+        defer { store.finalizeAllPendingCloses() }
+
+        switch path {
+        case "session":
+            #expect(store.softCloseSession(timed.id, grace: 60))
+            #expect(store.softCloseSession(untimed.id, grace: 60))
+        case "batch": #expect(store.softCloseSessions([timed.id, untimed.id], grace: 60))
+        default: #expect(store.softRemoveWorkspace(workspaceID, grace: 60))
+        }
+        #expect(timed.info == nil)
+        #expect(untimed.info?.source == "kept")
+
+        while store.undoPendingClose() {}
+        #expect(store.session(withID: timed.id)?.info == nil)
+        #expect(store.session(withID: untimed.id)?.info?.source == "kept")
+    }
+
     private final class DropLog {
         var identities: [UUID] = []
     }
@@ -97,6 +123,86 @@ struct AppStorePendingCloseTests {
         #expect(Set(store.pendingCloseMembers().map(\.session.id)) == [first.id, second.id])
     }
 
+    @Test func batchCloseStampsTheActiveSessionLeftWhenUndoSelectsABatchMate() throws {
+        let store = store()
+        let first = addSession(store, name: "one")
+        let second = addSession(store, name: "two")
+        _ = addSession(store, name: "three")
+        store.selectedSessionID = first.id
+        first.lastSelectedAt = Date(timeIntervalSince1970: 1)
+        defer { store.finalizeAllPendingCloses() }
+
+        let before = Date()
+        #expect(store.softCloseSessions([first.id, second.id], grace: 60))
+        let after = Date()
+        #expect(store.undoPendingClose(selecting: second.id))
+
+        #expect(store.selectedSessionID == second.id)
+        let stamp = try #require(first.lastSelectedAt)
+        #expect((before...after).contains(stamp))
+    }
+
+    @Test func finalizingOnePendingSessionKeepsItsBatchMatesAndOtherRecordsUndoable() {
+        let store = store()
+        let first = addSession(store, name: "one")
+        let second = addSession(store, name: "two")
+        let third = addSession(store, name: "three")
+        #expect(store.softCloseSessions([first.id, second.id], grace: 60))
+        #expect(store.softCloseSession(third.id, grace: 60))
+
+        #expect(store.finalizePendingClose(ofSession: first.id))
+
+        #expect(Set(store.pendingCloseMembers().map(\.session.id)) == [second.id, third.id])
+        #expect(store.undoPendingClose())
+        #expect(store.undoPendingClose())
+        #expect(store.session(withID: second.id) != nil)
+        #expect(store.session(withID: third.id) != nil)
+        #expect(store.session(withID: first.id) == nil)
+    }
+
+    @Test func undoAfterFinalizingAnEarlierBatchMateRestoresTheSurvivorInItsPlace() {
+        let store = store()
+        let first = addSession(store, name: "one")
+        let second = addSession(store, name: "two")
+        let third = addSession(store, name: "three")
+        let before = store.workspaces[0].sessions.map(\.id).filter { $0 != first.id }
+        #expect(store.softCloseSessions([first.id, second.id], grace: 60))
+
+        #expect(store.finalizePendingClose(ofSession: first.id))
+        #expect(store.undoPendingClose())
+
+        #expect(store.workspaces[0].sessions.map(\.id) == before)
+        #expect(store.workspaces[0].sessions.map(\.id).firstIndex(of: second.id)! < store.workspaces[0].sessions.map(\.id).firstIndex(of: third.id)!)
+    }
+
+    @Test func finalizingTheOnlyPendingSessionDropsItsRecord() {
+        let store = store()
+        let only = addSession(store, name: "one")
+        #expect(store.softCloseSession(only.id, grace: 60))
+
+        #expect(store.finalizePendingClose(ofSession: only.id))
+
+        #expect(store.pendingCloseMembers().isEmpty)
+        #expect(!store.undoPendingClose())
+        #expect(!store.finalizePendingClose(ofSession: only.id))
+    }
+
+    @Test func finalizingOneSessionOfAPendingWorkspaceKeepsTheRest() {
+        let store = store()
+        let first = addSession(store, name: "one")
+        let second = addSession(store, name: "two")
+        store.workspaces.append(Workspace(name: "workspace 2", sessions: []))
+        #expect(store.softRemoveWorkspace(store.workspaces[0].id, grace: 60))
+
+        #expect(store.finalizePendingClose(ofSession: first.id))
+
+        #expect(store.pendingCloseMembers().map(\.session.id).contains(second.id))
+        #expect(!store.pendingCloseMembers().map(\.session.id).contains(first.id))
+        #expect(store.undoPendingClose())
+        #expect(store.session(withID: second.id) != nil)
+        #expect(store.session(withID: first.id) == nil)
+    }
+
     @Test func softClosedWorkspaceContributesEverySessionItHeld() {
         let store = store()
         let session = addSession(store, name: "build")
@@ -108,6 +214,28 @@ struct AppStorePendingCloseTests {
         #expect(members.map(\.session.id) == [session.id])
         #expect(members.first?.workspaceID == target)
         #expect(members.first?.workspaceName == "workspace 1")
+    }
+
+    @Test(arguments: ["session", "batch", "workspace"])
+    func aPendingCloseSessionIsFoundOnlyUntilUndoOrFinalize(path: String) {
+        let store = store()
+        let first = addSession(store, name: "one")
+        let second = addSession(store, name: "two")
+        store.workspaces.append(Workspace(name: "staying", sessions: []))
+        #expect(store.pendingCloseSession(withID: first.id) == nil, "a visible row is not pending")
+
+        switch path {
+        case "session": #expect(store.softCloseSession(first.id, grace: 60))
+        case "batch": #expect(store.softCloseSessions([first.id, second.id], grace: 60))
+        default: #expect(store.softRemoveWorkspace(store.workspaces[0].id, grace: 60))
+        }
+        #expect(store.pendingCloseSession(withID: first.id) === first)
+        #expect(store.undoPendingClose())
+        #expect(store.pendingCloseSession(withID: first.id) == nil)
+
+        #expect(store.softCloseSession(first.id, grace: 60))
+        store.finalizeAllPendingCloses()
+        #expect(store.pendingCloseSession(withID: first.id) == nil)
     }
 
     @Test func finalizingTheGraceDropsTheClaim() {
@@ -158,5 +286,38 @@ struct AppStorePendingCloseTests {
         #expect(store.softRemoveWorkspace(store.workspaces[0].id))
 
         #expect(drops.identities == [session.paneIdentity])
+    }
+
+    @Test func aRemoteRowReportsLeavingOnSoftCloseAndReturningOnUndo() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        var edges: [Bool] = []
+        store.onRemoteRowVisibility = { _, shown in edges.append(shown) }
+        let remote = try #require(store.addSession(toWorkspace: ws.id, cwd: "/tmp", remoteHost: "buildbox"))
+        let local = try #require(store.addSession(toWorkspace: ws.id, cwd: "/tmp"))
+        #expect(edges == [true])
+
+        #expect(store.softCloseSession(remote.id))
+        #expect(edges == [true, false])
+        #expect(store.undoPendingClose())
+        #expect(edges == [true, false, true])
+
+        #expect(store.softCloseSession(local.id))
+        #expect(edges == [true, false, true], "a local row is none of the presentation client's business")
+    }
+
+    @Test func aRemoteRowReportsReturningWhenItsWorkspaceIsRestored() throws {
+        let store = makeStore()
+        _ = store.addWorkspace(name: "keep")
+        let ws = store.addWorkspace(name: "work")
+        var edges: [Bool] = []
+        store.onRemoteRowVisibility = { _, shown in edges.append(shown) }
+        _ = try #require(store.addSession(toWorkspace: ws.id, cwd: "/tmp", remoteHost: "buildbox"))
+
+        #expect(store.softRemoveWorkspace(ws.id))
+        #expect(edges == [true, false])
+        #expect(store.undoPendingClose())
+
+        #expect(edges == [true, false, true])
     }
 }

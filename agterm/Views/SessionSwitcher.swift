@@ -207,8 +207,10 @@ struct SessionSwitcherOverlay: View {
 
     @ViewBuilder private func row(_ id: UUID, selected: Bool) -> some View {
         if let session = store.session(withID: id) {
-            SessionSwitcherRow(title: session.displayName,
-                               subtitle: "\(store.workspace(forSession: id)?.name ?? "") · \(session.subtitleDetail)")
+            SessionSwitcherRow(title: store.listLabel(for: session),
+                               subtitle: "\(store.workspace(forSession: id)?.name ?? "") · \(session.switcherDetail)",
+                               status: session.agentIndicator.status, statusColorHex: session.agentIndicator.color,
+                               statusShape: session.agentIndicator.shape, remote: session.remoteHost != nil)
                 .background(selected ? Color.accentColor.opacity(0.25) : Color.clear)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
         }
@@ -216,8 +218,8 @@ struct SessionSwitcherOverlay: View {
 }
 
 /// Carries the measured row-stack height out of the scroll content, so the panel can size to its rows
-/// instead of to the height it is offered.
-private struct RowsHeightKey: PreferenceKey {
+/// instead of to the height it is offered. Shared with the title-bar attention popover.
+struct RowsHeightKey: PreferenceKey {
     static let defaultValue: Double = 0
     static func reduce(value: inout Double, nextValue: () -> Double) { value = max(value, nextValue()) }
 }
@@ -232,12 +234,12 @@ struct SessionSwitcherRow: View {
     /// Optional themed foreground: nil renders the system label colors (the Ctrl-Tab overlay's look); a set
     /// color themes the title with it and the subtitle at 0.6 opacity (the recent-sessions popover's look).
     var foreground: Color?
-    /// Optional leading agent-status glyph — the attention popover sets it; the Ctrl-Tab overlay and the
-    /// recent-sessions popover leave it nil. `statusColorHex` is the per-call `session.status --color` tint,
-    /// `statusShape` its per-call `--shape` silhouette.
+    /// status is the session's agent indicator, per-call overrides included; nil or idle draws no glyph.
     var status: AgentStatus?
     var statusColorHex: String?
     var statusShape: StatusShape?
+    /// Leads the title with the sidebar's cloud glyph, for a session attached from another Mac.
+    var remote = false
 
     /// Read from the non-observable `GhosttyApp` — both the Ctrl-Tab overlay and the popovers mount fresh
     /// on every open, so neither renders a stale size.
@@ -249,17 +251,22 @@ struct SessionSwitcherRow: View {
 
     var body: some View {
         HStack {
-            if let status { StatusGlyph(status: status, colorHex: statusColorHex, shape: statusShape) }
             VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.system(size: metrics.base))
-                    .foregroundStyle(foreground ?? Color.primary)
+                HStack(spacing: metrics.scaled(4)) {
+                    if remote { Image(systemName: "cloud").accessibilityLabel("Remote") }
+                    Text(title)
+                }
+                .font(.system(size: metrics.base))
+                .foregroundStyle(foreground ?? Color.primary)
                 Text(subtitle)
                     .font(.system(size: metrics.secondary))
                     .foregroundStyle(foreground.map { $0.opacity(0.6) } ?? Color.secondary)
                     .lineLimit(1).truncationMode(.middle)
             }
             Spacer(minLength: 0)
+            if let status, status != .idle {
+                StatusGlyph(status: status, colorHex: statusColorHex, shape: statusShape)
+            }
         }
         .padding(.horizontal, metrics.scaled(12))
         .padding(.vertical, metrics.scaled(6))

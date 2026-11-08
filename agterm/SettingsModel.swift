@@ -19,6 +19,8 @@ final class SettingsModel {
     private(set) var keymap: Keymap = Keymap(builtinOverrides: [:], commands: [])
     /// Problems found while parsing the keymap file, surfaced read-only in the Key Mapping settings tab.
     private(set) var keymapDiagnostics: [KeymapDiagnostic] = []
+    private(set) var hooks = Hooks()
+    private(set) var hooksDiagnostics: [KeymapDiagnostic] = []
 
     /// Coalesces a burst of `previewTheme` calls into one `apply()` instead of rebuilding + reloading every
     /// surface per arrow keypress. `commitTheme` flushes it; `revertThemePreview` drops it.
@@ -47,10 +49,7 @@ final class SettingsModel {
         self.settings = settingsStore.load()
         self.committedTheme = settings.theme
         self.committedDarkTheme = settings.darkTheme
-        // write NOW: GhosttyApp's loadConfig runs in applicationDidFinishLaunching, AFTER this App.init,
-        // and the SEEDED default theme (agterm) is memory-only, never in settings.json — without this the
-        // launch config carries no theme line and the terminal renders ghostty's built-in until the next
-        // settings change. Idempotent: no-ops when the file already matches.
+        // a no-op at launch, where agtermApp.init already wrote it; keeps a model built elsewhere current.
         _ = writeGhosttyConfig()
         // mirror the persisted settings into their shared channels before any settings change fires.
         applyWindowTranslucency()
@@ -72,8 +71,14 @@ final class SettingsModel {
         applyStatusReset()
         applyInterfaceElements()
         applyAutoHideSidebarInactiveWindows()
+        applyFlaggedViewLayout()
+        GhosttyApp.shared.setSessionInfoDisplay(settings.effectiveSessionInfoDisplay)
+        applyHtmlOverlayZoom()
+        TerminalInputSource.shared.setTarget(settings.terminalInputSource)
         ensureStarterKeymap()
         loadKeymap()
+        ensureStarterHooks()
+        loadHooks()
         ensureStarterGhosttyConfig()
         ensureStarterRestoreDenylist()
         loadRestoreDenylist()
@@ -197,6 +202,7 @@ final class SettingsModel {
     /// from `settings.json` on the next save; the Settings picker maps `.compact` back to nil.
     func setToolbarMode(_ mode: ToolbarMode?) { settings.toolbarMode = mode?.rawValue; settings.compactToolbar = nil; persistAndApply() }
     func setNotificationBadgeEnabled(_ value: Bool?) { settings.notificationBadgeEnabled = value; persistAndApply() }
+    func setIgnoreReduceTransparency(_ value: Bool?) { settings.ignoreReduceTransparency = value; persistAndApply() }
     func setDockBounce(_ mode: DockBounce?) { settings.dockBounce = mode?.rawValue; persistAndApply() }
     /// Persist the system sound played when a notification is delivered (nil/empty = none). Not a ghostty
     /// key; the `NotificationManager` mirror is read on the next notification, like `dockBounce`.
@@ -214,6 +220,13 @@ final class SettingsModel {
     func setInactivePaneMuteStrength(_ value: Int?) { settings.inactivePaneMuteStrength = value; persistAndApply() }
     func setSidebarBackgroundShift(_ value: Int?) { settings.sidebarBackgroundShift = value; persistAndApply() }
     func setSidebarFontSize(_ value: Double?) { settings.sidebarFontSize = value; persistAndApply() }
+
+    /// Persist the sidebar row spacing; `standard` is the nil case. An unchanged value skips the write.
+    func setSidebarDensity(_ density: SidebarDensity) {
+        guard density != settings.effectiveSidebarDensity else { return }
+        settings.sidebarDensity = density == .standard ? nil : density.rawValue
+        persistAndApply()
+    }
     func setInterfaceFontSize(_ value: Double?) { settings.interfaceFontSize = value; persistAndApply() }
     func setQuickTerminalSizePercent(_ value: Int?) {
         settings.quickTerminalSizePercent = value
@@ -249,6 +262,40 @@ final class SettingsModel {
         settings.autoHideSidebarInactiveWindows = value
         persistAndApply()
         if value == true { library.applyInactiveWindowSidebarHiding() }
+    }
+
+    /// Persist the flagged view's layout; `flat` is the nil case, keeping `settings.json` minimal. Not a ghostty
+    /// key: it rides `.agtermAppearanceChanged`, which every sidebar reconciles on. An unchanged value skips
+    /// the write so no sidebar rebuilds for nothing.
+    func setFlaggedViewLayout(_ layout: FlaggedViewLayout) {
+        guard layout != settings.effectiveFlaggedViewLayout else { return }
+        settings.flaggedViewLayout = layout == .flat ? nil : layout.rawValue
+        persistAndApply()
+    }
+
+    /// setSessionInfoDisplay persists where info lines draw; `always` is the nil case. Like the flagged layout it
+    /// rides `.agtermAppearanceChanged`, and an unchanged value skips the write.
+    func setSessionInfoDisplay(_ display: SessionInfoDisplay) {
+        guard display != settings.effectiveSessionInfoDisplay else { return }
+        settings.sessionInfoDisplay = display == .always ? nil : display.rawValue
+        persistAndApply()
+    }
+
+    /// Persist where a clicked web link opens; `browser` is the nil case, keeping `settings.json` minimal. Not a
+    /// ghostty key and nothing renders from it: each click reads the setting.
+    func setLinkOpenMode(_ mode: LinkOpenMode) {
+        guard mode != settings.effectiveLinkOpenMode else { return }
+        settings.linkOpenMode = mode == .browser ? nil : mode.rawValue
+        persistAndApply()
+    }
+
+    /// setTerminalInputSource persists the keyboard input source held while an agterm window has the
+    /// keyboard, nil for off, and applies it at once.
+    func setTerminalInputSource(_ id: String?) {
+        guard id != settings.terminalInputSource else { return }
+        settings.terminalInputSource = id
+        try? settingsStore.save(settings)
+        TerminalInputSource.shared.setTarget(id)
     }
 
     /// Show or hide one title-bar / sidebar-footer chrome element (an empty result maps back to nil so
@@ -295,25 +342,47 @@ final class SettingsModel {
     func setNewSessionDirectory(_ value: String?) { settings.newSessionDirectory = value; try? settingsStore.save(settings) }
     /// Persist the fixed directory used when `newSessionDirectory` is `custom` (nil/empty falls back to home).
     func setNewSessionCustomDirectory(_ value: String?) { settings.newSessionCustomDirectory = value; try? settingsStore.save(settings) }
+    /// setNewSessionPlacement persists placement for future session creation; nil restores `end`.
+    func setNewSessionPlacement(_ value: String?) { settings.newSessionPlacement = value; try? settingsStore.save(settings) }
     /// Persist whether a GUI session close first asks for confirmation (nil = off). `AppActions` reads it on
     /// demand at close time, so it just saves.
     func setConfirmCloseSession(_ value: Bool?) { settings.confirmCloseSession = value; try? settingsStore.save(settings) }
     /// Persist whether GUI closes use the short undo grace period. nil = on; false = close immediately.
     func setCloseGraceUndoEnabled(_ value: Bool?) { settings.closeGraceUndoEnabled = value; try? settingsStore.save(settings) }
+    /// stepHtmlOverlayZoom moves every HTML page's zoom by a font binding action and persists it. Saves and
+    /// mirrors only: no chrome or config depends on it.
+    func stepHtmlOverlayZoom(_ action: String) {
+        guard let zoom = HtmlZoom.applying(fontAction: action, to: settings.effectiveHtmlOverlayZoom) else { return }
+        settings.htmlOverlayZoom = zoom == 1 ? nil : zoom
+        try? settingsStore.save(settings)
+        applyHtmlOverlayZoom()
+    }
     /// Persist that the first-run welcome has been shown, so it never appears again on this state directory.
     func setWelcomeShown(_ value: Bool?) { settings.welcomeShown = value; try? settingsStore.save(settings) }
     /// Persist the user-idle auto-follow timeout (nil = off) and push it into every open window's `AppStore`
-    /// (a newly opened window seeds itself via `applyAutoFollow(to:)`).
+    /// (a newly opened window seeds itself via `applyWindowSettings(to:)`).
     func setAutoFollowAttention(_ value: String?) {
         settings.autoFollowAttention = value
         try? settingsStore.save(settings)
-        applyAutoFollowToAllWindows()
+        applyWindowSettingsToAllWindows()
     }
     /// Persist whether auto-follow stays put on a running (`active`) session (nil/false = off) and fan it out.
     func setAutoFollowStayOnActive(_ value: Bool?) {
         settings.autoFollowStayOnActive = value
         try? settingsStore.save(settings)
-        applyAutoFollowToAllWindows()
+        applyWindowSettingsToAllWindows()
+    }
+    /// Persist whether attention navigation also stops on `active` sessions (nil = off) and fan it out.
+    func setAttentionIncludesActive(_ value: Bool?) {
+        settings.attentionIncludesActive = value
+        try? settingsStore.save(settings)
+        applyWindowSettingsToAllWindows()
+    }
+    /// Persist whether attention navigation walks every open window (nil = off) and fan it out.
+    func setAttentionNavigationAcrossWindows(_ value: Bool?) {
+        settings.attentionNavigationAcrossWindows = value
+        try? settingsStore.save(settings)
+        applyWindowSettingsToAllWindows()
     }
 
     /// Apply a new background opacity live WITHOUT saving — the live-drag half of the slider; each tick
@@ -415,7 +484,60 @@ final class SettingsModel {
         settings.configDirectory = value
         try? settingsStore.save(settings)
         reloadKeymap()
+        reloadHooks()
         reloadGhosttyConfig()
+        remotes.watch(remotesURL)
+    }
+
+    /// Re-read `hooks.conf` and post `.agtermHooksChanged` so the scheduler applies it; diagnostics surface as
+    /// a banner like the keymap's.
+    func reloadHooks() {
+        loadHooks()
+        NotificationCenter.default.post(name: .agtermHooksChanged, object: nil)
+        if !hooksDiagnostics.isEmpty {
+            NotificationManager.shared.notifyHooksDiagnostics(count: hooksDiagnostics.count)
+        }
+    }
+
+    /// remotesURL is the resolved `remotes.conf`, beside `keymap.conf`.
+    var remotesURL: URL { ConfigPaths.remotesPath(configDirectory: configDirectoryURL()) }
+
+    /// remotes follows `remotes.conf` on disk; File ▸ Attach Remote lists its entries.
+    @ObservationIgnored private(set) lazy var remotes = RemotesWatcher(url: remotesURL) {
+        NotificationManager.shared.notifyRemotesDiagnostics(count: $0)
+    }
+
+    /// The resolved `hooks.conf` path: `<config dir>/hooks.conf`, beside `keymap.conf`.
+    var hooksPath: String { ConfigPaths.hooksPath(configDirectory: configDirectoryURL()).path }
+
+    private func loadHooks() {
+        let url = ConfigPaths.hooksPath(configDirectory: configDirectoryURL())
+        do {
+            let parsed = parseHooksConf(try String(contentsOf: url, encoding: .utf8))
+            hooks = parsed.hooks
+            hooksDiagnostics = parsed.diagnostics
+        } catch {
+            // a missing file means no hooks; an existing file that cannot be read must not read as clean,
+            // or a reload would silently retire every hook
+            hooks = Hooks()
+            hooksDiagnostics = FileManager.default.fileExists(atPath: url.path)
+                ? [KeymapDiagnostic(line: 0, message: "could not read hooks.conf: \(error.localizedDescription)")]
+                : []
+        }
+    }
+
+    /// Write the commented starter `hooks.conf` (and its directory) when none exists. Also the Edit Hooks
+    /// entry point: the file can be missing after a config-directory change or a manual delete.
+    func ensureStarterHooks() {
+        let url = ConfigPaths.hooksPath(configDirectory: configDirectoryURL())
+        if FileManager.default.fileExists(atPath: url.path) { return }
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try ConfigPaths.starterHooksConf().write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            logger.notice("could not write starter hooks at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     /// Re-read `keymap.conf` and post `.agtermKeymapChanged` so the custom-command runner and action palette
@@ -430,12 +552,13 @@ final class SettingsModel {
         }
     }
 
-    /// The resolved config directory: the explicit setting, else `AGTERM_STATE_DIR/config` (test
-    /// isolation), else `~/.config/agterm`. Both `keymap.conf` and `ghostty.conf` live here.
+    /// configDirectoryURL follows `ConfigPaths.configDirectory`'s precedence. Both `keymap.conf` and
+    /// `ghostty.conf` live here.
     private func configDirectoryURL() -> URL {
         ConfigPaths.configDirectory(
             setting: settings.configDirectory,
-            stateDir: ProcessInfo.processInfo.environment["AGTERM_STATE_DIR"],
+            stateDir: DebugStateDirectory.configStateDirectory(environment: ProcessInfo.processInfo.environment,
+                                                               liveDirectory: PersistenceStore.defaultDirectory),
             home: FileManager.default.homeDirectoryForCurrentUser)
     }
 
@@ -586,8 +709,9 @@ final class SettingsModel {
     private func starterGhosttyConfigText() -> String {
         """
         # agterm-scoped ghostty config — applies ONLY to agterm, not the standalone Ghostty.app.
-        # Put any ghostty config key here to override agterm's bundled defaults and your global
+        # Put any ghostty terminal config key here to override agterm's bundled defaults and your global
         # ~/.config/ghostty/config. Full key reference: https://ghostty.org/docs/config
+        # Keys for Ghostty.app's own window and split chrome are mostly not read; split-divider-color is.
         #
         # Edit this file and run File ▸ Reload Config (or relaunch) to apply. Blank lines and lines
         # starting with `#` are ignored. Most keys apply to open terminals on reload, but layout keys
@@ -603,6 +727,7 @@ final class SettingsModel {
         # NOT SUPPORTED: the `ssh-env` and `ssh-terminfo` shell-integration features. They work by
         # wrapping `ssh` as a call to the `ghostty` CLI absent from agterm's bundle,
         # so agterm forces them back off. Your other shell-integration-features flags are kept.
+        # To install the terminfo entry on a remote host once: agtermctl terminfo install <host>
         #
         # NO EFFECT: an `env` line naming a variable agterm injects into the shell (`TERM_PROGRAM`,
         # `TERM_PROGRAM_VERSION`, `AGTERM_*`). agterm applies those after this file. Other `env` keys
@@ -654,6 +779,8 @@ final class SettingsModel {
         applyStatusReset()
         applyInterfaceElements()
         applyAutoHideSidebarInactiveWindows()
+        applyFlaggedViewLayout()
+        GhosttyApp.shared.setSessionInfoDisplay(settings.effectiveSessionInfoDisplay)
         // refresh the chrome (title bar + sidebar + quick terminal) for the new terminal color,
         // translucency and toolbar style now, not at the next window re-key.
         NotificationCenter.default.post(name: .agtermAppearanceChanged, object: nil)
@@ -661,7 +788,8 @@ final class SettingsModel {
 
     private func applyWindowTranslucency() {
         GhosttyApp.shared.setWindowTranslucency(opacity: settings.backgroundOpacity ?? 1,
-                                                blurRadius: settings.backgroundBlur ?? 0)
+                                                blurRadius: settings.backgroundBlur ?? 0,
+                                                ignoreReduceTransparency: settings.ignoreReduceTransparency == true)
     }
 
     private func applyNotificationsEnabled() {
@@ -700,22 +828,37 @@ final class SettingsModel {
         GhosttyApp.shared.setHiddenInterfaceElements(settings.resolvedHiddenInterfaceElements)
     }
 
+    // the one setter of both copies: GhosttyApp's drives rendering, the library's drives navigation
+    private func applyFlaggedViewLayout() {
+        GhosttyApp.shared.setFlaggedViewLayout(settings.effectiveFlaggedViewLayout)
+        library.setFlaggedLayout(settings.effectiveFlaggedViewLayout)
+    }
+
+    private func applyHtmlOverlayZoom() {
+        HtmlOverlayRegistry.shared.setZoom(settings.effectiveHtmlOverlayZoom)
+    }
+
     private func applyAutoHideSidebarInactiveWindows() {
         GhosttyApp.shared.setAutoHideSidebarInactiveWindows(settings.autoHideSidebarInactiveWindows ?? false)
     }
 
-    /// Push the current auto-follow configuration into one window's store, from `ContentView.resolveStore`
-    /// so a newly opened window honors the setting. The store is host-free and can't read settings itself.
-    func applyAutoFollow(to store: AppStore) {
+    /// Push the per-window settings (auto-follow, attention navigation) into one window's store, from
+    /// `ContentView.resolveStore` so a newly opened window honors them. The store is host-free and can't
+    /// read settings itself.
+    func applyWindowSettings(to store: AppStore) {
         let timeout = AppSettings.AutoFollowAttention(tolerant: settings.autoFollowAttention).timeout
         store.setAutoFollow(timeout: timeout, stayOnActive: settings.autoFollowStayOnActive ?? false)
+        store.attentionIncludesActive = settings.attentionIncludesActive ?? false
+        let acrossWindows = settings.attentionNavigationAcrossWindows ?? false
+        if store.attentionNavigationAcrossWindows != acrossWindows { store.attentionNavigationAcrossWindows = acrossWindows }
     }
 
-    /// Fan auto-follow out to every open window's store — the settings-change broadcast and the launch seed
-    /// from the scene `.task`. Idempotent: re-pushing the same values no-ops in `AppStore.setAutoFollow`.
-    func applyAutoFollowToAllWindows() {
+    /// Fan the per-window settings out to every open window's store — the settings-change broadcast and the
+    /// launch seed from the scene `.task`. Idempotent: re-pushing the same values no-ops in
+    /// `AppStore.setAutoFollow`.
+    func applyWindowSettingsToAllWindows() {
         for store in library.openIDs().compactMap({ library.store(for: $0) }) {
-            applyAutoFollow(to: store)
+            applyWindowSettings(to: store)
         }
     }
 
@@ -731,6 +874,7 @@ final class SettingsModel {
 
     private func applySidebarFontSize() {
         GhosttyApp.shared.setSidebarFontSize(settings.effectiveSidebarFontSize)
+        GhosttyApp.shared.setSidebarDensity(settings.effectiveSidebarDensity)
     }
 
     private func applyInterfaceFontSize() {
@@ -757,9 +901,12 @@ final class SettingsModel {
                                                completed: settings.effectiveStatusShape(for: .completed))
     }
 
+    private func writeGhosttyConfig() -> Bool { Self.writeGhosttyConfig(settings) }
+
     /// Write the ghostty config lines (font/size/theme + the translucency pins) to the file
     /// `GhosttyApp.loadConfig` reads. Returns true when the content changed, so the caller can skip the reload.
-    private func writeGhosttyConfig() -> Bool {
+    /// `agtermApp.init` calls it before libghostty boots, which loads the file once.
+    static func writeGhosttyConfig(_ settings: AppSettings) -> Bool {
         let url = GhosttyApp.settingsConfigURL
         // emit the raw single/dual theme, no appearance resolution: a dual value is stable across flips,
         // so `appearanceChanged` reloads directly rather than diffing this text.
@@ -770,13 +917,15 @@ final class SettingsModel {
         return true
     }
 
-    /// Every live ghostty surface: all open windows' sessions (primary + split + scratch) and quick terminals.
+    /// Every live ghostty surface: all open windows' sessions (primary, split, scratch, and the session-wide
+    /// and pane overlays) and quick terminals.
     private func liveSurfaces() -> [GhosttySurfaceView] {
         var views = library.openIDs()
             .compactMap { library.store(for: $0) }
             .flatMap(\.workspaces)
             .flatMap(\.sessions)
-            .flatMap { [$0.surface, $0.splitSurface, $0.scratchSurface] }
+            .flatMap { [$0.surface, $0.splitSurface, $0.scratchSurface, $0.overlaySurface, $0.leftOverlaySurface,
+                        $0.rightOverlaySurface] }
             .compactMap { $0 as? GhosttySurfaceView }
         views += [QuickTerminalController.shared.currentSurface()].compactMap { $0 }
         return views

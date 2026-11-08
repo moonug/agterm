@@ -21,16 +21,33 @@ public enum Command: String, Codable, Sendable {
     case workspaceFilter = "workspace.filter"
     case workspaceCollapse = "workspace.collapse"
     case workspaceExpand = "workspace.expand"
+    case workspaceFlag = "workspace.flag"
+    case workspaceTint = "workspace.tint"
     case sessionType = "session.type"
     case sessionStatus = "session.status"
     case sessionFlag = "session.flag"
     case sessionContext = "session.context"
+    case sessionInfo = "session.info"
+    case sessionTint = "session.tint"
     case sessionSeen = "session.seen"
     case sessionRestore = "session.restore"
+    case sessionCollapse = "session.collapse"
+    case sessionCompanionNew = "session.companion.new"
+    case sessionCompanionPage = "session.companion.page"
+    /// sessionPage creates a top-level page session; its own command so an older app refuses it.
+    case sessionPage = "session.page"
+    case sessionCompanionDuplicate = "session.companion.duplicate"
+    case sessionCompanionConvert = "session.companion.convert"
+    /// A viewer asking for one attachment of a page companion: a single-use token for `session.overlay.page.serve`
+    /// plus what the page shows.
+    case sessionCompanionPageAttach = "session.companion.page.attach"
+    case sessionExpand = "session.expand"
+    case sessionRestart = "session.restart"
     case sessionBackground = "session.background"
     case sessionSplit = "session.split"
     case sessionSplitClose = "session.split.close"
     case sessionSwap = "session.swap"
+    case sessionLead = "session.lead"
     case sessionScratch = "session.scratch"
     case sessionFocus = "session.focus"
     case sessionResize = "session.resize"
@@ -46,9 +63,18 @@ public enum Command: String, Codable, Sendable {
     case sessionOverlayOpen = "session.overlay.open"
     case sessionOverlayClose = "session.overlay.close"
     case sessionOverlayResize = "session.overlay.resize"
+    case sessionOverlayReload = "session.overlay.reload"
+    case sessionOverlayNavigate = "session.overlay.navigate"
     case sessionOverlayResult = "session.overlay.result"
+    case sessionOverlaySubmit = "session.overlay.submit"
     case sessionOverlayCopy = "session.overlay.copy"
     case sessionOverlayText = "session.overlay.text"
+    case sessionOverlayHide = "session.overlay.hide"
+    case sessionOverlayShow = "session.overlay.show"
+    case sessionOverlayToggle = "session.overlay.toggle"
+    case sessionOverlayFollow = "session.overlay.follow"
+    case sessionOverlaySearch = "session.overlay.search"
+    case sessionOverlayChanges = "session.overlay.changes"
     case sessionHudOpen = "session.hud.open"
     case sessionHudUpdate = "session.hud.update"
     case sessionHudClose = "session.hud.close"
@@ -57,6 +83,8 @@ public enum Command: String, Codable, Sendable {
     case quickText = "quick.text"
     case sidebar
     case sidebarMode = "sidebar.mode"
+    case sidebarFlaggedLayout = "sidebar.flagged-layout"
+    case sidebarDensity = "sidebar.density"
     case sidebarExpand = "sidebar.expand"
     case sidebarCollapse = "sidebar.collapse"
     case sidebarWidth = "sidebar.width"
@@ -67,6 +95,7 @@ public enum Command: String, Codable, Sendable {
     case windowNew = "window.new"
     case windowList = "window.list"
     case windowSelect = "window.select"
+    case windowGo = "window.go"
     case windowClose = "window.close"
     case windowRename = "window.rename"
     case windowDelete = "window.delete"
@@ -77,6 +106,11 @@ public enum Command: String, Codable, Sendable {
     case windowMinimize = "window.minimize"
     case keymapReload = "keymap.reload"
     case keymapList = "keymap.list"
+    case keymapRun = "keymap.run"
+    case hooksReload = "hooks.reload"
+    case hooksList = "hooks.list"
+    case browserClear = "browser.clear"
+    case browserLinks = "browser.links"
     case configReload = "config.reload"
     case themeSet = "theme.set"
     case themeList = "theme.list"
@@ -86,6 +120,9 @@ public enum Command: String, Codable, Sendable {
     case askOpen = "ask.open"
     case askResult = "ask.result"
     case askCancel = "ask.cancel"
+    case msgSend = "msg.send"
+    case msgRead = "msg.read"
+    case msgAck = "msg.ack"
     case restoreClear = "restore.clear"
     case version = "version"
     case restoreCapture = "restore.capture"
@@ -96,6 +133,19 @@ public enum Command: String, Codable, Sendable {
     case zmxReset = "zmx.reset"
     case zmxTree = "zmx.tree"
     case zmxAttach = "zmx.attach"
+    /// zmxAttachGroup is its own command, not a flag on `zmx.attach`, so an app that predates it fails to
+    /// decode the request and creates nothing instead of attaching one row.
+    case zmxAttachGroup = "zmx.attach.group"
+    case zmxPresent = "zmx.present"
+    case zmxScreen = "zmx.screen"
+    case recentList = "recent.list"
+    case recentOpen = "recent.open"
+    case recentClear = "recent.clear"
+    /// A viewer's helper claiming a remote overlay job; after an ok reply the connection carries job frames.
+    case sessionOverlayJobRun = "session.overlay.job.run"
+    /// sessionOverlayPageServe is a viewer's helper claiming a handed-over page by its single-use token; after an
+    /// ok reply the connection carries page channel frames.
+    case sessionOverlayPageServe = "session.overlay.page.serve"
     /// UI-TEST-ONLY: forces the app-level appearance (`light`|`dark` via `args.name`) so an XCUITest can
     /// simulate a macOS light/dark flip; with NO name it READS the side the last config feed applied, so a
     /// test can assert the flip drove the reload. Refused outside an XCUITest launch, and EXEMPT from the
@@ -115,6 +165,8 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     /// Additional session targets for batch-capable commands (`session.close`, `session.move`). When set,
     /// the command uses this ordered list instead of the top-level single `target`.
     public var targets: [String]?
+    /// For `session.close`: ask for the undo grace and a `result.undoable` answer.
+    public var undoable: Bool?
     /// Target workspace for `session.new` (the workspace to add to) and `session.move` (the destination).
     /// Resolved by id / unique prefix / `active`, never by name — use `workspaceName` for name targeting.
     public var workspace: String?
@@ -128,6 +180,11 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     /// fill it with `session.new --no-select` without it opening. Omitted/`false` = expanded; read back as
     /// the `tree` workspace node's `collapsed`.
     public var collapsed: Bool?
+    /// The tint color for `session.tint`/`workspace.tint` mode `set`, and the creation tint on `session.new`
+    /// and `workspace.new`; a `TintColor` name or a `#rrggbb` hex (`TintValue`).
+    public var tint: String?
+    /// The row parts the tint colors (`icon`, `name`); omitted on a set keeps the stored parts, else icon.
+    public var tintOn: [String]?
     /// For `window.new`: create the window already MINIMIZED to the Dock (the CLI's `--minimized`), so a
     /// script can build project windows without each flashing on screen and stealing focus; omitted/`false`
     /// presents it. Read back as the `window.list` node's `minimized`. The new window also hands frontmost
@@ -149,7 +206,8 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     public var select: Bool?
     /// Mode for `session.split` (`on|off|toggle`), `quick`/`surface.zoom` (`show|hide|toggle`),
     /// `session.flag` (`on|off|toggle|clear`), `sidebar.mode` (`tree|flagged|toggle`),
-    /// `workspace.focus` (`on|off|toggle|add`), `workspace.filter`/`window.minimize` (`on|off|toggle`),
+    /// `sidebar.flagged-layout` (`flat|plain|tree|toggle`), `sidebar.density` (`default|compact|toggle`),
+    /// `workspace.focus` (`on|off|toggle|add`), `workspace.filter`/`workspace.flag`/`window.minimize` (`on|off|toggle`),
     /// `session.background` (`image|text|color|clear`), `session.restore` (`set|none|clear` — pin
     /// `command`, pin nothing, or drop the pin), and `session.context` (`set|clear`).
     public var mode: String?
@@ -173,7 +231,7 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     /// place.
     public var textColor: String?
     /// The per-call glyph-SILHOUETTE override for `session.status`: a `StatusShape` raw value
-    /// (`circle|square|triangle|diamond|capsule|star`), dispatcher-validated. Rides the ephemeral indicator,
+    /// (`StatusShape.validNamesList`), dispatcher-validated. Rides the ephemeral indicator,
     /// lasting until the next `session.status` without a shape; nil = the Settings shape, else a circle.
     public var shape: String?
     /// The `background-image-opacity` for `session.background` (image + text), 0...1; nil = ghostty's 1.0.
@@ -203,12 +261,9 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     /// unaffected. A pane overlay is always full-pane, so
     /// `--pane` conflicts with `session.overlay.open --size-percent` and `session.overlay.resize` refuses it.
     public var pane: String?
-    /// A surface's STABLE spawn token for `session.status`/`session.restore`/`session.text`/`session.hud.*`
-    /// (the shell's baked `AGTERM_PANE_ID`, forwarded by the agent-status hook). Resolving it against the session's
-    /// live surfaces OVERRIDES the stale role `pane`, so a call from a moved pane reaches the CURRENT slot;
-    /// empty/unknown falls back to `pane`. Opaque — validated only by resolving.
-    /// `session.restore` and `session.hud.*` diverge: an unresolvable token with NO explicit `pane` errors
-    /// rather than silently choosing session-wide or main placement. See `Session.paneRole(forToken:)`, #199.
+    /// paneID is the stable `AGTERM_PANE_ID` token; a known id overrides `pane` and an empty one counts as
+    /// absent. An unknown id needs an explicit `pane` to fall back on, except for `session.status`, which
+    /// always falls back, and `surface.cursor`, which never does.
     public var paneID: String?
     /// Strict guard for `session.type`: the UUID must name the explicit `pane` slot AND its realized surface
     /// token, never a redirect to wherever that token moved. Unlike `paneID`, a mismatch is an error.
@@ -228,7 +283,7 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     /// Direction for `session.go` (`next`|`prev`|`previous`|`first`|`last`), for `workspace.go`
     /// (`next`|`prev`|`previous` — a workspace has no attention state and no ends to jump to), for the
     /// reorder form of `session.move` / `workspace.move` (`up`|`down`|`top`|`bottom`), and for
-    /// `session.search` (`next`|`prev`|`close`).
+    /// `session.search` (`next`|`prev`|`close`), and `session.overlay.navigate` (`back`|`forward`|`browser`|`finder`).
     public var to: String?
     /// Anchor session (id / unique prefix / `active`) to place a session right AFTER, for the placement form
     /// of `session.new`/`session.move`. The anchor carries its own workspace (resolved across the whole
@@ -264,8 +319,8 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     /// For `session.overlay.resize`, requests the full-pane (translucent, session-hidden) overlay — the way
     /// to switch a floating overlay back to full. Mutually exclusive with `sizePercent`.
     public var full: Bool?
-    /// For `session.overlay.open`, whether to select the target after opening; omitted/false opens in the
-    /// background without changing the active session (the default for full and floating overlays alike).
+    /// Whether `session.overlay.open` and a showing `session.scratch` select their target; omitted/false
+    /// leaves the active session alone. For `pick.open` and `ask.open` it raises the owning window instead.
     public var follow: Bool?
     /// The HUD panel's headline for `session.hud.open`/`.update` — required and non-empty on both, since an
     /// update with nothing to say is a close. Wrapped app-side; control characters are rejected.
@@ -282,6 +337,19 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     /// style or nothing and the dispatcher has one thing to validate.
     /// The box reserves the glyph's cells either way, so toggling it cannot rewrap the message.
     public var spinner: String?
+    /// Seconds after which a HUD takes itself down, for `session.hud.open`/`.update`; nil/omitted or 0 leaves
+    /// it up until something closes it. Each successful open or update restarts the interval, so an update
+    /// that omits it cancels the previous one, exactly as omitting `detail` drops the second line.
+    public var hideAfter: Double?
+    /// markdown renders the HUD message as markdown for `session.hud.open`/`.update`; nil/omitted is plain.
+    /// An update omitting it returns the panel to plain text, the whole spec being replaced.
+    public var markdown: Bool?
+    /// sticky puts a HUD flush against the edge or corner its `position` names, for `session.hud.open`/
+    /// `.update`; nil/omitted keeps the edge margin.
+    public var sticky: Bool?
+    /// frame false drops a HUD's border, rounding and blank rows, for `session.hud.open`/`.update`;
+    /// nil/omitted is framed.
+    public var frame: Bool?
     /// The finished caller-provided choices for `pick.open`.
     public var items: [ControlPickItem]?
     /// Optional placeholder text for `pick.open`'s query field.
@@ -290,6 +358,9 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     public var query: String?
     /// Whether `pick.open` accepts the current query as a custom result.
     public var allowCustom: Bool?
+    /// The item id `pick.open` highlights on open; distinct from `select`, the Bool behind
+    /// `session.type --select`.
+    public var selection: String?
     /// buttons are the caller-ordered choices for ask.open.
     public var buttons: [ControlAskButton]?
     /// defaultButton identifies the initially highlighted ask button.
@@ -300,12 +371,28 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     public var align: String?
     /// destructiveButton identifies the ask button styled as destructive.
     public var destructiveButton: String?
+    /// cancelButton identifies the ask button that resolves `escaped`, as Esc does.
+    public var cancelButton: String?
+    /// input is `line` or `multiline`, giving `ask.open` a text field.
+    public var input: String?
+    /// placeholder is the hint an empty `ask.open` text field shows.
+    public var placeholder: String?
+    /// choices gives `ask.open` a radio or checkbox list, in caller order.
+    public var choices: [ControlAskChoice]?
+    /// multiple makes an `ask.open` choice list checkboxes instead of radio buttons.
+    public var multiple: Bool?
+    /// checked lists the `ask.open` choice ids selected at open.
+    public var checked: [String]?
+    /// other adds a free-form row after an `ask.open` choice list; the value is its placeholder.
+    public var other: String?
     /// Target window whose tree a session/workspace/tree/font command operates on: id / prefix / `active`
     /// (= frontmost).
     public var window: String?
-    /// width is window.resize width in points, or ask.open width as an integer percent (10...100).
+    /// width is window.resize width in points, ask.open width as an integer percent (10...100), or a floating
+    /// overlay's content width in points for session.overlay.open/resize.
     public var width: Int?
-    /// New window frame height in points for `window.resize`.
+    /// height is window.resize height in points, or a floating overlay's content height in points for
+    /// session.overlay.open/resize.
     public var height: Int?
     /// The sidebar divider position in points for `sidebar.width`, clamped server-side to
     /// `AppStore.sidebarWidthMin...sidebarWidthMax`. `Double`, not `width`'s `Int`: the divider drag writes a
@@ -336,7 +423,9 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     /// exclusive with targets (the ids to open) and with the font flags — closing takes no other argument.
     public var close: Bool?
     /// The absolute cell font size in points for `dashboard` (the CLI's `--font-size`); must be positive.
-    /// Mutually exclusive with `autoSize`.
+    /// Mutually exclusive with `autoSize`. Also the HUD panel's point size for `session.hud.open`, nil to
+    /// inherit the session's, within `HudSpec.fontSizeRange`; `session.hud.update` rejects it because the
+    /// surface reads it once at creation.
     public var fontSize: Double?
     /// For `dashboard`, size the cells RELATIVE to the Settings default font size, shrinking as the grid
     /// grows so dense grids stay readable (the CLI's `--auto-size`). Mutually exclusive with `fontSize`.
@@ -345,6 +434,49 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     /// fewer if the window has fewer) instead of explicit ids (the CLI's `--mru`). Mutually exclusive with
     /// `targets`/`close`, composes with the font flags; resolved app-side, which needs the store's recency.
     public var mru: Bool?
+    /// html is the absolute path of the page `session.overlay.open --html` shows instead of running `command`; `cwd`
+    /// is then WebKit's read grant.
+    public var html: String?
+    /// current makes `session.overlay.reload` reload the page the user navigated to, not the original file.
+    public var current: Bool?
+    /// navigation gives an `--html` or `--url` overlay its toolbar.
+    public var navigation: Bool?
+    /// url is the web page `session.overlay.open --url` shows instead of running `command`.
+    public var url: String?
+    /// javascript lets an `--html` or `--url` page run its own scripts (`--js`); off by default.
+    public var javascript: Bool?
+    /// chromeless opens an `--html` page, or a `--url` page on a loopback host, with no identity strip (`--chromeless`).
+    public var chromeless: Bool?
+    /// persistent opens a `--url` page on the saved browser store (`--persistent`) instead of an in-memory one.
+    public var persistent: Bool?
+    /// browse lets a `--url` page's main frame leave its first origin for any HTTP(S) site (`--browse`).
+    public var browse: Bool?
+    /// image is the absolute path of the picture `session.overlay.open --image` shows instead of running `command`.
+    public var image: String?
+    /// markdownFile is the absolute path of the markdown file `session.overlay.open --markdown` renders; its
+    /// own field because `markdown` is the HUD's flag.
+    public var markdownFile: String?
+    /// textFile is the absolute path of the file `session.overlay.open --text` shows read-only, taken literally.
+    public var textFile: String?
+    /// line is the line, from 1, a `textFile` page opens scrolled to and marks.
+    public var line: Int?
+    /// tail makes a `textFile` page a log page showing its last N lines; followFile makes it follow the file's
+    /// end, with `TextPage.defaultTail` lines when no tail is given.
+    public var tail: Int?
+    public var followFile: Bool?
+    /// value is the answer `session.overlay.submit` hands back from a page, empty being a real answer, or
+    /// the initial text of an `ask.open` input field.
+    public var value: String?
+    /// page is the page id `session.overlay.result` reads the outcome of, instead of a program's exit status.
+    public var page: String?
+    /// recipients are the `SESSION:PANE` addresses `msg.send --to` names; the scalar `to` keeps its navigation meaning.
+    public var recipients: [String]?
+    /// identity is the `SESSION:PANE-ID` the caller acts as on `msg.*`.
+    public var identity: String?
+    /// ack makes `msg.read` remove the batch it returns.
+    public var ack: Bool?
+    /// ids are the message ids `msg.ack` removes.
+    public var ids: [String]?
 
     public init(name: String? = nil, cwd: String? = nil, targets: [String]? = nil,
                 workspace: String? = nil, workspaceName: String? = nil,
@@ -354,8 +486,9 @@ public struct ControlArgs: Codable, Sendable, Equatable {
                 text: String? = nil, select: Bool? = nil, mode: String? = nil, axis: String? = nil,
                 command: String? = nil, splitCommand: String? = nil, wait: Bool? = nil, sizePercent: Int? = nil, full: Bool? = nil,
                 follow: Bool? = nil, message: String? = nil, detail: String? = nil, spinner: String? = nil,
+                hideAfter: Double? = nil, markdown: Bool? = nil, sticky: Bool? = nil, frame: Bool? = nil,
                 items: [ControlPickItem]? = nil, prompt: String? = nil,
-                query: String? = nil, allowCustom: Bool? = nil,
+                query: String? = nil, allowCustom: Bool? = nil, selection: String? = nil,
                 buttons: [ControlAskButton]? = nil, defaultButton: String? = nil,
                 destructiveButton: String? = nil, style: String? = nil, align: String? = nil, window: String? = nil,
                 pane: String? = nil, paneID: String? = nil, expectedPaneID: String? = nil, to: String? = nil,
@@ -369,7 +502,16 @@ public struct ControlArgs: Codable, Sendable, Equatable {
                 opacity: Double? = nil, fit: String? = nil,
                 position: String? = nil, repeats: Bool? = nil, all: Bool? = nil, lines: Int? = nil,
                 light: String? = nil, dark: String? = nil,
-                close: Bool? = nil, fontSize: Double? = nil, autoSize: Bool? = nil, mru: Bool? = nil) {
+                close: Bool? = nil, fontSize: Double? = nil, autoSize: Bool? = nil, mru: Bool? = nil,
+                html: String? = nil, current: Bool? = nil, navigation: Bool? = nil, url: String? = nil,
+                javascript: Bool? = nil, value: String? = nil, page: String? = nil, chromeless: Bool? = nil,
+                persistent: Bool? = nil, browse: Bool? = nil, image: String? = nil, markdownFile: String? = nil, textFile: String? = nil, line: Int? = nil,
+                tail: Int? = nil, followFile: Bool? = nil,
+                cancelButton: String? = nil, input: String? = nil,
+                placeholder: String? = nil, choices: [ControlAskChoice]? = nil, multiple: Bool? = nil,
+                checked: [String]? = nil, other: String? = nil, undoable: Bool? = nil,
+                tint: String? = nil, tintOn: [String]? = nil, recipients: [String]? = nil,
+                identity: String? = nil, ack: Bool? = nil, ids: [String]? = nil) {
         self.name = name
         self.cwd = cwd
         self.targets = targets
@@ -377,6 +519,8 @@ public struct ControlArgs: Codable, Sendable, Equatable {
         self.workspaceName = workspaceName
         self.createWorkspace = createWorkspace
         self.collapsed = collapsed
+        self.tint = tint
+        self.tintOn = tintOn
         self.minimized = minimized
         self.force = force
         self.host = host
@@ -394,10 +538,15 @@ public struct ControlArgs: Codable, Sendable, Equatable {
         self.message = message
         self.detail = detail
         self.spinner = spinner
+        self.hideAfter = hideAfter
+        self.markdown = markdown
+        self.sticky = sticky
+        self.frame = frame
         self.items = items
         self.prompt = prompt
         self.query = query
         self.allowCustom = allowCustom
+        self.selection = selection
         self.buttons = buttons
         self.defaultButton = defaultButton
         self.style = style
@@ -443,6 +592,34 @@ public struct ControlArgs: Codable, Sendable, Equatable {
         self.fontSize = fontSize
         self.autoSize = autoSize
         self.mru = mru
+        self.html = html
+        self.current = current
+        self.navigation = navigation
+        self.url = url
+        self.javascript = javascript
+        self.value = value
+        self.page = page
+        self.chromeless = chromeless
+        self.persistent = persistent
+        self.browse = browse
+        self.image = image
+        self.markdownFile = markdownFile
+        self.textFile = textFile
+        self.line = line
+        self.tail = tail
+        self.followFile = followFile
+        self.cancelButton = cancelButton
+        self.input = input
+        self.placeholder = placeholder
+        self.choices = choices
+        self.multiple = multiple
+        self.checked = checked
+        self.other = other
+        self.undoable = undoable
+        self.recipients = recipients
+        self.identity = identity
+        self.ack = ack
+        self.ids = ids
     }
 }
 
@@ -501,8 +678,8 @@ public struct ControlResult: Codable, Sendable, Equatable {
     /// from. Without the echo a caller cannot tell an out-of-range request from an honored one, both
     /// answering ok.
     public var sidebarWidth: Double?
-    /// pane is the role written by session.restore or the pane anchor resolved by ask.open.
-    /// session.restore reports it on every success, including the default-to-main path.
+    /// pane is the pane session.restore wrote, session.text read or session.type typed into, or the anchor
+    /// ask.open resolved. The first three report it on every success, the default-pane paths included.
     public var pane: String?
     /// The light/dark syncing state for `theme.set`/`theme.list`, from the stored theme: `sync` = whether it
     /// is ghostty's dual `light:,dark:` form (the terminal tracks the macOS appearance), `light`/`dark` its
@@ -514,6 +691,8 @@ public struct ControlResult: Codable, Sendable, Equatable {
     public var events: ControlEventBatch?
     /// The resolved keymap plus the live menu key equivalents, for `keymap.list`.
     public var keymap: ControlKeymap?
+    /// The hook definitions and their live state, for `hooks.list`.
+    public var hooks: ControlHooks?
     /// The current or terminal picker outcome for `pick.result`.
     public var pick: ControlPickResult?
     /// ask is the current or terminal dialog outcome for ask.result.
@@ -522,6 +701,9 @@ public struct ControlResult: Codable, Sendable, Equatable {
     public var cursor: ControlCursor?
     /// The app serving this socket, for `version`. The same value `tree` carries.
     public var app: AppIdentity?
+    /// The build metadata of the bundle on disk, for `version`. Omitted when it cannot be read, which
+    /// means unknown, never "same as `app`".
+    public var installed: AppIdentity?
     /// The restore-mode policy for `restore.mode`, and the header `zmx list` repeats so its rows can be
     /// read without a second call.
     public var restore: ControlRestoreStatus?
@@ -531,6 +713,35 @@ public struct ControlResult: Codable, Sendable, Equatable {
     public var remote: ControlRemoteTree?
     /// What `zmx.reset` confirmed: the sessions and panes it will reset at the next launch.
     public var liveReset: ControlLiveResetStatus?
+    /// The page `session.overlay.open --html` opened, which `session.overlay.result --page` reads back.
+    public var pageID: String?
+    /// A page's selector outcome for `session.overlay.result --page`.
+    public var pageOutcome: ControlHtmlPageOutcome?
+    /// restart is what `session.restart` replaced: the pane's stable id and its shell before and after.
+    public var restart: ControlRestartReceipt?
+    /// The Recent Closed entries for `recent.list`, newest first.
+    public var recent: [ControlRecentItem]?
+    /// What `recent.open` reopened and where.
+    public var recentOpen: ControlRecentOpen?
+    /// Whether `session.close --undoable` left the close undoable; absent for a plain close.
+    public var undoable: Bool?
+    /// The new companion's parent id, the receipt a companion creation answers with.
+    public var parent: String?
+    /// Every session id `session.close` closed, a parent's companions included.
+    public var closed: [String]?
+    /// The page a `session.companion.page.attach` handed out, token included.
+    public var companionPage: PresentationPage?
+    /// messageID is the id every copy of a `msg.send` shares.
+    public var messageID: String?
+    /// delivered and rejected are `msg.send`'s per-recipient results.
+    public var delivered: [String]?
+    public var rejected: [MessageRejection]?
+    /// messages are the oldest of the reader's mailbox; remaining counts the pending ones left out.
+    public var messages: [BusMessage]?
+    public var remaining: Int?
+    /// acked names the messages removed, present on every `msg.ack` and `msg.read --ack` reply, empty included.
+    public var acked: [String]?
+    public var remoteGroup: ControlRemoteGroup?
 
     public init(id: String? = nil, tree: ControlTree? = nil, text: String? = nil,
                 windows: [ControlWindowNode]? = nil, exitCode: Int? = nil, count: Int? = nil,
@@ -538,18 +749,42 @@ public struct ControlResult: Codable, Sendable, Equatable {
                 theme: String? = nil, themes: [String]? = nil, ratio: Double? = nil,
                 sidebarWidth: Double? = nil, pane: String? = nil,
                 sync: Bool? = nil, light: String? = nil, dark: String? = nil,
-                events: ControlEventBatch? = nil, keymap: ControlKeymap? = nil,
+                events: ControlEventBatch? = nil, keymap: ControlKeymap? = nil, hooks: ControlHooks? = nil,
                 pick: ControlPickResult? = nil, ask: ControlAskResult? = nil, cursor: ControlCursor? = nil,
                 app: AppIdentity? = nil, restore: ControlRestoreStatus? = nil,
                 zmx: ControlZmxInventory? = nil, remote: ControlRemoteTree? = nil,
                 liveReset: ControlLiveResetStatus? = nil,
-                width: Int? = nil, height: Int? = nil) {
+                width: Int? = nil, height: Int? = nil,
+                pageID: String? = nil, pageOutcome: ControlHtmlPageOutcome? = nil,
+                restart: ControlRestartReceipt? = nil, installed: AppIdentity? = nil,
+                recent: [ControlRecentItem]? = nil, recentOpen: ControlRecentOpen? = nil, undoable: Bool? = nil,
+                parent: String? = nil, closed: [String]? = nil, companionPage: PresentationPage? = nil,
+                messageID: String? = nil, delivered: [String]? = nil, rejected: [MessageRejection]? = nil,
+                messages: [BusMessage]? = nil, remaining: Int? = nil, acked: [String]? = nil,
+                remoteGroup: ControlRemoteGroup? = nil) {
+        self.messageID = messageID
+        self.delivered = delivered
+        self.rejected = rejected
+        self.messages = messages
+        self.remaining = remaining
+        self.acked = acked
+        self.companionPage = companionPage
+        self.remoteGroup = remoteGroup
+        self.parent = parent
+        self.closed = closed
+        self.undoable = undoable
+        self.recent = recent
+        self.recentOpen = recentOpen
+        self.restart = restart
+        self.installed = installed
         self.width = width
         self.height = height
         self.restore = restore
         self.zmx = zmx
         self.remote = remote
         self.liveReset = liveReset
+        self.pageID = pageID
+        self.pageOutcome = pageOutcome
         self.id = id
         self.tree = tree
         self.text = text
@@ -567,6 +802,7 @@ public struct ControlResult: Codable, Sendable, Equatable {
         self.dark = dark
         self.events = events
         self.keymap = keymap
+        self.hooks = hooks
         self.pick = pick
         self.ask = ask
         self.cursor = cursor
@@ -579,6 +815,14 @@ public struct ControlResult: Codable, Sendable, Equatable {
 public enum OverlayResultError {
     public static let stillRunning = "overlay still running"
     public static let noResult = "no overlay result"
+    /// An overlay a viewer showed that ended without an exit code: `launch-failed`, `canceled`, `unknown`.
+    public static func ended(_ outcome: String) -> String { "overlay ended: \(outcome)" }
+    /// The overlay runs on another Mac's surface, so this Mac has nothing to read or copy.
+    public static let shownElsewhere = "overlay is shown on another Mac"
+    /// The stream the overlay was handed to is gone, so nothing can reach the surface to resize it.
+    public static let viewerGone = "the viewer showing this overlay is gone"
+    /// The command and its environment exceed what the helper reads in one frame.
+    public static let tooLarge = "overlay command too large to show on another Mac"
 }
 
 /// Error strings for `session.overlay.*` aimed at a session whose overlay slot holds a HUD. The slot is
@@ -589,7 +833,7 @@ public enum OverlayHudError {
     /// `overlayActive` alone would otherwise answer the misleading "overlay still running".
     public static let noResult = "no overlay result: the slot holds a hud"
     /// A HUD is always floating (`AppStore.openHud`): it must never cover the session it is a message about.
-    /// A percent is accepted but bounded by `HudLayout.clampSizePercent`, which states the same invariant.
+    /// A percent is accepted but bounded by `HudLayout.clampSizePercent(_:for:)`.
     public static let fullResize = "a hud is always floating: pass --size-percent, not --full"
     /// `session.hud.update`/`.close` against a slot that holds no HUD — empty, or running a caller's program.
     public static let noHud = "no hud"
@@ -599,6 +843,104 @@ public enum OverlayHudError {
     public static let noRead = "no overlay to read: the slot holds a hud"
     /// The body file the helper reads could not be written, so the panel would paint nothing or stale text.
     public static let writeFailed = "could not write the hud message"
+}
+
+/// BrowserClearError holds the reasons the saved browser store cannot be cleared or opened right now.
+public enum BrowserClearError {
+    public static let clearing = "browser storage is being cleared"
+
+    public static func pagesOpen(_ count: Int) -> String {
+        "\(count) persistent \(count == 1 ? "page" : "pages") still open"
+    }
+}
+
+/// OverlayHtmlError holds the error strings for `session.overlay.*` against an HTML page.
+public enum OverlayHtmlError {
+    public static let commandAndHtml = "session.overlay.open takes a command or --html, not both"
+    public static let commandAndURL = "session.overlay.open takes a command or --url, not both"
+    public static let htmlAndURL = "session.overlay.open takes --html or --url, not both"
+    public static let waitWithHtml = "session.overlay.open: --wait cannot be combined with --html"
+    public static let waitWithURL = "session.overlay.open: --wait cannot be combined with --url"
+    /// cwdWithURL: a web page reads no local files, so there is no grant to give it.
+    public static let cwdWithURL = "session.overlay.open: --cwd cannot be combined with --url"
+    public static let invalidURL = "session.overlay.open: --url must be an absolute http or https URL"
+    public static let navigationWithoutPage = "session.overlay.open: --navigation requires --html, --url or --markdown"
+    public static let javascriptWithoutPage = "session.overlay.open: --js requires --html or --url"
+    public static let chromelessRequiresFile = "session.overlay.open: --chromeless requires --html or a loopback --url"
+    /// chromelessRequiresLoopback: the strip is what names a URL page's origin, so only this Mac's may drop it.
+    public static let chromelessRequiresLoopback =
+        "session.overlay.open: --chromeless with --url requires a loopback host: 127.0.0.1, ::1 or localhost"
+    public static let chromelessWithNavigation = "session.overlay.open: --chromeless cannot be combined with --navigation"
+    public static let chromelessWithBrowse = "session.overlay.open: --chromeless cannot be combined with --browse"
+    public static let persistentRequiresURL = "session.overlay.open: --persistent requires --url"
+    public static let persistentUnavailable = "persistent browser storage is not available"
+    public static let browseRequiresURL = "session.overlay.open: --browse requires --url"
+    public static let oneSource = "session.overlay.open takes one of a command, --html, --url, --image, --markdown or --text"
+    /// imageOptions: a picture page runs no script, navigates nowhere and reads only its own file.
+    public static let imageOptions =
+        "session.overlay.open: --image takes no --wait, --cwd, --navigation, --js, --chromeless, --persistent or --browse"
+    public static let imageNotAbsolute = "session.overlay.open: --image must be an absolute path"
+    public static let imageType = "session.overlay.open: --image must be a png, jpg, jpeg, gif or webp file"
+    public static let markdownOptions =
+        "session.overlay.open: --markdown takes no --wait, --cwd, --js, --chromeless, --persistent or --browse"
+    public static let markdownNotAbsolute = "session.overlay.open: --markdown must be an absolute path"
+    public static let markdownType = "session.overlay.open: --markdown must be a .md or .markdown file"
+    public static let textOptions =
+        "session.overlay.open: --text takes no --wait, --cwd, --navigation, --js, --chromeless, --persistent or --browse"
+    public static let textNotAbsolute = "session.overlay.open: --text must be an absolute path"
+    public static let textType = "session.overlay.open: --text must be a source, config, text or log file"
+    public static let lineWithoutText = "session.overlay.open: --line requires --text"
+    public static let lineNotPositive = "session.overlay.open: --line must be 1 or more"
+    public static let tailWithoutText = "session.overlay.open: --tail and --follow-file require --text"
+    public static let tailWithLine = "session.overlay.open: --tail and --follow-file cannot be combined with --line"
+    public static let logRemote = "session.overlay.open: a log page is not shown on another Mac"
+    public static let tailRange = "session.overlay.open: --tail must be 1...\(TextPage.maxTail)"
+    public static let searchRequest = "session.overlay.search needs text, --next, --prev or --close"
+    public static let searchTextWithStep = "session.overlay.search: text cannot be combined with --next, --prev or --close"
+    public static let companionNeedsPage = "a page companion needs --html or --url"
+    public static let pageSessionNeedsPage = "a page session needs --html or --url"
+    /// presenter: a page is shown on this Mac, so it is refused while another Mac presents the session.
+    public static let presenter = "a viewer presents this session: an html overlay would open where nobody sees it"
+    public static let noOverlay = "no overlay"
+    public static let notHtml = "the overlay is not an html page"
+    public static let navigation = "session.overlay.navigate requires back, forward, browser or finder"
+    public static let finderRequiresFile = "show in Finder requires a file page"
+    /// markdownInOverlay: a markdown page is rendered by the app, so a browser would get the raw file instead.
+    public static let markdownInOverlay = "a markdown page opens only in its overlay"
+    /// textInOverlay: a text page is built by the app, so a browser would get the raw file instead.
+    public static let textInOverlay = "a text page opens only in its overlay"
+    /// documentInOverlay: a clicked HTML file came from terminal output, and a browser would run its scripts.
+    public static let documentInOverlay = "a clicked html page opens only in its overlay"
+    /// unreadablePage: a saved page this build could not read has no file or address to hand anywhere.
+    public static let unreadablePage = "the saved page could not be read"
+    /// remoteFile: a file page shown for another Mac has no file here to reveal or open.
+    public static let remoteFile = "the page's file is on another Mac"
+    /// remotePage: Finder and Browser are refused for a file page shown on the presenting Mac.
+    public static let remotePage = "page is shown on another Mac"
+    /// replicaSubmit: a page shown here for another Mac is answered there, through the page itself.
+    public static let replicaSubmit = "submit on the Mac that opened the page"
+    /// remoteLoopback: a loopback URL names this Mac, so the presenting Mac cannot load it.
+    public static let remoteLoopback = "a loopback url names this Mac, so the Mac presenting the session cannot load it"
+    public static let remoteTooLarge = "page too large to show on another Mac"
+    /// noHistory: the page has nowhere to go in that direction.
+    public static func noHistory(_ navigation: HtmlNavigation) -> String { "no page to go \(navigation.rawValue) to" }
+    /// notRealized: the page has not been shown yet, so there is no web view to drive.
+    public static let notRealized = "html overlay not realized"
+    public static let noBrowser = "no default web browser to open the page in"
+    /// noResult and noRead: a page runs no program, so there is no exit status and no terminal text.
+    public static let noResult = "no overlay result: the slot holds an html page"
+    public static let noRead = "no overlay to read: the slot holds an html page"
+    public static let submitValue = "session.overlay.submit requires a value"
+    public static let invalidPageID = "invalid page id"
+    /// unknownPage: no page with that id was opened, or its outcome aged out of the retained results.
+    public static let unknownPage = "no such page"
+}
+
+/// Error strings for `session.overlay.hide|show|toggle` and for opening into a slot whose overlay is hidden.
+public enum OverlayVisibilityError {
+    /// hidden: the slot still holds its overlay, running; show or close it before opening another.
+    public static let hidden = "overlay hidden"
+    public static let noOverlay = "no overlay"
 }
 
 /// Error strings for the pane-scoped (`--pane`) arm of `session.overlay.*`. Shared because the rejections
@@ -611,6 +953,20 @@ public enum PaneOverlayError {
     public static let invalidPane = "session.overlay: --pane must be left or right"
     public static let sizePercentConflict = "session.overlay.open: --pane is mutually exclusive with --size-percent"
     public static let resizeUnsupported = "session.overlay.resize: --pane is not supported (pane overlays are always full)"
+    public static let pointsConflict = "session.overlay.open: --pane is mutually exclusive with --width/--height"
+}
+
+/// OverlayPointError holds the `--width`/`--height` error strings of `session.overlay.open` and `.resize`,
+/// split across the dispatcher and the store like `PaneOverlayError`.
+public enum OverlayPointError {
+    public static let needsPercent = "session.overlay.open: --width/--height need --size-percent"
+    public static let notPositive = "session.overlay: --width/--height must be positive"
+    public static let fullConflict = "session.overlay.resize: --full is mutually exclusive with --width/--height"
+    /// notFloating: points alone change the axes of a panel that is already floating; a full overlay has no
+    /// percent for the other axis to keep.
+    public static let notFloating = "session.overlay.resize: --width/--height need a floating overlay; pass --size-percent too"
+    public static let hud = "a hud measures its own height: --width/--height do not apply"
+    public static let remote = "--width/--height are not supported for an overlay this Mac shows for another Mac; resize it on that Mac"
 }
 
 /// Advisory text `notify` returns in `result.text` when the banner toggle is off. The command still succeeds

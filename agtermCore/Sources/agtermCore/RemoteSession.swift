@@ -28,6 +28,62 @@ public enum RemoteSession {
         return sshArguments(host: host, connectTimeout: connectTimeout, interactive: false) + [remote]
     }
 
+    /// One ssh invocation carrying `session`'s presentation stream, for as long as the row is shown.
+    ///
+    /// `-T` because frames travel on plain stdio and a pty would mangle them, and no lifetime deadline:
+    /// the stream is meant to stay up. `exec` so the far-side shell does not linger between ssh and the
+    /// bridge, which would keep a dead bridge's stdio open.
+    public static func presentCommand(host: String, session: String, connectTimeout: Int = 5) throws -> [String] {
+        try validate(host: host)
+        guard isPlain(session) else { throw InvocationError.invalidSession }
+        let chain = cliPathPrefix + " && exec agtermctl zmx present " + CommandRestore.shellQuotedLine([session])
+        let remote = CommandRestore.shellQuotedLine(["/bin/sh", "-c", chain])
+        return sshArguments(host: host, connectTimeout: connectTimeout, interactive: false) + [remote]
+    }
+
+    /// One ssh invocation running the helper for `job`, an overlay the origin handed to this Mac, for as long
+    /// as the overlay is up. `-tt` because the program is the user's and reads the pty; `exec` so the helper's
+    /// hangup check sees the ssh session's own pty close.
+    public static func runJobCommand(host: String, job: String, connectTimeout: Int = 5) throws -> [String] {
+        try validate(host: host)
+        guard isPlain(job) else { throw InvocationError.invalidSession }
+        let chain = cliPathPrefix + " && exec agtermctl session overlay run-job " + CommandRestore.shellQuotedLine([job])
+        let remote = CommandRestore.shellQuotedLine(["/bin/sh", "-c", chain])
+        return sshArguments(host: host, connectTimeout: connectTimeout, interactive: true) + [remote]
+    }
+
+    /// pageServeCommand uses plain ssh stdio to claim and carry a remote page's channel.
+    public static func pageServeCommand(host: String, token: String, connectTimeout: Int = 5) throws -> [String] {
+        try validate(host: host)
+        guard isPlain(token) else { throw InvocationError.invalidSession }
+        let chain = cliPathPrefix + " && exec agtermctl session overlay page-serve " + CommandRestore.shellQuotedLine([token])
+        let remote = CommandRestore.shellQuotedLine(["/bin/sh", "-c", chain])
+        return sshArguments(host: host, connectTimeout: connectTimeout, interactive: false) + [remote]
+    }
+
+    /// One ssh invocation running the far side's `agtermctl` with `arguments` plus `--json`, so the reply is the
+    /// server's own response line. Arguments carry user text, so the outer layer is quoted for any login shell.
+    public static func controlCommand(host: String, arguments: [String], connectTimeout: Int = 5) throws -> [String] {
+        try validate(host: host)
+        let chain = cliPathPrefix + " && agtermctl " + CommandRestore.shellQuotedLine(arguments + ["--json"])
+        let remote = ["/bin/sh", "-c", chain].map(accountShellQuoted).joined(separator: " ")
+        return sshArguments(host: host, connectTimeout: connectTimeout, interactive: false) + [remote]
+    }
+
+    /// accountShellQuoted quotes `value` as one word that sh, zsh, tcsh and fish all read alike: an apostrophe or
+    /// a backslash goes outside the quotes, escaped, since fish treats both specially inside single quotes.
+    static func accountShellQuoted(_ value: String) -> String {
+        var quoted = "'"
+        for character in value {
+            switch character {
+            case "'": quoted += "'\\''"
+            case "\\": quoted += "'\\\\'"
+            default: quoted.append(character)
+            }
+        }
+        return quoted + "'"
+    }
+
     /// sshd runs a remote command with `/usr/bin:/bin:/usr/sbin:/sbin` and a non-interactive shell reads no
     /// profile, so an installed CLI is otherwise not found and every command exits 127. `CommandPath` owns
     /// where it can live; APPENDED, so a user's own `agtermctl` earlier on PATH still wins.
@@ -48,7 +104,11 @@ public enum RemoteSession {
     /// `env` and `sh` are spelled absolutely because they are implementation primitives. The remote
     /// `agtermctl` in `treeCommand` is deliberately PATH-resolved instead — that one IS the user's
     /// installed CLI.
+    ///
+    /// `lead` opts the far zmx client into explicit leadership; an origin whose zmx predates it ignores
+    /// the two variables and the pane behaves as it did before.
     public static func attachCommand(host: String, endpoint: ControlZmxEndpoint, daemon: String,
+                                     lead: ZmxLeadAttachment? = nil,
                                      connectTimeout: Int = 5) throws -> [String] {
         try validate(host: host)
         guard ZmxSupport.isDaemonName(daemon) else { throw InvocationError.invalidSession }
@@ -61,27 +121,60 @@ public enum RemoteSession {
             // `ZMX_SESSION` makes attach SWITCH session instead, never reaching the create-only guard,
             // and an inherited prefix resolves a name agterm never created.
             "/usr/bin/env", "ZMX_SESSION=", "ZMX_SESSION_PREFIX=", "ZMX_NO_DETACH_KEY=1",
-            "ZMX_DIR=" + endpoint.socketDirectory, endpoint.executable,
-            "attach", daemon, "/bin/sh", "-c", guardScript,
+            "ZMX_DIR=" + endpoint.socketDirectory,
+        ] + (lead?.assignments ?? []) + [
+            endpoint.executable, "attach", daemon, "/bin/sh", "-c", guardScript,
         ])
-        return sshArguments(host: host, connectTimeout: connectTimeout, interactive: true) + [remote]
+        var argv = sshArguments(host: host, connectTimeout: connectTimeout, interactive: true) + [remote]
+        // why ERROR: control-api.md, Remote sessions
+        argv.insert(contentsOf: ["-o", "LogLevel=ERROR"], at: argv.count - 2)
+        return argv
     }
 
     /// The pane's command: the attach, then one line saying what died. `commandWait` holds the pane on
     /// Ghostty's own press-any-key prompt, so this sits under the last remote screen until it is read.
     ///
-    /// It names the host, the session and the exit status and stops there. How to get back is not
-    /// agterm's to say: the picker is a keymap custom command the user supplies.
+    /// It names the host, the session and the exit status. On ssh's own failure, 255, it shows a reconnecting
+    /// bar, reports that under `RemoteLinkNotice` and waits on `cat` for the app to attach the pane again;
+    /// `cat` ends with the app's pty. The mouse and focus reporting a remote program left on is switched off
+    /// first, or those reports would echo onto the kept screen, and echo goes with the cursor: a paste or a
+    /// wheel scroll would otherwise print under the bar, and Ghostty draws its password lock in place of the
+    /// cursor while echo is off. Without a lead nonce nothing could be believed, so it exits.
     public static func attachPaneCommand(host: String, endpoint: ControlZmxEndpoint, daemon: String,
                                          session: String, pane: ZmxPaneRole,
+                                         lead: ZmxLeadAttachment? = nil,
                                          connectTimeout: Int = 5) throws -> String {
-        let attach = CommandRestore.shellQuotedLine(
-            try attachCommand(host: host, endpoint: endpoint, daemon: daemon, connectTimeout: connectTimeout))
+        let argv = try attachCommand(host: host, endpoint: endpoint, daemon: daemon, lead: lead,
+                                     connectTimeout: connectTimeout)
+        // $ka is unquoted on purpose: four words or none. When and why the check: control-api.md, Remote sessions
+        let keepAlive = "ka=; " + CommandRestore.shellQuotedLine(["ssh", "-G"] + argv.dropFirst())
+            + " 2>/dev/null | grep -qx 'serveraliveinterval 0'"
+            + " && ka='-o ServerAliveInterval=5 -o ServerAliveCountMax=2'"
+        let attach = CommandRestore.shellQuotedLine(Array(argv.dropLast(2))) + " $ka "
+            + CommandRestore.shellQuotedLine(Array(argv.suffix(2)))
         let label = CommandRestore.shellQuotedLine(
             ["agterm: \(session) (\(pane.rawValue)) on \(host) disconnected, exit"])
         // the pane must exit with SSH's status, not printf's zero, or a failed connection reads as a
         // clean one to anything that looks at the exit code
-        return "\(attach); status=$?; printf '%s %s\\n' \(label) \"$status\"; exit \"$status\""
+        let report = "printf '%s %s\\n' \(label) \"$status\""
+        var script = "\(keepAlive); \(attach); status=$?; \(report); exit \"$status\""
+        if let lead {
+            let bar = CommandRestore.shellQuotedLine(["Connection to \(host) lost · reconnecting… · any key retries now"])
+            let title = CommandRestore.shellQuotedLine([RemoteLinkNotice.title(nonce: lead.nonce)])
+            let reset = "\\033[0m\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1006l\\033[?1004l\\033[?2004l\\033[?2031l\\033[?2048l"
+            script = "\(keepAlive); \(attach); status=$?; if [ \"$status\" -eq 255 ]; then "
+                + "printf '\(reset)\\r\\n\\033[30;43m %s \\033[K\\033[0m\\n' \(bar); printf '\\033]2;%s\\007' \(title); "
+                + "printf '\\033[?25l'; stty -echo 2>/dev/null; cat >/dev/null; else \(report); fi; exit \"$status\""
+        }
+        // libghostty runs this as `exec -l <command>`: bare, the exec replaces the shell with ssh and nothing
+        // after it runs. `env` takes the exec instead, and a plain `sh` beneath it reads no login profile.
+        return CommandRestore.shellQuotedLine(["/usr/bin/env", "/bin/sh", "-c", script])
+    }
+
+    /// One ssh invocation that only proves the host answers again, before a waiting pane is attached anew.
+    public static func probeCommand(host: String) throws -> [String] {
+        try validate(host: host)
+        return sshArguments(host: host, connectTimeout: 5, interactive: false) + ["true"]
     }
 
     private static func sshArguments(host: String, connectTimeout: Int, interactive: Bool) -> [String] {
@@ -94,7 +187,12 @@ public enum RemoteSession {
     /// Refused rather than escaped, and a leading `-` with it: ssh would read that as an option.
     private static func validate(host: String) throws {
         guard !host.isEmpty else { throw InvocationError.emptyHost }
-        guard isPlain(host), !host.hasPrefix("-") else { throw InvocationError.invalidHost }
+        guard isHost(host) else { throw InvocationError.invalidHost }
+    }
+
+    /// isHost reports whether `value` may be handed to ssh as its destination argument.
+    static func isHost(_ value: String) -> Bool {
+        isPlain(value) && !value.hasPrefix("-")
     }
 
     /// A host or remote-session token: no whitespace, no control characters. Shared with the dispatcher,

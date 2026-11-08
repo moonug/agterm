@@ -19,6 +19,8 @@ enum LiveResetConsumer {
         var budget: Duration = .seconds(15)
         var listTimeout: TimeInterval = 3
         var killTimeout: TimeInterval = 5
+        /// outdatedBefore is the launch's `ZmxBuildRecord` cutoff; nil skips every outdated target.
+        var outdatedBefore: Date?
     }
 
     /// Nil when no marker was armed; an unreadable or undecodable marker is discarded and kills nothing.
@@ -41,6 +43,7 @@ enum LiveResetConsumer {
         let claimed: Set<UUID>? = claims.complete ? Set(claims.claims.map(\.paneIdentity)) : nil
         let records = client.sessionRecords(timeout: min(deps.listTimeout, max(remaining(), 0.1)))
         let narrowed = LiveReset.narrow(marker: marker, claimed: claimed, records: records,
+                                        outdatedBefore: deps.outdatedBefore,
                                         classify: deps.probe.classifier(endpoint: client.endpoint))
         let kill = narrowed.kill
         var survivors: Set<pid_t> = []
@@ -52,7 +55,8 @@ enum LiveResetConsumer {
                 logger.error("live sessions reset: the budget expired before the kill; leaving every selected pane suppressed")
                 survivors = Set(kill.map(\.leaderPID))
             } else {
-                if !client.killBatch(names: kill.map(\.daemon), timeout: timeout) {
+                let shells = Dictionary(kill.map { ($0.daemon, $0.leaderPID) }) { first, _ in first }
+                if !client.killBatch(names: kill.map(\.daemon), shells: shells, timeout: timeout) {
                     logger.error("live sessions reset: the batched kill did not complete; polling every leader anyway")
                 }
                 survivors = ZmxClient.leadersExited(Set(kill.map(\.leaderPID)), deadline: deadline, poll: deps.poll, isAlive: deps.isAlive)

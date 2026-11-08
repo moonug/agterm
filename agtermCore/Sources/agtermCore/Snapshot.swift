@@ -18,7 +18,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
     public var sidebarWidth: Double?
     /// Whether the window's sidebar is shown; nil = the default (shown).
     public var sidebarVisible: Bool?
-    /// Which view the sidebar renders (tree or flagged flat list); nil = `.tree`.
+    /// Which view the sidebar renders (the workspace tree or the flagged view); nil = `.tree`.
     public var sidebarMode: SidebarMode?
     /// The workspaces marked in the sidebar focus set, in tree order; nil = nothing marked.
     public var focusedWorkspaceIDs: [UUID]?
@@ -27,11 +27,14 @@ public struct Snapshot: Codable, Equatable, Sendable {
     /// Most-recently-selected session ids, front = current, so the Ctrl-Tab switcher's order survives a
     /// relaunch. Restore drops ids no longer in the tree; nil = selection only.
     public var sessionRecency: [UUID]?
+    /// flaggedOrder is the flagged working set's saved order (`AppStore.flaggedOrder`); nil restores in tree
+    /// order.
+    public var flaggedOrder: [UUID]?
 
     public init(version: Int = Snapshot.currentVersion, selectedSessionID: UUID? = nil,
                 workspaces: [WorkspaceSnapshot] = [], sidebarWidth: Double? = nil, sidebarVisible: Bool? = nil,
                 sidebarMode: SidebarMode? = nil, focusedWorkspaceIDs: [UUID]? = nil, focusEnabled: Bool? = nil,
-                sessionRecency: [UUID]? = nil) {
+                sessionRecency: [UUID]? = nil, flaggedOrder: [UUID]? = nil) {
         self.version = version
         self.selectedSessionID = selectedSessionID
         self.workspaces = workspaces
@@ -41,11 +44,12 @@ public struct Snapshot: Codable, Equatable, Sendable {
         self.focusedWorkspaceIDs = focusedWorkspaceIDs
         self.focusEnabled = focusEnabled
         self.sessionRecency = sessionRecency
+        self.flaggedOrder = flaggedOrder
     }
 
     enum CodingKeys: String, CodingKey {
         case version, selectedSessionID, workspaces, sidebarWidth, sidebarVisible, sidebarMode
-        case focusedWorkspaceIDs, focusEnabled, sessionRecency
+        case focusedWorkspaceIDs, focusEnabled, sessionRecency, flaggedOrder
     }
 
     /// The legacy single-workspace focus key from before the focus SET existed. Its own key type with no
@@ -98,6 +102,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
             focusEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .focusEnabled)) ?? nil
         }
         sessionRecency = (try? c.decodeIfPresent([UUID].self, forKey: .sessionRecency)) ?? nil
+        flaggedOrder = (try? c.decodeIfPresent([UUID].self, forKey: .flaggedOrder)) ?? nil
     }
 }
 
@@ -109,16 +114,20 @@ public struct WorkspaceSnapshot: Codable, Equatable, Sendable {
     /// The INVERSE of `isExpanded`, so missing → expanded (the default) and only a collapsed workspace
     /// writes it — an all-expanded tree serializes byte-identically to a legacy snapshot.
     public var collapsed: Bool?
+    /// The workspace row's tint; nil = none, and absent from the file so an untinted tree stays unchanged.
+    public var tint: SidebarTint?
 
-    public init(id: UUID, name: String, sessions: [SessionSnapshot], collapsed: Bool? = nil) {
+    public init(id: UUID, name: String, sessions: [SessionSnapshot], collapsed: Bool? = nil,
+                tint: SidebarTint? = nil) {
         self.id = id
         self.name = name
         self.sessions = sessions
         self.collapsed = collapsed
+        self.tint = tint
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, sessions, collapsed
+        case id, name, sessions, collapsed, tint
     }
 
     /// Custom decode so `collapsed` is LOSSY, matching the other two snapshot types: the synthesized
@@ -130,6 +139,7 @@ public struct WorkspaceSnapshot: Codable, Equatable, Sendable {
         name = try c.decode(String.self, forKey: .name)
         sessions = try c.decode([SessionSnapshot].self, forKey: .sessions)
         collapsed = (try? c.decodeIfPresent(Bool.self, forKey: .collapsed)) ?? nil
+        tint = (try? c.decodeIfPresent(SidebarTint.self, forKey: .tint)) ?? nil
     }
 }
 
@@ -162,6 +172,8 @@ public struct SessionSnapshot: Codable, Equatable, Sendable {
     /// What the session is FOR (`session.context`), shown in the title bar; nil = none set. Survives a
     /// relaunch by design — it states durable purpose, so nothing expires it but an explicit clear.
     public var context: String?
+    /// The sidebar row's tint (`session.tint`); nil = none.
+    public var tint: SidebarTint?
     /// The main pane's foreground command (full argv) as of the last clean quit or the last
     /// `restore.capture`, re-run on restore in `rerun` launch mode. nil at a shell prompt, or in another
     /// mode, which gates every capture site.
@@ -182,12 +194,22 @@ public struct SessionSnapshot: Codable, Equatable, Sendable {
     public var splitCommandWait: Bool?
     /// The session's background watermark (image or rasterized text); nil = none. `.text` re-renders its PNG.
     public var backgroundWatermark: BackgroundWatermark?
+    /// paneBackgrounds holds the left/right overrides of `backgroundWatermark`; the scratch's is never persisted.
+    public var paneBackgrounds: PaneBackgrounds?
     /// The main pane's restore-command override (`session.restore`), winning over `foregroundCommand` and
     /// `initialCommand` on the next launch. Tri-state: nil = no override, `""` = a plain shell, a command =
     /// that shell line. Sticky — unlike `foregroundCommand` it is not consumed, so it fires every restart.
     public var restoreCommand: String?
     /// The split (right) pane's restore-command override, the split analogue of `restoreCommand`.
     public var splitRestoreCommand: String?
+    /// `Session.lastSelectedAt` as epoch seconds; nil when no selection timestamp has been recorded.
+    public var lastSelectedAt: Double?
+    /// parentID is the parent's id for a companion.
+    public var parentID: UUID?
+    /// collapsed is written only when true, so an unfolded tree matches a legacy snapshot.
+    public var collapsed: Bool?
+    /// page is a page row's page; nil is a terminal, so a snapshot written before page rows restores unchanged.
+    public var page: PageSnapshot?
 
     public init(id: UUID, paneIdentity: UUID? = nil, splitPaneIdentity: UUID? = nil,
                 customName: String?, cwd: String, isSplit: Bool? = nil, hasSplit: Bool? = nil,
@@ -196,10 +218,14 @@ public struct SessionSnapshot: Codable, Equatable, Sendable {
                 foregroundCommand: [String]? = nil, splitForegroundCommand: [String]? = nil,
                 initialCommand: String? = nil, commandWait: Bool? = nil,
                 splitInitialCommand: String? = nil, splitCommandWait: Bool? = nil,
-                backgroundWatermark: BackgroundWatermark? = nil,
+                backgroundWatermark: BackgroundWatermark? = nil, paneBackgrounds: PaneBackgrounds? = nil,
                 restoreCommand: String? = nil, splitRestoreCommand: String? = nil,
-                context: String? = nil) {
+                context: String? = nil, lastSelectedAt: Double? = nil, tint: SidebarTint? = nil,
+                parentID: UUID? = nil, collapsed: Bool? = nil, page: PageSnapshot? = nil) {
         self.id = id
+        self.page = page
+        self.parentID = parentID
+        self.collapsed = collapsed
         self.paneIdentity = paneIdentity
         self.splitPaneIdentity = splitPaneIdentity
         self.customName = customName
@@ -218,17 +244,20 @@ public struct SessionSnapshot: Codable, Equatable, Sendable {
         self.splitInitialCommand = splitInitialCommand
         self.splitCommandWait = splitCommandWait
         self.backgroundWatermark = backgroundWatermark
+        self.paneBackgrounds = paneBackgrounds
         self.restoreCommand = restoreCommand
         self.splitRestoreCommand = splitRestoreCommand
         self.context = context
+        self.lastSelectedAt = lastSelectedAt
+        self.tint = tint
     }
 
     enum CodingKeys: String, CodingKey {
         case id, paneIdentity, splitPaneIdentity, customName, cwd, isSplit, hasSplit, splitAxis
         case fontSize, splitCwd, splitRatio, flagged
         case foregroundCommand, splitForegroundCommand, initialCommand, commandWait
-        case splitInitialCommand, splitCommandWait, backgroundWatermark
-        case restoreCommand, splitRestoreCommand, context
+        case splitInitialCommand, splitCommandWait, backgroundWatermark, paneBackgrounds
+        case restoreCommand, splitRestoreCommand, context, lastSelectedAt, tint, parentID, collapsed, page
     }
 
     /// Custom decode so every optional is LOSSY, matching `Snapshot.init(from:)`: an unknown
@@ -259,8 +288,19 @@ public struct SessionSnapshot: Codable, Equatable, Sendable {
         splitInitialCommand = (try? c.decodeIfPresent(String.self, forKey: .splitInitialCommand)) ?? nil
         splitCommandWait = (try? c.decodeIfPresent(Bool.self, forKey: .splitCommandWait)) ?? nil
         backgroundWatermark = (try? c.decodeIfPresent(BackgroundWatermark.self, forKey: .backgroundWatermark)) ?? nil
+        paneBackgrounds = (try? c.decodeIfPresent(PaneBackgrounds.self, forKey: .paneBackgrounds)) ?? nil
         restoreCommand = (try? c.decodeIfPresent(String.self, forKey: .restoreCommand)) ?? nil
         splitRestoreCommand = (try? c.decodeIfPresent(String.self, forKey: .splitRestoreCommand)) ?? nil
+        lastSelectedAt = (try? c.decodeIfPresent(Double.self, forKey: .lastSelectedAt)) ?? nil
+        tint = (try? c.decodeIfPresent(SidebarTint.self, forKey: .tint)) ?? nil
+        parentID = (try? c.decodeIfPresent(UUID.self, forKey: .parentID)) ?? nil
+        collapsed = (try? c.decodeIfPresent(Bool.self, forKey: .collapsed)) ?? nil
+        // a present descriptor this build cannot use keeps the row a page, so it never spawns a shell or a daemon
+        do {
+            page = try c.decodeIfPresent(PageSnapshot.self, forKey: .page)
+        } catch {
+            page = PageSnapshot(source: .unreadable(PageSnapshot.unreadableReason))
+        }
         // the only field checked for CONTENT, not just type: a hand-edited context carrying a newline or
         // 300 bytes would otherwise reach the title bar and the JSON read-back intact.
         let storedContext = (try? c.decodeIfPresent(String.self, forKey: .context)) ?? nil
@@ -269,5 +309,114 @@ public struct SessionSnapshot: Codable, Equatable, Sendable {
         } else {
             context = nil
         }
+    }
+}
+
+/// PageSnapshot is a page row's saved page: the file or URL it shows and the options it was opened with, the
+/// only two sources a page row holds, or the unreadable marker of a saved one this build could not use.
+public struct PageSnapshot: Codable, Equatable, Sendable {
+    public enum Source: Equatable, Sendable {
+        case file(path: String, grantRoot: String?)
+        case url(URL)
+        case unreadable(String)
+    }
+
+    /// unreadableReason is what a page row shows when its saved descriptor could not be read.
+    public static let unreadableReason = "the saved page names no file or http(s) URL this version can open"
+
+    public var source: Source
+    public var javascript: Bool
+    public var navigation: Bool
+    public var chromeless: Bool
+    public var persistent: Bool
+    public var browse: Bool
+    /// backgroundColor is the `#rrggbb` painted behind the page; nil is the theme's.
+    public var backgroundColor: String?
+
+    public init(source: Source, javascript: Bool = false, navigation: Bool = false, chromeless: Bool = false,
+                persistent: Bool = false, browse: Bool = false, backgroundColor: String? = nil) {
+        self.source = source
+        self.javascript = javascript
+        self.navigation = navigation
+        self.chromeless = chromeless
+        self.persistent = persistent
+        self.browse = browse
+        self.backgroundColor = backgroundColor
+    }
+
+    /// init describes `overlay`'s page; nil for a source a page row cannot hold.
+    public init?(overlay: HtmlOverlay, backgroundColor: String?) {
+        switch overlay.source {
+        case .file(let path, let grantRoot): source = .file(path: path, grantRoot: grantRoot)
+        case .url(let url): source = .url(url)
+        case .unreadable(let reason): source = .unreadable(reason)
+        case .replica, .image, .markdown, .text, .document: return nil
+        }
+        javascript = overlay.javascript
+        navigation = overlay.navigation
+        chromeless = overlay.chromeless
+        persistent = overlay.persistent
+        browse = overlay.browse
+        self.backgroundColor = backgroundColor
+    }
+
+    /// makeOverlay builds the page under a fresh page id; an unreadable one starts failed with its reason.
+    public func makeOverlay() -> HtmlOverlay {
+        let html: HtmlSource
+        switch source {
+        case .file(let path, let grantRoot): html = .file(path: path, grantRoot: grantRoot)
+        case .url(let url): html = .url(url)
+        case .unreadable(let reason): html = .unreadable(reason: reason)
+        }
+        var overlay = HtmlOverlay(source: html, navigation: navigation, javascript: javascript, chromeless: chromeless,
+                                  persistent: persistent, browse: browse)
+        if case .unreadable(let reason) = source {
+            overlay.loadState = .failed
+            overlay.loadError = reason
+        }
+        return overlay
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case file, grantRoot, url, unreadable, javascript, navigation, chromeless, persistent, browse, backgroundColor
+    }
+
+    // the source is strict and throws on a descriptor naming neither a file nor a web URL, which
+    // `SessionSnapshot` keeps as the unreadable marker; the options are lossy like every other snapshot optional
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let reason = try c.decodeIfPresent(String.self, forKey: .unreadable) {
+            source = .unreadable(reason)
+        } else if let path = try c.decodeIfPresent(String.self, forKey: .file) {
+            source = .file(path: path, grantRoot: (try? c.decodeIfPresent(String.self, forKey: .grantRoot)) ?? nil)
+        } else if let url = HtmlSource.webURL(try c.decode(String.self, forKey: .url)) {
+            source = .url(url)
+        } else {
+            throw DecodingError.dataCorruptedError(forKey: .url, in: c, debugDescription: "not an http or https url")
+        }
+        let flag = { (key: CodingKeys) in ((try? c.decodeIfPresent(Bool.self, forKey: key)) ?? nil) ?? false }
+        javascript = flag(.javascript)
+        navigation = flag(.navigation)
+        chromeless = flag(.chromeless)
+        persistent = flag(.persistent)
+        browse = flag(.browse)
+        backgroundColor = (try? c.decodeIfPresent(String.self, forKey: .backgroundColor)) ?? nil
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch source {
+        case .file(let path, let grantRoot):
+            try c.encode(path, forKey: .file)
+            try c.encodeIfPresent(grantRoot, forKey: .grantRoot)
+        case .url(let url):
+            try c.encode(url.absoluteString, forKey: .url)
+        case .unreadable(let reason):
+            try c.encode(reason, forKey: .unreadable)
+        }
+        let flags: [(CodingKeys, Bool)] = [(.javascript, javascript), (.navigation, navigation), (.chromeless, chromeless),
+                                           (.persistent, persistent), (.browse, browse)]
+        for (key, value) in flags where value { try c.encode(true, forKey: key) }
+        try c.encodeIfPresent(backgroundColor, forKey: .backgroundColor)
     }
 }

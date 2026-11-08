@@ -8,6 +8,14 @@ paths:
 
 These run inside the app, so a mistake can kill the host instead of failing an assertion.
 
+- The run draws nothing on screen. `HostedWindowHider`, the test bundle's principal class, makes every
+  window created after bundle load start at `alphaValue` 0; the launch window predates it and is covered
+  by `HostedTestPlaceholder`. Windows stay ordered in and key-eligible, so `isVisible` assertions hold.
+  A test that needs an opaque window sets `alphaValue` itself. View captures (`cacheDisplay`,
+  `ImageRenderer`, `WKWebView.takeSnapshot`) are unaffected; a screen-composite capture would be blank.
+  A popped-up `NSMenu` is a window-server surface outside `NSApp.windows`, so the hook cannot reach it.
+  A hosted test records the popup request instead, as `SidebarControlClickTests` does, and leaves the
+  menu actually opening to `agtermUITests`.
 - **Set `isReleasedWhenClosed = false` on every test-owned `NSWindow`.** The initializer defaults true;
   `close()` can over-release a window still held by `registeredWindows`/`WindowRegistry`, then crash at
   the main-queue autorelease-pool pop. xcodebuild reports `Restarting after unexpected exit, crash, or
@@ -23,11 +31,14 @@ These run inside the app, so a mistake can kill the host instead of failing an a
   menu, a detached one included, replacing the key equivalent and mask the test just set. Titles like
   "Paste and Match Style", "Zoom" and "Close" are real system commands, so a developer who rebound one
   fails on his machine alone while CI stays green. `defaults read -g NSUserKeyEquivalents` names the
-  bindings. Suppress the substitution rather than renaming fixtures: `CloseSessionChordTests` needs the
+  bindings. Suppress the substitution rather than renaming fixtures: `StockMenuChordTests` needs the
   real "Close" to test chord ownership, and the substitution matches invented titles just as readily.
 - Never stub `GhosttyApp`; its handler is the only crash record.
-- `AGTERM_HOSTED_TESTS=1`, set by the `agtermTests` scheme, renders `Color.clear` and skips the scene task
-  that assigns `appDelegate.library`; it stays nil. SwiftUI's `@NSApplicationDelegateAdaptor` also makes
+- `AGTERM_HOSTED_TESTS=1`, set by the `agtermTests` scheme, renders `HostedTestPlaceholder`, skips the
+  launch `NSApp.activate()`, and skips the scene task that assigns `appDelegate.library`; it stays nil.
+  The placeholder makes its window transparent and click-through and keeps it ordered in:
+  ordering out the launch window exited the host before XCTest connected.
+  SwiftUI's `@NSApplicationDelegateAdaptor` also makes
   `NSApp.delegate as? AppDelegate` nil, so obtain the delegate another way. The local placeholder window
   exists (`NSApp.windows.count == 1`, title "Agterm"), but another-process CI launch may hit FB11763863
   and create none.
@@ -105,7 +116,12 @@ These run inside the app, so a mistake can kill the host instead of failing an a
   failure occurred about 64 seconds after synthesis began and the same test passed in about 13 seconds
   without HazeOver. Quit overlays and
   clear covered/minimized/other-Space windows before debugging the test. FB11763863 instead has no
-  window/AX tree.
+  window/AX tree. The same timeout also came from typing that hid the app under test: on 2026-10-18
+  `typeText` keys arrived as Command chords (Cmd-M minimized it, Cmd-H hid it, the rest reached the live
+  agterm the run was launched from and opened its Open Directory panel), while
+  `typeKey(_:modifierFlags: [])` was unaffected. [Unverified] where the stuck Command came from.
+  A window ordered out or an unexpected Open panel seconds into typing means stop the run; do not rerun
+  it on the same desktop.
 - `XCUIApplication.terminate()` does not call `applicationWillTerminate`. Use ⌘Q plus
   `wait(for: .notRunning, timeout:)` for restore-command or quit-flush tests; XCUITest auto-skips the
   quit-confirm modal. `MultiWindowUITests` survives hard termination only because structural saves
@@ -124,3 +140,7 @@ These run inside the app, so a mistake can kill the host instead of failing an a
   `RestoreCommandUITests.testRestoreReRunsShellScriptWrapper` uses `sh -c 'tee ...; true'` so `sh` remains
   foreground. Do not execute a script from the runner's sandboxed temp dir; the app can write there but
   cannot exec it.
+- The runner's sandbox grants `network.client` only, so an `NWListener` in the test fails `bind` with
+  EPERM. A test needing an HTTP server has the app run it in a background session
+  (`session.new` with `/usr/bin/python3 -m http.server PORT --bind 127.0.0.1 --directory DIR`) and polls
+  it from the runner as a client; see `ControlHtmlOverlayUITests`.

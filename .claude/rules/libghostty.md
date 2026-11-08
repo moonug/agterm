@@ -17,11 +17,11 @@ paths:
 
 ## Rendering
 
-- Nothing in agterm paints a surface. `src/apprt/embedded.zig` declares no `must_draw_from_app_thread`, so
-  `renderer/Thread.drawFrame` draws on the render thread instead of posting `redraw_surface`, the only
-  producer of `GHOSTTY_ACTION_RENDER`. The action is therefore unreachable on the embedded apprt and the
-  `action` switch drops it to `default`. If `GHOSTTY_REV` ever advances onto a libghostty that declares
-  that constant, panes stop painting until a RENDER arm calling `ghostty_surface_draw` comes back.
+- Nothing in agterm paints a surface. `GHOSTTY_ACTION_RENDER` comes only from `Surface.redraw`, which
+  answers the `.redraw` surface message, and only the OpenGL renderer's `Frame` posts that message. Metal
+  presents through its own layer, so the action is unreachable on macOS and the `action` switch drops it
+  to `default`. If a `GHOSTTY_REV` has Metal post `.redraw`, check that frames still present without an
+  apprt draw before leaving the action dropped.
 - The render thread is not the only painter: libghostty installs its own `CALayer` subclass as the surface
   view's layer, and its `display` calls a callback holding a raw `*Renderer`, so CoreAnimation draws on the
   main thread too. Before upstream `4b4a5b241109` nothing cleared that callback — `Metal.deinit` dropped
@@ -39,6 +39,13 @@ paths:
   the inset panel leaves panes on screen. A detached quick/scratch/split host is hidden regardless of its
   last deck value, and the ordered-out quick panel clears `deckOnScreen` itself since `orderOut` keeps
   `window` set.
+- A window that is miniaturized, ordered out or hidden with the app keeps its views attached, so
+  `showsOnScreen` also requires `window.isVisible`. The view observes that key on its current window
+  (`observeWindowVisibility`, re-armed in `viewDidMoveToWindow`): ordering has no notification of its
+  own, and occlusion notifications can miss an order-in. Whole-window occlusion and other Spaces are
+  deliberately not terms: a covered window keeps its swap chains. Since occlusion is terminal
+  visibility, a program using mode 2033 gets a report when its window is hidden this way and when it
+  returns.
 - Occlusion is TERMINAL visibility, not a renderer lever: every edge flips `terminal.flags.visible` and,
   under mode 2033, emits a visibility report, so never toggle it to force a GPU re-release for a pane
   that stayed hidden. The release is edge-triggered while the CA display callback draws unguarded, so a
@@ -47,7 +54,7 @@ paths:
   (`ghostty_surface_draw`) because that sweep cleared `contents` and `refresh` merely queues a render.
 - A hidden pane also clears `needsDisplayOnBoundsChange` on libghostty's layer and restores it on
   reveal. Without that, a window resize makes CoreAnimation display every mounted hidden pane and
-  rebuild the chain the release just freed. At `683d8db`, `Metal.init` installs one `IOSurfaceLayer`
+  rebuild the chain the release just freed. At `83fb956`, `Metal.init` installs one `IOSurfaceLayer`
   for the surface renderer and sets the flag once; no later Ghostty path replaces the layer or
   rewrites the flag. A `GHOSTTY_REV` bump has to recheck both, and that the synchronous reveal draw
   still restores the intended visible-resize path.
@@ -56,8 +63,12 @@ paths:
 
 - Chrome reads background/foreground through `ghostty_config_get`. It cannot read optional
   `selection-*` keys, even when set, so `resolveSelectionColors` parses the same last-wins config sources
-  and named bundled theme file. Selected rows use selection background/foreground, with black/white
-  luminance fallback. Tint borderless New Session through `.tint`; its label ignores foreground style.
+  and the theme file, found as libghostty finds it: a leading `~/` expanded, an absolute path directly,
+  a name in the user themes directory and then the bundled one.
+  `GhosttyConfigText` owns ghostty's quote, empty-reset and last-valid-wins rules for those keys.
+  Selected rows use selection background/foreground, black/white luminance text over a background with no
+  foreground, and the theme foreground for both when neither is set.
+  Tint borderless New Session through `.tint`; its label ignores foreground style.
 - Pass `theme = light:X,dark:Y` raw. The pinned libghostty supports conditional themes, but
   `set_color_scheme` only changes conditional state and emits an unhandled soft reload. agterm must set
   app and surface schemes, then call `update_config`.
@@ -136,6 +147,10 @@ paths:
   second or two after the notification. A failed create also re-arms `pendingSurfaceCreation`, so the
   layout path retries as well: the wake hook makes recovery TIMELY, not possible, and a view first
   mounted inside that residual window registered its observer too late for the wake that just fired.
+- Release builds strip libghostty's Zig-internal symbols and the linker reorders them, so `atos` resolves
+  only the exported `ghostty_*` ones. `scripts/symbolicate-frames.py BINARY ARCHIVE OFFSET...` matches the instructions before
+  each return address against `libghostty-internal.a` of the same `GHOSTTY_REV` and names a frame only on
+  a single match; an ambiguous or missing match is reported as such and exits 1.
 - `working_directory`, `initial_input`, and environment strdup buffers must outlive
   `ghostty_surface_new`; retain them until destruction.
 - Reparenting invalidates the drawable while leaving terminal buffer intact. `set_size` with an unchanged
@@ -148,6 +163,12 @@ paths:
   drag destination lookup, and rejecting in `draggingEntered` does not fall through. Visible split panes
   both qualify; full overlay, scratch-covered, and self-overlaid panes do not. This closes the latent
   background-session target shipped with single-session file drop in #52.
+- An HTML page needs more than unregistering: `WKWebView` overrides the private `_hitTest:dragTypes:` and
+  answers for any point in its frame, registered types or not, so an off-screen page stacked above the
+  visible pane took its drops (#677). `HtmlOverlayWebView` overrides the same selector and returns nil
+  while `setDropsEnabled(false)` holds.
+  `HtmlOverlayRegistryTests.testAnOffScreenPageLeavesTheDropToTheViewBeneathIt` pins it through the
+  container's own lookup.
 - File drop uses `insertPasted`/`ghostty_surface_text`, preserving bracketed-paste behavior. It may still
   submit a trailing newline when the program disables mode 2004. Do not reuse `inject`, which intentionally
   translates newline/return into Return for `session.type`. `pasteboardText` remains shared with clipboard
@@ -203,8 +224,8 @@ paths:
 - The wash is neutral only at full window opacity. Below it the wash color is opaque while the backing is
   not, so the body rises to `m + p(1-m)` against a title bar left at `p`; scaling by the rendered opacity
   shrinks that gap but no fill closes it. Scale by what the window actually renders at, not the saved
-  setting: fullscreen and Reduce Transparency force it opaque, and scaling there under-mutes to nothing at
-  a saved 0. Fullscreen is per-window, so it needs its own notification pair, not an app-global mirror.
+  setting: fullscreen and Reduce Transparency (unless ignored) force it opaque, and scaling there
+  under-mutes to nothing at a saved 0. Fullscreen is per-window, so it needs its own notification pair, not an app-global mirror.
 - Take the covered session's own solid background when it set one, else the theme color. Neither that field
   nor a live OSC 11 color is observed, so the color is whatever it was when the wash was last drawn.
 
@@ -241,6 +262,10 @@ paths:
 - Each `DashboardMember` hosts its existing pane with stable primary/split slot identity. Claim each exact
   slot through `dashboardHostsSurface`, leaving a clear placeholder in the eager deck so other surfaces
   still realize. Enter selects, closes, then focuses that exact pane.
+- A cell hosts the pane's TERMINAL, never its overlay, so a pane the session shows under a page or program
+  gets `DashboardOverlayCover` from `Session.dashboardCover(for:)` (#688): a full session-wide cover first,
+  then the pane's own overlay. A HUD, a floating overlay and the scratch produce none.
+  The page or program remains hosted in the deck.
 - Place dashboard in `windowOverlayLayer`, never a body overlay.
 - View-only requires all five gates:
   1. terminal hit testing off with a transparent click/highlight/enter layer above;
@@ -310,8 +335,12 @@ paths:
   suppress hit testing and the deck never sets `isHidden`.
 - Both dividers paint ↔ themselves: the sidebar handle from `onContinuousHover`, the split from
   `SplitProbeView`'s tracking area over the split, which covers both panes, so it repaints only inside the
-  band and gates on the deck's `visible` minus any overlay or scratch. AppKit's own divider cursor stops
-  firing once a second session is mounted, so nothing else writes it.
+  band and gates on the deck's `visible` minus any overlay or scratch.
+- AppKit's own divider cursor rect stays live on a background session's split, which the deck hides by
+  opacity only. The visible terminal's per-move writes mask it, so it surfaces only under a cover with no
+  per-move writer: a session ask left ↔ stuck over the hidden divider's column.
+  `SplitCursorRects` drops that rect while the probe's `deckVisible` is false and restores it when shown.
+  Reproduce with two split sessions at different ratios.
 - Chrome that paints its own cursor must re-assert per move and per drag tick, then again on the next
   runloop turn re-reading live hover state: a replacement lands after a synchronous `.set()` returns, and a
   deferred pass that captured hover instead strands the shape over live terminal.
@@ -333,6 +362,10 @@ paths:
   `UNAVAILABLE` result never starts the request, so an OSC 52 reader would wait for a reply that never comes.
 - A write keeps every representation (`NSPasteboard.PasteboardType(mimeType:)` mapping): the callback is
   void and core reports `DONE` right after it, so a dropped representation is a false success.
+- Reads and writes follow the callback's clipboard location through `GhosttyCallbacks.pasteboard(for:)`:
+  selection (`copy-on-select = true`, OSC 52 `s`) is a private pasteboard named for the bundle id, as in
+  Ghostty.app, so selecting text never replaces the system clipboard. Primary stays on the general one,
+  because an OSC 52 `p` write reaches the embedder although `supportsClipboard` reports none.
 - Default ungated writes are synchronous so a same-tick read sees them. Read defaults to ask; write defaults
   allow and can be changed in agterm `ghostty.conf`.
 - Deferred completion captures `GhosttySurfaceView`, then rereads its live surface. If a pane closed while

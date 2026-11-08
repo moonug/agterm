@@ -439,6 +439,20 @@ final class WindowLibraryTests {
         #expect(store.selectedSessionID == session.id)
     }
 
+    @Test func theStoreHoldingASessionIsFoundWhileItsCloseCanBeUndone() throws {
+        let library = WindowLibrary(directory: directory)
+        let store = try #require(library.activeStore)
+        let session = try #require(store.addSession(toWorkspace: store.workspaces[0].id, cwd: "/tmp", name: "grace"))
+        #expect(library.store(holdingSession: session.id) === store)
+
+        #expect(store.softCloseSession(session.id, grace: 60))
+        #expect(library.store(forSession: session.id) == nil)
+        #expect(library.store(holdingSession: session.id) === store)
+
+        store.finalizeAllPendingCloses()
+        #expect(library.store(holdingSession: session.id) == nil)
+    }
+
     @Test func reopeningRecentDuringGraceRestoresPendingSessionWithoutRebuildingSnapshot() {
         let library = WindowLibrary(directory: directory)
         let store = try! #require(library.activeStore)
@@ -832,6 +846,56 @@ final class WindowLibraryTests {
         #expect(!library.isOpen(extra.id))
         #expect(library.windows.contains { $0.id == extra.id })
         #expect(library.openIDs() == [library.windows[0].id])
+    }
+
+    @Test func windowStepWrapsBothWaysInLibraryOrder() {
+        let library = WindowLibrary(directory: directory)
+        let first = library.windows[0].id
+        let second = library.newWindow(name: "second").id
+        let third = library.newWindow(name: "third").id
+        #expect(library.canStepWindows)
+
+        library.frontmostWindowID = first
+        #expect(library.navigateWindow(.next) == second)
+        #expect(library.navigateWindow(.previous) == third)
+        library.frontmostWindowID = third
+        #expect(library.navigateWindow(.next) == first)
+        #expect(library.navigateWindow(.previous) == second)
+    }
+
+    @Test func windowStepSkipsClosedEntries() {
+        let library = WindowLibrary(directory: directory)
+        let first = library.windows[0].id
+        let middle = library.newWindow(name: "middle").id
+        let last = library.newWindow(name: "last").id
+        library.closeWindow(middle)
+
+        library.frontmostWindowID = first
+        #expect(library.navigateWindow(.next) == last)
+        #expect(library.navigateWindow(.previous) == last)
+    }
+
+    @Test func windowStepIsNilWithOneOpenWindow() {
+        let library = WindowLibrary(directory: directory)
+        let extra = library.newWindow(name: "extra").id
+        library.closeWindow(extra)
+        #expect(!library.canStepWindows)
+        #expect(library.navigateWindow(.next) == nil)
+        #expect(library.navigateWindow(.previous) == nil)
+    }
+
+    @Test func windowStepStartsFromTheResolvedActiveWindowWhenFrontmostIsClosed() {
+        // `activeWindowID` falls back to the first OPEN window, so a step after the frontmost closed
+        // leaves from that survivor rather than returning nil.
+        let library = WindowLibrary(directory: directory)
+        let first = library.windows[0].id
+        let second = library.newWindow(name: "second").id
+        let third = library.newWindow(name: "third").id
+        library.frontmostWindowID = third
+        library.closeWindow(third)
+
+        #expect(library.activeWindowID == first)
+        #expect(library.navigateWindow(.next) == second)
     }
 
     @Test func closeUnknownWindowIsNoOp() {
@@ -1287,6 +1351,30 @@ final class WindowLibraryTests {
         library.enqueueClaim(info.id)
         #expect(library.claimNextWindowID() == info.id)
         #expect(library.claimNextWindowID() == nil)
+    }
+
+    // #626: a window deleted before its scene claimed it left a dead id for the next window to pop.
+    @Test func removeWindowPurgesItsPendingClaim() throws {
+        let library = WindowLibrary(directory: directory)
+        _ = library.consumeReopen()
+        _ = library.claimNextWindowID()
+        let extra = library.newWindow(name: "extra").id
+        library.enqueueClaim(extra)
+        library.removeWindow(extra)
+        #expect(library.claimNextWindowID() == nil)
+    }
+
+    @Test func rejectedRemoveOfLastWindowKeepsItsPendingClaim() throws {
+        let library = WindowLibrary(directory: directory)
+        let launch = library.windows[0].id
+        _ = library.consumeReopen()
+        _ = library.claimNextWindowID()
+        let extra = library.newWindow(name: "extra").id
+        library.enqueueClaim(extra)
+        library.removeWindow(launch)
+        library.removeWindow(extra)
+        #expect(library.windows.map(\.id) == [extra])
+        #expect(library.claimNextWindowID() == extra)
     }
 
     // two adoptLaunchWindowID() calls before consumeReopen (SwiftUI restored more than one window,
@@ -1763,5 +1851,113 @@ final class WindowLibraryTests {
 
         #expect(Set(log.identities) == expected)
         #expect(!expected.isEmpty)
+    }
+
+    private func addSession(to store: AppStore, status: AgentStatus) throws -> Session {
+        let session = try #require(store.addSession(toWorkspace: store.workspaces[0].id, cwd: "/tmp"))
+        store.setAgentIndicator(AgentIndicator(status: status), forSession: session.id)
+        return session
+    }
+
+    @Test func attentionAcrossWindowsRanksStatusBeforeWindowOrder() throws {
+        let library = WindowLibrary(directory: directory)
+        let first = try #require(library.activeWindowID)
+        let firstStore = try #require(library.store(for: first))
+        let second = library.newWindow(name: "second")
+        let secondStore = try #require(library.store(for: second.id))
+        let blocked = try addSession(to: secondStore, status: .blocked)
+        let completed = try addSession(to: firstStore, status: .completed)
+        let active = try addSession(to: firstStore, status: .active)
+
+        let entries = library.attentionAcrossWindows
+
+        #expect(entries.map(\.session.id) == [blocked.id, active.id, completed.id])
+        #expect(entries.map(\.window.id) == [second.id, first, first])
+    }
+
+    @Test func attentionAcrossWindowsOrdersASharedRankNewestFirstAcrossWindows() throws {
+        let library = WindowLibrary(directory: directory)
+        let firstStore = try #require(library.activeStore)
+        let second = library.newWindow(name: "second")
+        let secondStore = try #require(library.store(for: second.id))
+        let older = try addSession(to: firstStore, status: .blocked)
+        let newer = try addSession(to: secondStore, status: .blocked)
+
+        #expect(library.attentionAcrossWindows.map(\.session.id) == [newer.id, older.id])
+    }
+
+    @Test func attentionAcrossWindowsMatchesTheSingleWindowList() throws {
+        let library = WindowLibrary(directory: directory)
+        let store = try #require(library.activeStore)
+        _ = try addSession(to: store, status: .completed)
+        _ = try addSession(to: store, status: .blocked)
+        _ = try addSession(to: store, status: .active)
+
+        #expect(library.attentionAcrossWindows.map(\.session.id) == store.attentionSessions.map(\.id))
+    }
+
+    @Test func attentionAcrossWindowsSkipsClosedWindows() throws {
+        let library = WindowLibrary(directory: directory)
+        let first = try #require(library.activeWindowID)
+        let firstStore = try #require(library.store(for: first))
+        let second = library.newWindow(name: "second")
+        let secondStore = try #require(library.store(for: second.id))
+        _ = try addSession(to: secondStore, status: .blocked)
+        let kept = try addSession(to: firstStore, status: .completed)
+
+        library.closeWindow(second.id)
+
+        #expect(library.attentionAcrossWindows.map(\.session.id) == [kept.id])
+    }
+
+    @Test func attentionAcrossWindowsInvalidatesWhenABackgroundWindowCloses() throws {
+        let library = WindowLibrary(directory: directory)
+        let first = try #require(library.activeWindowID)
+        let second = library.newWindow(name: "second")
+        let secondStore = try #require(library.store(for: second.id))
+        _ = try addSession(to: secondStore, status: .blocked)
+        library.frontmostWindowID = first
+        let fired = Flag()
+        withObservationTracking {
+            _ = library.attentionAcrossWindows
+        } onChange: {
+            fired.set()
+        }
+
+        library.closeWindow(second.id)
+
+        #expect(fired.isSet)
+        #expect(library.windows.count == 2)
+        #expect(library.frontmostWindowID == first)
+        #expect(library.attentionAcrossWindows.isEmpty)
+    }
+
+    @Test func attentionSubtitleNamesTheWindowOnlyWithSeveralOpen() throws {
+        let library = WindowLibrary(directory: directory)
+        let store = try #require(library.activeStore)
+        let session = try addSession(to: store, status: .blocked)
+        let single = try #require(library.attentionAcrossWindows.first)
+        #expect(library.attentionSubtitle(single) == "workspace 1 · \(session.subtitleDetail)")
+
+        let second = library.newWindow(name: "second")
+        let entry = try #require(library.attentionAcrossWindows.first { $0.session.id == session.id })
+        #expect(library.attentionSubtitle(entry) == "\(entry.window.name) · workspace 1 · \(session.subtitleDetail)")
+
+        library.closeWindow(second.id)
+        #expect(library.attentionSubtitle(entry) == "workspace 1 · \(session.subtitleDetail)")
+    }
+
+    @Test func attentionSubtitleNamesTheHostOfARemoteSession() throws {
+        let library = WindowLibrary(directory: directory)
+        let store = try #require(library.activeStore)
+        let session = try #require(store.addSession(toWorkspace: store.workspaces[0].id, cwd: "/tmp", remoteHost: "buildbox"))
+        store.setAgentIndicator(AgentIndicator(status: .blocked), forSession: session.id)
+        let entry = try #require(library.attentionAcrossWindows.first)
+        #expect(library.attentionSubtitle(entry) == "workspace 1 · buildbox · \(session.subtitleDetail)")
+    }
+
+    private final class Flag: @unchecked Sendable {
+        private(set) var isSet = false
+        func set() { isSet = true }
     }
 }

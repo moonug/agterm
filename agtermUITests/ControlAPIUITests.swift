@@ -384,6 +384,24 @@ final class ControlAPIUITests: ControlAPITestCase {
         XCTAssertNil(node["splitRestoreCommand"], "nothing may be pinned on the vacated split slot")
     }
 
+    // a ui-test pane runs no zmx client, so it reports no lead: the refusals are what is reachable here.
+    func testSessionLeadRefusesAPaneWithNoLead() throws {
+        let sessionID = try activeSessionID()
+        let plain = try sendCommand(#"{"cmd":"session.lead","target":"\#(sessionID)"}"#)
+        XCTAssertEqual(plain["ok"] as? Bool, false)
+        XCTAssertEqual(plain["error"] as? String, "pane has no lead to take", "\(plain)")
+
+        let noSplit = try sendCommand(#"{"cmd":"session.lead","target":"\#(sessionID)","args":{"pane":"split"}}"#)
+        XCTAssertEqual(noSplit["error"] as? String, "session has no split pane", "\(noSplit)")
+        let scratch = try sendCommand(#"{"cmd":"session.lead","target":"\#(sessionID)","args":{"pane":"scratch"}}"#)
+        XCTAssertEqual(scratch["error"] as? String, "the scratch terminal has no lead", "\(scratch)")
+        let invalid = try sendCommand(#"{"cmd":"session.lead","target":"\#(sessionID)","args":{"pane":"middle"}}"#)
+        XCTAssertEqual(invalid["error"] as? String, "invalid pane: middle", "\(invalid)")
+
+        let surfaces = try XCTUnwrap(try restoreNode(sessionID)["surfaces"] as? [[String: Any]])
+        XCTAssertTrue(surfaces.allSatisfy { $0["lead"] == nil }, "omitted, not null, for a pane with no role")
+    }
+
     // the last case is where session.restore diverges from session.status, which falls back to left.
     func testSessionRestoreRejectsUnrestorablePanes() throws {
         let sessionID = try activeSessionID()
@@ -506,6 +524,22 @@ final class ControlAPIUITests: ControlAPITestCase {
         let longText = String(repeating: "A", count: 5000)
         let tooLong = try sendCommand(#"{"cmd":"session.background","target":"\#(sid)","args":{"mode":"text","text":"\#(longText)"}}"#)
         XCTAssertEqual(tooLong["ok"] as? Bool, false, "an over-long watermark text should be rejected")
+
+        let background = { (args: String) in #"{"cmd":"session.background","target":"\#(sid)","args":{\#(args)}}"# }
+        let paneText = { (node: [String: Any], pane: String) in ((node["paneBackgrounds"] as? [String: Any])?[pane] as? [String: Any])?["text"] as? String }
+        XCTAssertEqual(try sendCommand(background(#""mode":"text","text":"PEER","pane":"right""#))["error"] as? String, "session has no split pane")
+        XCTAssertEqual(try sendCommand(#"{"cmd":"session.split","target":"\#(sid)","args":{"mode":"on"}}"#)["ok"] as? Bool, true)
+        XCTAssertEqual(try sendCommand(background(#""mode":"text","text":"PEER","pane":"right""#))["ok"] as? Bool, true)
+        let labelled = try XCTUnwrap(pollSessionNode(sid, timeout: 3) { paneText($0, "right") == "PEER" && paneText($0, "left") == nil })
+        XCTAssertEqual((labelled["background"] as? [String: Any])?["colorHex"] as? String, "#ff0000", "the default reads back beside the override")
+        var swapped: [String: Any] = [:]
+        for _ in 0..<20 where swapped["ok"] as? Bool != true {
+            swapped = try sendCommand(#"{"cmd":"session.swap","target":"\#(sid)"}"#)
+            if swapped["ok"] as? Bool != true { Thread.sleep(forTimeInterval: 0.2) }
+        }
+        XCTAssertNotNil(try pollSessionNode(sid, timeout: 3) { paneText($0, "left") == "PEER" && paneText($0, "right") == nil }, "the label follows the swap: \(swapped)")
+        XCTAssertEqual(try sendCommand(background(#""mode":"clear","pane":"left""#))["ok"] as? Bool, true)
+        XCTAssertNotNil(try pollSessionNode(sid, timeout: 3) { $0["paneBackgrounds"] == nil && $0["background"] != nil }, "a pane clear returns it to the default")
 
         let cleared = try sendCommand(#"{"cmd":"session.background","target":"\#(sid)","args":{"mode":"clear"}}"#)
         XCTAssertEqual(cleared["ok"] as? Bool, true, "session.background clear should succeed: \(cleared)")
@@ -1730,6 +1764,98 @@ final class ControlAPIUITests: ControlAPITestCase {
         XCTAssertEqual(response["ok"] as? Bool, true, "version should ignore addressing: \(response)")
         let result = try XCTUnwrap(response["result"] as? [String: Any], "version should carry a result")
         XCTAssertNotNil(result["app"], "the identity should come back regardless of addressing: \(response)")
+    }
+
+    // MARK: - Hooks
+
+    // hooks.reload re-reads hooks.conf and returns the parse-diagnostic count; the auto-created starter is
+    // all comments, so a fresh launch reports zero.
+    func testHooksReloadReportsZeroDiagnostics() throws {
+        let response = try sendCommand(#"{"cmd":"hooks.reload"}"#)
+        XCTAssertEqual(response["ok"] as? Bool, true, "hooks.reload should succeed: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "hooks.reload should carry a result")
+        XCTAssertEqual(result["count"] as? Int, 0, "the all-comment starter hooks file should have no diagnostics: \(response)")
+    }
+
+    func testHooksReloadReportsDiagnosticsForBrokenFile() throws {
+        try relaunch(withHooks: "bogus verb here\n")
+        let response = try sendCommand(#"{"cmd":"hooks.reload"}"#)
+        XCTAssertEqual(response["ok"] as? Bool, true, "hooks.reload should succeed even with a broken file: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "hooks.reload should carry a result")
+        XCTAssertEqual(result["count"] as? Int, 1, "one broken line should yield one diagnostic: \(response)")
+    }
+
+    func testHooksListReportsPathDiagnosticsAndEntries() throws {
+        try relaunch(withHooks: "on status true\nbad line\non notify echo hi | cat\n")
+        let response = try sendCommand(#"{"cmd":"hooks.list"}"#)
+        XCTAssertEqual(response["ok"] as? Bool, true, "hooks.list should succeed: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "hooks.list should carry a result")
+        let hooks = try XCTUnwrap(result["hooks"] as? [String: Any], "hooks.list should carry a hooks payload")
+        XCTAssertTrue((hooks["path"] as? String ?? "").hasSuffix("/config/hooks.conf"), "path should be the isolated file: \(hooks)")
+        let diagnostics = try XCTUnwrap(hooks["diagnostics"] as? [[String: Any]])
+        XCTAssertEqual(diagnostics.map { $0["line"] as? Int }, [2])
+        let rows = try XCTUnwrap(hooks["hooks"] as? [[String: Any]])
+        XCTAssertEqual(rows.map { $0["kind"] as? String }, ["status", "notify"])
+        XCTAssertEqual(rows.map { $0["command"] as? String }, ["true", "echo hi | cat"])
+        XCTAssertEqual(rows.map { $0["line"] as? Int }, [1, 3])
+        XCTAssertEqual(rows.map { $0["pending"] as? Int }, [0, 0])
+        XCTAssertNil(rows[0]["runningPid"], "an idle hook carries no pid: \(rows[0])")
+    }
+
+    // the hook's agtermctl call queues behind the request that fired it; both must complete
+    func testHookCallingTheSameSocketCompletesWithTheOriginalRequest() throws {
+        try relaunch(withHooks: #"on status [ "$AGT_EVENT_STATUS" = blocked ] || exit 0; agtermctl notify "hook ran" --target "$AGT_SESSION_ID" --socket "$AGT_SOCKET""# + "\n")
+        let seeded = try activeSessionID()
+        let anchor = try sendCommand(#"{"cmd":"events.read"}"#)
+        let anchorResult = try XCTUnwrap(anchor["result"] as? [String: Any])
+        let events = try XCTUnwrap(anchorResult["events"] as? [String: Any])
+        let run = try XCTUnwrap(events["run"] as? String)
+        let after = try XCTUnwrap(events["next"] as? Int)
+
+        let status = try sendCommand(#"{"cmd":"session.status","target":"\#(seeded)","args":{"status":"blocked"}}"#)
+        XCTAssertEqual(status["ok"] as? Bool, true, "the originating request must return on its own: \(status)")
+
+        let deadline = Date().addingTimeInterval(15)
+        var sawNotify = false
+        var quiescent = false
+        while Date() < deadline, !(sawNotify && quiescent) {
+            let page = try sendCommand(#"{"cmd":"events.read","args":{"run":"\#(run)","after":"\#(after)","kinds":["notify"]}}"#)
+            let items = ((page["result"] as? [String: Any])?["events"] as? [String: Any])?["items"] as? [[String: Any]] ?? []
+            sawNotify = items.contains { (($0["payload"] as? [String: Any])?["body"] as? String) == "hook ran" }
+            let list = try sendCommand(#"{"cmd":"hooks.list"}"#)
+            let rows = ((list["result"] as? [String: Any])?["hooks"] as? [String: Any])?["hooks"] as? [[String: Any]] ?? []
+            quiescent = rows.count == 1 && rows[0]["runningPid"] == nil && rows[0]["pending"] as? Int == 0
+                && rows[0]["lastFailure"] == nil
+            if !(sawNotify && quiescent) { Thread.sleep(forTimeInterval: 0.25) }
+        }
+        XCTAssertTrue(sawNotify, "the hook's notify should reach the ring through the same socket")
+        XCTAssertTrue(quiescent, "the hook should finish with no running child, no pending work and no failure")
+    }
+
+    func testEditHooksOverlayCloseReloadsTheFile() throws {
+        let seeded = try activeSessionID()
+        app.menuBars.menuBarItems["File"].click()
+        let item = app.menuItems["Edit Hooks…"]
+        XCTAssertTrue(item.waitForExistence(timeout: 5), "File menu should list Edit Hooks")
+        item.click()
+        XCTAssertTrue(poll(until: (try? sessionNodeIfPresent(id: seeded))??["overlay"] as? Bool == true, timeout: 10),
+                      "Edit Hooks should open an overlay on the active session")
+
+        let file = stateDir.appendingPathComponent("config", isDirectory: true).appendingPathComponent("hooks.conf")
+        let handle = try FileHandle(forWritingTo: file)
+        handle.seekToEndOfFile()
+        handle.write(Data("on notify true\n".utf8))
+        try handle.close()
+        let close = try sendCommand(#"{"cmd":"session.overlay.close","target":"\#(seeded)"}"#)
+        XCTAssertEqual(close["ok"] as? Bool, true, "closing the editor overlay should succeed: \(close)")
+
+        var rows: [[String: Any]] = []
+        let reloaded = poll(until: {
+            let list = (try? sendCommand(#"{"cmd":"hooks.list"}"#)) ?? [:]
+            rows = ((list["result"] as? [String: Any])?["hooks"] as? [String: Any])?["hooks"] as? [[String: Any]] ?? []
+            return rows.contains { $0["kind"] as? String == "notify" && $0["command"] as? String == "true" }
+        }(), timeout: 10)
+        XCTAssertTrue(reloaded, "closing the editor overlay should reload hooks.conf: \(rows)")
     }
 
     // MARK: - Keymap

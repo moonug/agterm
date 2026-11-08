@@ -9,11 +9,44 @@ C-boundary concurrency before changing the bridge.
 
 - For nonstandard or risky UI requests, first explain the AppKit/SwiftUI cost and offer the standard
   alternative. Proceed if the user still prefers the custom behavior.
+- Design every UI behavior to be consistent and unsurprising: a key or gesture does one thing for what the user
+  is looking at and never reaches a layer hidden behind the visible one.
+  A rule whose exceptions depend on state the user cannot see on screen is a defect: propose the single rule,
+  and ask before adding a case.
+  Existing behavior next to the change that breaks this rule is a defect to fix with it, not a pre-existing one:
+  name it with its fix as a question, never as out of scope.
+  A control that already exists elsewhere in the app (a search bar, a button, a picker) looks and behaves the same
+  in the new place: reuse its component, and show the user the rendered result before writing tests.
+- Judge any change that can leave a long-standing visual artifact by what the user is left looking at,
+  never by whether the mechanism is sound. A panel, badge, marker or overlay that outlives the thing it
+  describes is a defect however correct the code that posted it. Give it a way to clear itself, and put
+  that in the control API rather than in a private timer inside one caller, or every other caller ships
+  the same artifact.
 - For every new capability, propose useful control API/CLI coverage: protocol command and arguments,
   dispatch, `agtermctl`, read-back, and tests. Control-native features count; skip only chrome with nothing
   meaningful to drive.
+- A session attached from another Mac is a normal view, not an extra.
+  Every new or changed capability that works locally works there too, unless it was explicitly deferred
+  or declined: design the remote path (presentation, page serving, control routing) together with the
+  local one, and a missing remote path is part of the task, never an exclusion to note.
 - For each hideable titlebar/sidebar element, ask whether it should join host-free `InterfaceElement` and
   Settings > Interface. Never add that preference without approval.
+  A control enabled there stays visible and is disabled when it cannot act; never show or hide it by state.
+- The HTML overlay displays a page over a session; it is not a browser.
+  Moving within what the page was opened with is in scope: an HTML file's grant folder, a markdown file's link
+  root, a URL page's origin, and any origin for a `--browse` page; a terminal click may replace a hidden clicked page.
+  Features that make it a general browser (tabs, an address bar, links followed past those bounds) are declined.
+  What a mouse-capturing program does with a click is that program's, not agterm's.
+- A decline of a feature request that a custom command covers explains the extension model with the request
+  as the worked example: README's "bind X yourself", `site/docs.html#extend`, the agent skill, the cookbook.
+  It also points "can you add X" requests to Discussions ▸ Ideas instead of issues.
+- When adding a process that runs user commands or reparents a session, weigh its effect on macOS TCC
+  attribution per service, up front. The responsible process is not always TCC's authorization subject:
+  the #574 microphone test recorded `agterm-session-host` as responsible, `com.umputun.agterm` as the
+  subject, and access allowed. Check each service rather than assuming one answer covers all of them. A
+  passive `AXIsProcessTrusted` false can also be a stale grant, not a code bug: a stored grant may require
+  a specific old cdhash (an ad-hoc build's requirement is a bare cdhash), so verify the row's full
+  requirement against the running binary before suspecting attribution.
 - Start Swift work with the relevant skills: `swiftui-expert` for UI/AppKit/Observation/rendering,
   `swift-testing-expert` for tests, and `swift-concurrency` for actors, Sendable, async, and C callbacks.
 - “Show me” means build and launch a separate interactive Debug instance, not a screenshot. Use isolated
@@ -23,12 +56,20 @@ C-boundary concurrency before changing the bridge.
   Set only a short `/tmp` `AGTERM_STATE_DIR` so app and inherited CLI derive the same socket.
   Prepend the Debug app's `Contents/MacOS` to PATH for custom commands; login shells may restore the
   deployed CLI, so manual commands should use the Debug binary's full path.
+- `open -n` passes the caller's environment to the app, including inherited `CLAUDE*` markers and
+  live-terminal `AGTERM_*`/`GHOSTTY_*` variables; a `claude` started in that instance warns that transcript
+  saving is off.
+  Launch through `env -u NAME ...` naming every such variable, which drops `AGTERM_STATE_DIR` too, so pass
+  the isolated one back with `open -n --env AGTERM_STATE_DIR=...`; verify with `ps eww -p <pid>`.
 - A fresh isolated state dir reads as a first launch and opens the welcome alert.
   `mkdir -p "$AGTERM_STATE_DIR/windows"` before launching to skip it: `FirstRunWelcome.hasPriorState`
   looks for `settings.json`, `workspaces.json`, or `windows` before the app writes anything.
   Leave the marker out only when the welcome itself is under test.
 - The control socket binds from the window scene's task, so a backgrounded `open -n -g` can leave the app
-  running with no socket until a window renders. Activate the instance when the socket never appears.
+  running with no socket until a window renders.
+  If the socket is still absent 10 s after launch, activate the instance; never leave a socket wait unbounded.
+  An activation by pid once left it unbound for 15 s more (2026-11-07); stopping it and relaunching without `-g`
+  bound the socket at once.
 - `agtermctl` never reads `AGTERM_SOCKET`; it resolves `--socket`, then `AGTERM_STATE_DIR`, then
   `~/Library/Application Support/agterm`. A shell inside the live terminal therefore defaults onto the
   live socket, and exporting a short `AGTERM_STATE_DIR` is what keeps inherited commands off it.
@@ -53,8 +94,10 @@ C-boundary concurrency before changing the bridge.
 - Xcodegen creates the app project; Xcode 26 builds it. Call `xcodegen`, `xcodebuild`, and `swift`
   directly through repository scripts; `mise` is unused.
 - Swift 6 `agtermCore` uses complete concurrency checking and has no Xcode/libghostty dependency.
-- `scripts/setup.sh` builds pinned libghostty and zmx with Homebrew `zig@0.16` and Xcode's Metal Toolchain.
-  It is idempotent after artifacts exist.
+- `scripts/setup.sh` builds pinned libghostty with Homebrew `zig@0.17`, zmx with `zig@0.16`, and Xcode's
+  Metal Toolchain.
+  It is idempotent after artifacts exist. zmx is the plain upstream pin plus `scripts/zmx-patches/`,
+  whose README says what each patch is for and how to regenerate one.
 - Commands:
   - `scripts/run.sh`: setup, generate, Debug build, launch.
   - `scripts/build.sh`: setup, generate, Release build.
@@ -69,6 +112,30 @@ C-boundary concurrency before changing the bridge.
   via `-only-testing:<Target>/<Class>/<test>`. Never re-run a whole XCUITest suite to verify a narrow
   change; `agtermUITests/ControlAPIUITests` alone is 82 methods and about 7.5 minutes, and tells you
   nothing the targeted run did not.
+- **An XCUITest run started from a shell inside a live agterm window can die at runner init** with
+  `Failed to initialize for UI testing ... Timed out while enabling automation mode` after 60s, before any
+  test case runs. The block is at runner initialization, so app code under test cannot reach it; it is not
+  a defect in the diff under test. The timeout is intermittent: one retry passed on the same stale host
+  minutes after a failure (2026-09-26), so retry once before treating it as blocking.
+  [Unverified] cause: TCC attributes the authorization to the responsible process,
+  `/Applications/agterm.app/Contents/MacOS/agterm-session-host` hosting that shell; when a deploy replaced
+  the app after that process launched, the running image stops matching the file and tccd logs
+  `IDENTITY_ATTRIBUTION: Failed to copy signing info for <pid> ... #-67034` (errSecCSStaticCodeChanged) in
+  the same window. The correlation is measured; the causal link to the timeout is not. Diagnose with
+  `log show --predicate 'subsystem == "com.apple.TCC"' --last 6m --style compact` plus
+  `ps -p <pid> -o lstart` against the binary's mtime. If the retry also fails, diagnose the attribution
+  issue before considering a restart; restarting agterm is Eugene's decision, never the agent's.
+  Hosted `agtermTests` can be blocked over the same period (2026-10-02): the host waits in
+  `_prepareTestConfigurationAndIDESession` with zero test cases started, and `xcodebuild` logs
+  `Connection peer refused channel request for "dtxproxy:XCTestManager_IDEInterface:..."` two minutes after
+  connecting. Both runners recovered once Eugene allowed the pending authorization, with the same stale
+  session host and the same `testmanagerd` still running, so neither needs a restart. SIP refuses
+  `launchctl kickstart -k` on `testmanagerd`. [Unverified] which authorization that was.
+- A TCC-gated tool run from a shell in the live terminal (`screencapture`, XCUITest) can be denied after a
+  deploy replaces the app under a running `agterm-session-host`, even with an existing grant.
+  `codesign -v <pid>` reports the code on disk does not match, and tccd logs
+  `Failed to match existing code requirement`. Check both before calling a permission missing;
+  a Debug instance can capture its own view in-process instead.
 - For maintainer work, ask before splitting a touched long file and do not raise limits reflexively.
   Contributors need not refactor preexisting length; mention it without blocking or suggesting a limit bump.
 
@@ -80,41 +147,73 @@ C-boundary concurrency before changing the bridge.
   `.ghostty-build-stamp`, and `.zmx-build-stamp`. Symlink all six from the main checkout instead of rebuilding;
   use absolute targets for resources. Each stamp makes its staged artifacts count as current. They remain
   untracked and disappear with worktree removal.
-- Symlink an artifact set only while the main checkout's matching stamp equals that set's revision in the
-  worktree's `setup.sh`. When `GHOSTTY_REV` or `ZMX_REV` differs, remove that set's artifact and stamp
-  links before setup runs and let it build locally. `setup.sh` writes stamps through symlinks while
-  replacing linked artifacts with local files and directories, so a linked build leaves the main checkout
-  claiming a revision its artifacts were never built from.
+- Symlink an artifact set only while the main checkout's matching stamp equals what the worktree's
+  `setup.sh` would write for that set: `GHOSTTY_REV` and the digest of
+  `scripts/ghostty-patches/*.patch` for ghostty, and `ZMX_REV`, `ZMX_TARGET` and the
+  digest of `scripts/zmx-patches/*.patch` and `scripts/zmx-patches/ghostty/*.patch` for zmx, so a target
+  or a patch change invalidates a set whose revision still matches. When either differs, remove that
+  set's artifact and stamp links before setup runs and let it build locally. `setup.sh` writes stamps
+  through symlinks while replacing linked artifacts with local files and directories, so a linked build
+  leaves the main checkout claiming a build its artifacts never came from.
+- A contributor PR is built on master's dependency pins, never its own older ones: merge fetched
+  `origin/master` into its local branch before setup, and match stamps against that merged tree.
 - After merge, verify the PR merge commit on fetched `origin/master`, then remove the worktree without
   changing the main checkout's branch. Squash/rebase makes removal report unmerged commits; after
   verification, discard the worktree safely. Native removal may leave a renamed branch, which must be
   deleted separately after checking the remote.
+- A worktree removed under a live session leaves that session's custom commands starting in HOME, so one
+  written with relative paths acts on HOME, not the repository. When ExitWorktree reports no active
+  session, leave the removal to a session started in the main checkout.
+- Before removing a worktree, and after any hosted or UI test run, run
+  `lsappinfo list | grep -A4 agterm.debug`.
+  An entry marked `exited-with-subordinates` that lists `relatedCoalitionPIDs` is held by those pids:
+  identify them with `ps -p`, stop the ones that are leaked test processes, and report anything else to
+  Eugene.
+  An entry without `relatedCoalitionPIDs` right after a run can be transient; check again after a minute
+  before acting, and report it to Eugene if it persists.
 - Debug Swift code lives in `agterm.debug.dylib`; inspect it or object files, not the stub executable.
 - For throwaway launch-time probes, append to a temp file. `NSLog` from `open -n` is unreliable; production
   logging uses `os.Logger`.
 - `scripts/run.sh` activates an existing instance instead of loading a rebuild. Use a distinct isolated
   launch for current code.
+- Stop an isolated Live-mode Debug instance and its daemons before rebuilding the same DerivedData.
+  Rewriting the bundle's `zmx` or `agterm-session-host` under running daemons can trigger
+  `SIGKILL (Code Signature Invalid)`; the reports go to `~/Library/Logs/DiagnosticReports/`.
+  Foreground programs can survive without a tty; stop any survivors by pid.
 - `make deploy` copies Release to `~/Applications`, whose app, PATH CLI, and installed hooks shadow Debug.
   Test fresh CLI/hooks with the Debug binary or redeploy and reinstall them. Debug uses
-  `com.umputun.agterm.debug`, distinct from Release, but state/socket paths still require isolation.
-- Launching a second instance without `AGTERM_STATE_DIR` still shares state, but no longer takes the
-  running app's control socket. `ControlServer.init` takes an exclusive `flock` on `<socket>.lock` and
-  `start` refuses to bind while another live instance holds it, logging `already served by another
-  instance`. Ownership is settled at init so the launch window's first shell, whose environment is
-  snapshotted before `start` runs, cannot bake the owner's path.
+  `com.umputun.agterm.debug`, distinct from Release.
+- A Debug build launched with `AGTERM_STATE_DIR` unset or empty adopts
+  `~/Library/Application Support/agterm-debug` (`DebugStateDirectory`), exporting it so its shells and
+  their `agtermctl` resolve the same socket. A non-empty value always wins, the live directory included.
+  Config is not adopted: that launch reads the default config directory, `~/.config/agterm` unless the
+  setting names another. Manual runs still pass a short `/tmp`
+  directory: the adopted one is shared by every unisolated Debug launch and persists between them.
+- A second instance on a state directory another process owns exits with status 1 before reading or
+  writing anything there. `agtermApp.init` first takes an exclusive `flock` on `<stateDir>/agterm.lock`
+  (`StateDirectoryLock`), and a lock it cannot take exits too. Every store save rewrites its whole file
+  from memory, so a second loader once overwrote the owner's newer sessions with its stale tree (#741);
+  `agterm --help` started one, since libghostty appends `Contents/MacOS` to every pane's PATH.
+  A running build predating the lock holds no `agterm.lock`, so the first fixed launch beside one is
+  unprotected: stop old instances before it.
+- Instances on different state directories that share one `AGTERM_CONTROL_SOCKET` are separated by the
+  socket lock instead. `ControlServer.init` takes an exclusive `flock` on `<socket>.lock` and `start`
+  refuses to bind while another live instance holds it, logging `already served by another instance`.
+  Ownership is settled at init so the launch window's first shell, whose environment is snapshotted
+  before `start` runs, cannot bake the owner's path.
   A refused instance advertises `<socket>.unavailable` in `AGTERM_SOCKET`, so a command passing
   `--socket "$AGTERM_SOCKET"` fails rather than reaching the owner. A BARE `agtermctl` still reaches it:
-  the CLI never reads that variable and resolves the default path. Isolate anyway — state is shared and
-  persisted session ids resolve in both instances, so an untargeted command lands on the live terminal.
+  the CLI never reads that variable and resolves the default path.
 - `lsof -p <pid> | grep agterm.sock` showing an fd on a socket path `ls` cannot find means an orphaned
   socket; a window scene that never bound one is a different fault. Reaching it now takes a build
   predating the lock, or the socket file being deleted by hand.
 
 ## Protect the live terminal
 
-- Never run a mutating `agtermctl` command on the default socket. It controls the user's live deployed
-  terminal. Read-only `tree` and `window list` are tolerable; writes require explicit isolated socket.
-  Never execute bundled recipes against the default instance.
+- Never run experimental or test `agtermctl` mutations (bundled recipes, probes, test scenarios) on the
+  default socket; it controls the user's live daily-driver terminal, so experiments go to an isolated socket.
+  A session's normal operations on itself (context, rename, status, notify, HUD, chat, its own companions)
+  are ordinary use.
 - Every delegated agent that might touch the app or CLI must receive verbatim:
   “never execute `agterm`/`agtermctl` against the default socket, never launch or quit the app, static
   reading only.”
@@ -123,6 +222,10 @@ C-boundary concurrency before changing the bridge.
 - Manual Debug UI work uses a separate `open -n` instance with isolated state and short socket. Address
   its CLI with `--socket` after the subcommand. Stop only its known PID with SIGTERM; clean quit triggers
   the visible quit-confirmation alert. Use clean quit only when testing its final cwd/running-command flush.
+- A stopped Debug instance can leave its Dock tile; a click on it relaunches the bundle with no
+  `AGTERM_STATE_DIR`, which a current build answers from `agterm-debug` and a build predating
+  `DebugStateDirectory` answers from the live state and daemons. After SIGTERM, confirm the tile is gone
+  with `lsappinfo list | grep agterm.debug` and tell Eugene when one lingers.
 - A manual-test pane opens in `$HOME`, and a pane restored from a daemon keeps whatever directory it had.
   Never type a bare `claude` into one. Always send `cd <dir> && claude` with a directory Claude Code
   already trusts, `~/dev.umputun/agterm` by default. A session rooted at `$HOME` treats every dotfile and
@@ -142,14 +245,17 @@ C-boundary concurrency before changing the bridge.
 ## GhosttyKit
 
 - `scripts/setup.sh` builds upstream `ghostty-org/ghostty` at `GHOSTTY_REV` using
-  `zig build -Demit-xcframework=true -Dxcframework-target=native`. No fork or disposable daily build is used.
-- `GHOSTTY_REV` is `683d8db` (2026-08-25), a plain reproducibility pin carrying upstream's hidden-surface
-  GPU release.
+  `zig build -Demit-xcframework=true -Dxcframework-target=native`, after applying
+  `scripts/ghostty-patches/*.patch`. That directory documents the teardown backport and its removal.
+- `GHOSTTY_REV` is `83fb956` (v1.4.0, 2026-10-27), a plain reproducibility pin carrying upstream's
+  hidden-surface GPU release.
   It sat at `4dcb09ada` (2026-04-30) from June while later builds blanked scrollback on a font-size
   increase; upstream fixed that and the case was re-verified by hand before the bump. Re-test the
   font-increase case when moving it, and check `minimum_zig_version` in `build.zig.zon` against
-  `ZIG_FORMULA`. The 0.15 to 0.16 jump came with the `0ba6250` bump, not this one.
-- `.ghostty-build-stamp` records the rev the staged artifacts came from and is what decides a rebuild.
+  `GHOSTTY_ZIG_FORMULA`. zmx has its own `ZMX_ZIG_FORMULA`, so a ghostty compiler jump leaves zmx's
+  stamp and caches valid.
+- `.ghostty-build-stamp` records the revision and patch digest the staged artifacts came from
+  and is what decides a rebuild.
   Presence alone would serve an xcframework built from a different rev silently, so a `GHOSTTY_REV`
   change costs everyone exactly one libghostty rebuild and nobody keeps a stale core by accident.
 - Setup stages the xcframework and `zig-out/share/{ghostty,terminfo}`. All are ignored build artifacts.
@@ -176,10 +282,14 @@ C-boundary concurrency before changing the bridge.
   `GHOSTTY_ACTION_RENDER`, so agterm handles no draw action. Never restore the rejected continuous 120Hz
   poll or use `assumeIsolated`. See [[libghostty]] before advancing `GHOSTTY_REV`.
 - `close_surface_cb` only recovers the view and dispatches; it never frees synchronously.
-- The session-wide overlay slot holds either a caller's program or a HUD. Raw `overlayActive` answers only
-  "the slot is occupied"; every layer asking "is a program covering this session" reads
-  `Session.programOverlayActive` instead. Deck gates, focus routing, zoom, and scratch focus all turn on
-  that distinction, so never spell the predicate inline. `control-api.md` lists the sites.
+- A libdispatch callback closure written inside a `@MainActor` method inherits main-actor isolation, and
+  libdispatch running it on another queue aborts under `dispatch_assert_queue`. Declare such closures
+  `@Sendable` explicitly (`HookProcessRunner`'s `DispatchIO` cleanup and write handlers).
+- The session-wide overlay slot holds a caller's program, an HTML page, or a HUD. Raw `overlayActive` answers
+  only "the slot is occupied"; a layer asking "does a cover own this session's input" reads
+  `Session.coverOverlayVisible`, and one asking about the covering terminal surface reads
+  `programOverlayVisible`; their `Active` forms answer occupancy, hidden or not. Deck gates, focus routing, zoom, and scratch focus all turn on that distinction,
+  so never spell a predicate inline. `control-api.md` lists the sites.
 - A terminal ask has a separate slot on `Session`, independent of the HUD/program overlay slot; see [[control-api]].
 - A long-lived process spawned into a surface needs a stop condition of its own. A hard-killed app runs no
   teardown, and no SIGHUP reaches the process because the pty's session leader is the surviving `login`, so
@@ -211,6 +321,8 @@ C-boundary concurrency before changing the bridge.
 - Event arguments must appear in `EventFormatter.human`, not only JSON payloads.
 - Control API, keymap, and model changes also update bundled
   `plugins/agterm/skills/agterm/`, the sole source for installed Claude/Codex copies.
+  A capability agents should discover unprompted needs a trigger in SKILL.md's `description` and a section
+  or pointer there; a reference.md entry alone is insufficient for discovery.
 - `site/docs.html` is the canonical user guide and `site/commands.html` the canonical command reference.
   `README.md` is the product synopsis: pitch, install, the model, and the control-API demo.
   `site/llms.txt` is the crawler-oriented summary and discovery index.
@@ -223,14 +335,19 @@ C-boundary concurrency before changing the bridge.
   social tags insert `macOS` for search intent, and `site/llms.txt` carries a libghostty-based variant.
 - `site/index.html` reflects major features and current `softwareVersion`; `site/commands.html` mirrors
   every command, arguments, and read-back field.
-- `cookbook/` is not a synchronized surface. Recipes pin a minimum version and are fixed reactively;
+- `cookbook/` is not a synchronized surface. Recipes pin a minimum version;
   its CI checks structure and shell hygiene, not current API parity.
-- Cookbook recipes are third-party work published by their author, not code the project owns.
-  Review asks only three things: it does no harm, deliberately or accidentally; it does what it claims;
+- Every recipe names its author on an `Author:` line and in the index's author column.
+  A recipe by another author is his published work, not code the project owns.
+  An issue asking to fix or change one gets a pointer to `cookbook/CONTRIBUTING.md#bugs-and-improvements` and is
+  closed; bugs in @umputun's recipes follow normal bug handling.
+  Review of a contributed recipe asks only three things: it does no harm, deliberately or accidentally; it does what it claims;
   and it follows `cookbook/CONTRIBUTING.md`.
   Edge cases, minor bugs, and other small findings never block the PR: approve and merge, leaving a note
   for the contributor. That note is where a recipe finding ends: never file it in `docs/backlog/`, which
   is for code the project owns, and never edit a recipe's prose unprompted.
+- A recipe's Limits list only what the recipe causes or cannot do, never general agent behavior.
+  State what the recipe guarantees before a side effect, so the side effect never reads as misrouting.
 - agterm runs only on macOS, so POSIX portability is never a finding by itself. A shellcheck SC3xxx on a
   recipe is a CI lint gate, not a runtime defect: `/bin/sh` there is bash 3.2 and `printf %q` works.
   Never propose a bash shebang as the fix; the mac shell is zsh, and CI's `.zsh` path is `zsh -n`.
@@ -242,12 +359,16 @@ C-boundary concurrency before changing the bridge.
   redirects with 308.
 - Assets are self-hosted: CSS, latin woff2 fonts, WebP screenshots, 1200x630 social card, and favicons.
   Inline page styles come from a design-tool export whose source archive is on the maintainer's Desktop.
+- Browsers cache `style.css` for 4 hours, so a page change that depends on a `style.css` change bumps the
+  `?v=` on its `<link>` in every page, or cached visitors get new HTML with old CSS.
 - Hero images must match the fixed `1187 / 696` ratio, about 1.70:1; capture dense dashboards at that
   ratio before WebP conversion; existing shots are 2374x1392. Dashboard images may floor near 200k versus
   85-172k for single-window shots. Crossfade duration is slides times 5 seconds, delays advance by
   5 seconds, and the opaque keyframe plateau is about `1/slides`.
 - Auto-fit feature grids can strand orphan cards. Use a fixed column count, explicit spans, and narrow
   media fallbacks as in `.surfaces-grid`.
+- Demo and screenshot staging shows two or three agent statuses at most, and never notification badges
+  next to statuses; they are alternative mechanisms.
 
 ## Path-scoped rules
 

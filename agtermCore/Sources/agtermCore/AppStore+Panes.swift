@@ -27,6 +27,10 @@ extension AppStore {
     /// `alreadyFinalized` names a pane whose daemon the CALLER has destroyed, so the teardown does not ask
     /// the finalizer to kill a name that is already gone. Only `zmx kill` passes one.
     func finalizePaneIdentities(_ sessions: [Session], alreadyFinalized: UUID? = nil) {
+        // every pane, an attached one included: its daemon is not ours to kill, its lead state is
+        for session in sessions {
+            ([session.paneIdentity] + [session.splitPaneIdentity].compactMap { $0 }).forEach(ZmxLeadBook.shared.forget)
+        }
         let identities = PaneIdentityInventory.identities(in: sessions).filter { $0 != alreadyFinalized }
         if !identities.isEmpty { paneFinalizer?(identities) }
     }
@@ -62,6 +66,7 @@ extension AppStore {
     }
 
     private func setSplitVisibility(_ session: Session, shown: Bool) {
+        let wasShown = session.isSplit
         // hiding a shown split unmounts its right host, so the pacer must stop expecting that key
         if !shown, session.isSplit, let split = session.splitPaneIdentity { launchPaneDrop?([split]) }
         session.isSplit = shown
@@ -80,8 +85,9 @@ extension AppStore {
         }
         // hiding the split un-renders a pane, so an overlay opened on it that has not realized yet would sit
         // active with no surface and no program forever.
-        session.dropUnrealizedPaneOverlays()
-        save()
+        dropUnrealizedPaneOverlays(of: session)
+        if wasShown != shown { emitPaneVisibility(.paneSplit, session: session, shown: shown) }
+        savePaneLayout(session)
     }
 
     /// Sets a session's split-divider primary-pane fraction, clamped and persisted; returns the applied
@@ -140,11 +146,16 @@ extension AppStore {
             (session.rightOverlaySurface, session.leftOverlaySurface)
         (session.leftOverlayExitCode, session.rightOverlayExitCode) =
             (session.rightOverlayExitCode, session.leftOverlayExitCode)
+        session.remoteOverlays.swapPanes()
+        if holdsPaneOverlay(session) { scheduleTreeChanged() }
+        // rendered text files are keyed by pane identity, which swapped above, so they follow without a move
+        (session.paneBackgrounds.left, session.paneBackgrounds.right) =
+            (session.paneBackgrounds.right, session.paneBackgrounds.left)
 
         var indicator = session.agentIndicator
         if indicator.status == .idle {
             indicator.statusPane = nil
-        } else {
+        } else if session.remotePresentation?.statusOwnerUnknown != true {
             switch indicator.statusPane {
             case nil, .left: indicator.statusPane = .right
             case .right: indicator.statusPane = .left
@@ -155,7 +166,7 @@ extension AppStore {
         // PaneHostIdentity observes this because surface slots are ignored; keep the swap toggle unconditional
         // so a zoom host re-evaluates and sees its new occupant token.
         session.splitFocused.toggle()
-        save()
+        savePaneLayout(session)
         return nil
     }
 
@@ -169,9 +180,30 @@ extension AppStore {
         setAgentIndicator(AgentIndicator(), forSession: session.id)
     }
 
+    /// clearPaneOwnedState drops what the program in `pane` owned when its shell is replaced in place: its
+    /// status, and a HUD, ask or pane overlay anchored to it. The pane, its identity and its persisted pins stay.
+    public func clearPaneOwnedState(_ sessionID: UUID, pane: StatusPane) {
+        guard let session = session(withID: sessionID), pane != .scratch else { return }
+        let identity = pane == .left ? session.paneIdentity : session.splitPaneIdentity
+        if let identity, session.hudPaneIdentity == identity { closeHud(sessionID) }
+        if let identity, session.askPaneIdentity == identity { session.cancelPendingAsk() }
+        let slot: OverlayPane = pane == .left ? .left : .right
+        closePaneOverlay(sessionID, pane: slot)
+        // one handed to another Mac lives in the remote slot only, and the pane's kill does not end its job
+        closeRemoteOverlay(sessionID, pane: slot)
+        clearIndicatorOwnedByPane(pane, of: session)
+    }
+
+    // drops a departing pane's override and its text file; call it before the identity naming the file goes.
+    private func dropPaneBackground(_ pane: StatusPane, of session: Session) {
+        if session.paneBackgrounds[pane]?.kind == .text, let key = session.backgroundFileKey(for: pane) {
+            WatermarkStorage.removeRenderedText(sessionID: session.id, paneKey: key)
+        }
+        session.paneBackgrounds[pane] = nil
+    }
+
     /// Closes the split pane: hides it AND tears down its surface, so a later split starts a fresh shell.
-    /// Reached by the split shell's own exit, by the palette's Close Split and by `session.split.close`;
-    /// resets `splitFocused`, else it points the collapsed view at the gone pane.
+    /// Resets `splitFocused`, else it points the collapsed view at the gone pane.
     public func closeSplit(_ sessionID: UUID, alreadyFinalized: UUID? = nil) {
         guard let session = session(withID: sessionID) else { return }
         if let splitIdentity = session.splitPaneIdentity,
@@ -184,7 +216,12 @@ extension AppStore {
            session.locallyManagedPaneIdentities.contains(splitPaneIdentity) {
             paneFinalizer?([splitPaneIdentity])
         }
-        if let split = session.splitPaneIdentity { launchPaneDrop?([split]) }
+        if let split = session.splitPaneIdentity {
+            launchPaneDrop?([split])
+            ZmxLeadBook.shared.forget(pane: split)
+            MessageBus.shared.dispose(pane: split)
+        }
+        let wasShown = session.isSplit
         session.isSplit = false
         session.hasSplit = false
         session.splitFocused = false
@@ -194,6 +231,7 @@ extension AppStore {
         session.splitCwd = nil
         session.splitTitle = nil
         session.initialSplitCwd = nil
+        dropPaneBackground(.right, of: session)
         session.splitPaneIdentity = nil
         // the right pane is gone: drop its persisted pin, captured/creation commands, and armed payloads so a
         // fresh split is a plain shell. `restore.capture` can fill the capture slot mid-run, so it matters too.
@@ -205,24 +243,34 @@ extension AppStore {
         session.splitCommandWait = false
         session.splitRatio = nil // tearing down the split clears its geometry too, so a fresh split opens even
         // the right pane is gone, so its overlay has nothing left to cover and nobody left to read its status.
+        if session.paneOverlay(.right) != nil { scheduleTreeChanged() }
         session.teardownPaneOverlay(.right)
+        dropRemoteOverlay(.right, of: session)
         // a search bar pinned to the torn-down split surface would stay stuck (the weak `searchSurface`
         // zeroes but `searchActive` stays true), so reset search on the surviving session.
         session.clearSearch()
         // the departing right pane owned any `.right`-tagged block, which no survivor can keystroke-clear.
         clearIndicatorOwnedByPane(.right, of: session)
-        save()
+        if wasShown { emitPaneVisibility(.paneSplit, session: session, shown: false) }
+        savePaneLayout(session)
     }
 
     /// Promote the split's identity, launch state and any mounted surface into the primary slot. An
     /// unmounted sibling must survive too: its factory will consume the promoted command and cwd.
-    /// Without a logical split, the exiting primary was the last pane.
-    public func closePrimaryPane(_ sessionID: UUID, alreadyFinalized: UUID? = nil) {
-        guard let session = session(withID: sessionID) else { return }
+    /// Without a logical split, the exiting primary was the last pane; a local parent with companions
+    /// respawns instead of closing.
+    @discardableResult
+    public func closePrimaryPane(_ sessionID: UUID, alreadyFinalized: UUID? = nil, now: Date = Date()) -> PrimaryPaneExit {
+        guard let session = session(withID: sessionID) else { return .closed }
         guard session.hasSplit else {
+            if respawnsOnLastPaneExit(session, now: now) {
+                respawnPrimaryPane(session, now: now)
+                return .respawned
+            }
             closeSession(sessionID, alreadyFinalized: alreadyFinalized)
-            return
+            return .closed
         }
+        defer { savePaneLayout(session) }
         if session.hudPaneIdentity == session.paneIdentity { closeHud(sessionID) }
         if session.askPaneIdentity == session.paneIdentity { session.cancelPendingAsk() }
         let priorPrimary = session.surface // the exiting pane, torn down below; scopes the search reset
@@ -230,8 +278,14 @@ extension AppStore {
         session.splitSurface?.promoteToPrimaryPane()
         session.surface = session.splitSurface
         session.splitSurface = nil
+        ZmxLeadBook.shared.forget(pane: session.paneIdentity)
+        MessageBus.shared.dispose(pane: session.paneIdentity)
+        // the survivor's override moves left with it; its text file is keyed by the identity promoted below
+        dropPaneBackground(.left, of: session)
+        (session.paneBackgrounds.left, session.paneBackgrounds.right) = (session.paneBackgrounds.right, nil)
         session.paneIdentity = session.splitPaneIdentity ?? UUID()
         session.splitPaneIdentity = nil
+        let wasShown = session.isSplit
         session.isSplit = false
         session.hasSplit = false
         session.splitFocused = false
@@ -264,8 +318,12 @@ extension AppStore {
         session.splitCommandWait = false
         // the pane overlays follow their panes: the exiting primary's dies with it, the survivor's moves into
         // the left slot WITH its exit code, so `session.overlay.result --pane left` still answers afterwards.
+        // a torn-down left overlay and a right one changing role both move the tree's pane slots
+        if holdsPaneOverlay(session) { scheduleTreeChanged() }
         session.teardownPaneOverlay(.left)
         session.promotePaneOverlay()
+        dropRemoteOverlay(.left, of: session)
+        session.remoteOverlays.promoteRight()
         // reset search only if the torn-down primary owned the bar (or the weak ref already dangled), so a
         // search owned by the SURVIVING pane stays valid across promotion — `closeScratch`'s identity guard.
         if session.searchSurface == nil || session.searchSurface === priorPrimary {
@@ -274,23 +332,32 @@ extension AppStore {
         // the exited primary owned any `.left`/nil tag, which dies with it; a `.right` tag belonged to the
         // survivor and FOLLOWS it, re-tagged `.left` so `tree` (now `split:false`) and the survivor's
         // `.left`-role keystroke-clear agree instead of contradicting. `.scratch` is untouched.
-        if session.agentIndicator.status != .idle {
+        if session.agentIndicator.status != .idle, session.remotePresentation?.statusOwnerUnknown != true {
             switch session.agentIndicator.statusPane ?? .left {
             case .left: setAgentIndicator(AgentIndicator(), forSession: session.id)
             case .right:
                 var promoted = session.agentIndicator
                 promoted.statusPane = .left
+                // a re-tag, not a write: the setter would take a mirrored glyph away from the bridge
+                let bridged = session.remotePresentation?.statusBridged ?? false
                 setAgentIndicator(promoted, forSession: session.id)
+                session.remotePresentation?.statusBridged = bridged
             case .scratch: break
             }
         }
-        save()
+        if wasShown { emitPaneVisibility(.paneSplit, session: session, shown: false) }
+        return .promoted
     }
 
-    /// Preserve the primary even before its surface mounts. A promoted split has no sibling and closes the session.
-    public func closeSplitPane(_ sessionID: UUID, alreadyFinalized: UUID? = nil) {
+    /// Preserve the primary even before its surface mounts. A promoted split has no sibling and closes
+    /// the session; a local parent with companions respawns instead.
+    public func closeSplitPane(_ sessionID: UUID, alreadyFinalized: UUID? = nil, now: Date = Date()) {
         guard let session = session(withID: sessionID) else { return }
         guard session.hasSplit else {
+            if respawnsOnLastPaneExit(session, now: now) {
+                respawnPrimaryPane(session, now: now)
+                return
+            }
             closeSession(sessionID, alreadyFinalized: alreadyFinalized)
             return
         }
@@ -304,10 +371,12 @@ extension AppStore {
     /// replacing it. NOT persisted.
     /// - `sizePercent` (clamped to 1...100) requests a *floating* overlay: an opaque framed panel at that
     ///   percent of the pane with the session visible behind it; nil gives the full-pane overlay that hides it.
+    /// - `points` overrides that percent per axis; ignored without one.
     /// - `backgroundColor` (`#rrggbb`) gives the overlay pane its own solid background, independent of the
     ///   session's; nil leaves the default theme background. Read by the overlay factory at creation.
     @discardableResult public func openOverlay(_ sessionID: UUID, command: String, cwd: String? = nil,
                                                wait: Bool = false, sizePercent: Int? = nil,
+                                               points: OverlayPointSize = OverlayPointSize(),
                                                backgroundColor: String? = nil) -> Bool {
         guard let session = session(withID: sessionID) else { return false }
         if session.hudActive { closeOverlay(sessionID) }
@@ -317,24 +386,62 @@ extension AppStore {
         session.overlayCwd = cwd
         session.overlayWait = wait
         session.overlayExitCode = nil
+        session.remoteOverlays.clearFailure(nil)
         session.overlaySizePercent = sizePercent.map { min(100, max(1, $0)) }
+        session.overlayPoints = sizePercent == nil ? OverlayPointSize() : points
         session.overlayBackgroundColor = backgroundColor
         session.overlayActive = true
+        scheduleTreeChanged()
         return true
     }
 
     /// Resizes an already-open overlay in place: `sizePercent` (clamped to 1...100) switches it to floating,
     /// nil to the translucent full-pane overlay, as in `openOverlay`. The surface stays mounted (the detail
     /// pane hosts both variants), so only the layout re-flows and the program never re-spawns. False with no
-    /// open overlay. A HUD in the slot takes the narrower `HudLayout.clampSizePercent` bound instead, so no
+    /// open overlay. A HUD in the slot takes the `HudLayout.clampSizePercent(_:for:)` bound instead, so no
     /// resize path can grow a message until it covers the session it is about, and the percent reaches its
-    /// WIDTH alone: its height stays measured from the message, which a resize does not change (the text
-    /// wraps at `HudLayout.maxColumns`, not at the panel).
-    @discardableResult public func resizeOverlay(_ sessionID: UUID, sizePercent: Int?) -> Bool {
+    /// WIDTH alone. That width is recorded as forced, so it holds through later remeasures until the next
+    /// open or update; the caller owes the panel a `remeasureHud` for the height the new width needs.
+    /// `points` replaces the panel's point overrides whole, so an axis it omits goes back to the percent; a
+    /// full resize clears them. A HUD takes none.
+    @discardableResult public func resizeOverlay(_ sessionID: UUID, sizePercent: Int?,
+                                                 points: OverlayPointSize = OverlayPointSize()) -> Bool {
         guard let session = session(withID: sessionID), session.overlayActive else { return false }
-        let hud = session.hudActive
-        session.overlaySizePercent = sizePercent.map { hud ? HudLayout.clampSizePercent($0) : min(100, max(1, $0)) }
+        // a page companion's page is the row, so it stays full size
+        guard session.content == .terminal || sizePercent == nil else { return false }
+        guard let spec = session.hudSpec, session.hudActive else {
+            session.overlaySizePercent = sizePercent.map { min(100, max(1, $0)) }
+            session.overlayPoints = sizePercent == nil ? OverlayPointSize() : points
+            return true
+        }
+        session.overlaySizePercent = sizePercent.map { HudLayout.clampSizePercent($0, for: spec) }
+        session.hudResizedWidthPercent = session.overlaySizePercent
         return true
+    }
+
+    /// Sets a live HUD's size as one step, the width bounded for its own spec. `forcedWidthPercent` is what
+    /// `overlay.resize` left in force, nil when the width is the spec's own; a rollback passes back what it
+    /// captured, so a failed write cannot turn a measured width into a forced one.
+    @discardableResult public func setHudSize(_ sessionID: UUID, size: HudPanelSize,
+                                              forcedWidthPercent: Int?) -> Bool {
+        guard let session = session(withID: sessionID), let spec = session.hudSpec, session.hudActive else {
+            return false
+        }
+        session.overlaySizePercent = HudLayout.clampSizePercent(size.widthPercent, for: spec)
+        session.hudHeightPercent = size.heightPercent
+        session.hudHeightPoints = size.heightPoints
+        session.hudResizedWidthPercent = forcedWidthPercent
+        return true
+    }
+
+    /// Measures the live HUD again for `pane` and stores the result: wrap, rows, width and height together,
+    /// at the forced width when one is in force. Everything else about the panel is left alone — spec, pane
+    /// scope, slot generation, auto-hide — which is what separates this from an update.
+    @discardableResult public func remeasureHud(_ sessionID: UUID, pane: PaneMetrics) -> Bool {
+        guard let session = session(withID: sessionID), let spec = session.effectiveHudSpec,
+              session.hudActive else { return false }
+        return setHudSize(sessionID, size: HudLayout.panelSize(for: spec, pane: pane),
+                          forcedWidthPercent: session.hudResizedWidthPercent)
     }
 
     /// Records the overlay program's exit status (parsed app-side from the wrapper's temp file at surface
@@ -347,58 +454,76 @@ extension AppStore {
     /// never kept alive. Used on explicit close and when the program exits. No-op (false) with no overlay.
     @discardableResult public func closeOverlay(_ sessionID: UUID) -> Bool {
         guard let session = session(withID: sessionID), session.overlayActive else { return false }
+        // a page companion is its page: every way the page closes ends the row, which releases the page once
+        if session.content == .page, session.htmlOverlay != nil {
+            closeSession(sessionID)
+            return true
+        }
+        let replica = session.overlayReplica
+        session.overlayReplica = nil
         session.overlayActive = false
+        session.overlayHidden = false
+        session.forgetSessionCoverHolds()
         session.overlaySurface?.teardown()
         session.overlaySurface = nil
+        HtmlOverlayReleases.shared.release(session.htmlOverlay)
+        session.htmlOverlay = nil
         session.overlayCommand = nil
         session.overlayCwd = nil
         session.overlayWait = false
         session.overlaySizePercent = nil
+        session.overlayPoints = OverlayPointSize()
         session.overlayBackgroundColor = nil
         // every teardown routes through here — explicit close, ⌘W, the program's own exit, a replacement —
         // so discarding the HUD here is what keeps `hudActive` and its body file from outliving the slot they
         // describe, including for a HUD whose surface never realized and so never tore itself down.
         session.discardHudBody()
+        if let replica { session.onReplicaOverlayClosed?(replica.job) }
+        scheduleTreeChanged()
         return true
     }
 
     /// Opens a HUD in the session's overlay slot: a passive message panel rendered by the app's bundled
     /// helper, which `command` runs and which re-reads `file` every tick. Always FLOATING and always within
-    /// `HudLayout.clampSizePercent` — the app's measurement or the caller's `spec.sizePercent`, whichever
+    /// `HudLayout.clampSizePercent(_:for:)` — the app's measurement or the caller's `spec.sizePercent`, whichever
     /// applies, bounded — because a HUD must never cover the session it is a message about.
     ///
     /// A live HUD is REPLACED (torn down and re-opened, so the helper picks up the new file), a live
     /// PROGRAM overlay refuses. False for an unknown session or an occupied program slot. NOT persisted.
+    /// `fontSize` is the effective size the caller measured with; it is stored only after `openOverlay` has
+    /// torn down a replaced HUD, whose teardown clears it.
     @discardableResult public func openHud(_ sessionID: UUID, command: String, spec: HudSpec, file: String,
-                                           size: HudPanelSize, paneIdentity: UUID? = nil) -> Bool {
+                                           size: HudPanelSize, paneIdentity: UUID? = nil,
+                                           fontSize: Double? = nil) -> Bool {
         guard openOverlay(sessionID, command: command,
-                          sizePercent: HudLayout.clampSizePercent(size.widthPercent),
+                          sizePercent: HudLayout.clampSizePercent(size.widthPercent, for: spec),
                           backgroundColor: spec.backgroundColor),
               let session = session(withID: sessionID) else { return false }
         session.hudSpec = spec
         session.hudPaneIdentity = paneIdentity
         session.hudFile = file
         session.hudHeightPercent = size.heightPercent
+        session.hudHeightPoints = size.heightPoints
+        session.hudResizedWidthPercent = nil
+        session.hudFontSize = fontSize
         return true
     }
 
     /// Rewrites a live HUD's message and size in place: the surface stays mounted and the helper re-reads
     /// its body file on the next tick, so the panel changes with no re-spawn and no blink. The file path is
     /// not an argument — an update rewrites the path `openHud` already gave the running helper, per
-    /// `HudLayout.renderedBody`. The background color is not an argument either in practice: the factory
-    /// reads it at creation, so the LIVE panel's color is carried into the stored spec and `spec`'s own is
-    /// dropped. Only a replacing `openHud` changes the color, and the read-back keeps naming what the panel
+    /// `HudLayout.renderedBody`. The background color and font size are not arguments either in practice: the
+    /// factory reads both at creation, so the LIVE panel's are carried into the stored spec and `spec`'s own
+    /// are dropped. Only a replacing `openHud` changes them, and the read-back keeps naming what the panel
     /// actually paints. False with no HUD up, which is the only failure: `resizeOverlay` refuses an empty
     /// slot alone, and a live HUD occupies one.
     @discardableResult public func updateHud(_ sessionID: UUID, spec: HudSpec, size: HudPanelSize,
                                              paneIdentity: UUID? = nil) -> Bool {
         guard let session = session(withID: sessionID), let live = session.hudSpec,
               session.hudActive else { return false }
-        session.hudSpec = spec.withBackgroundColor(live.backgroundColor)
+        session.hudSpec = spec.holdingCreationFields(of: live)
         session.hudPaneIdentity = paneIdentity
-        session.hudHeightPercent = size.heightPercent
-        resizeOverlay(sessionID, sizePercent: size.widthPercent)
-        return true
+        return setHudSize(sessionID, size: size, forcedWidthPercent: nil)
     }
 
     /// Closes a HUD through the ordinary overlay teardown. Refused when the slot holds a caller's PROGRAM,
@@ -406,6 +531,16 @@ extension AppStore {
     @discardableResult public func closeHud(_ sessionID: UUID) -> Bool {
         guard let session = session(withID: sessionID), session.hudActive else { return false }
         return closeOverlay(sessionID)
+    }
+
+    /// Whether either pane holds an overlay, local or handed to a viewer: what a swap or a promotion moves.
+    private func holdsPaneOverlay(_ session: Session) -> Bool {
+        OverlayPane.allCases.contains { session.paneOverlay($0) != nil || session.remoteOverlays.slot($0) != nil }
+    }
+
+    /// `Session.dropUnrealizedPaneOverlays` plus the tree invalidation a dropped slot owes.
+    public func dropUnrealizedPaneOverlays(of session: Session) {
+        if session.dropUnrealizedPaneOverlays() { scheduleTreeChanged() }
     }
 
     /// Opens a pane-scoped overlay covering `pane` only, leaving the sibling pane live and interactive.
@@ -422,8 +557,11 @@ extension AppStore {
         // the slot would sit active with no program — reject instead of opening a dead overlay.
         guard session.rendersPane(pane) else { return .paneNotVisible }
         session.setPaneOverlayExitCode(nil, pane: pane)
-        session.setPaneOverlay(PaneOverlay(command: command, cwd: cwd, backgroundColor: backgroundColor,
-                                           wait: wait), pane: pane)
+        session.remoteOverlays.clearFailure(pane)
+        var overlay = PaneOverlay(command: command, cwd: cwd, backgroundColor: backgroundColor, wait: wait)
+        overlay.holdsSessionCover = session.coverOverlayActive
+        session.setPaneOverlay(overlay, pane: pane)
+        scheduleTreeChanged()
         return nil
     }
 
@@ -437,34 +575,46 @@ extension AppStore {
     /// overlay, never kept alive. The exit code SURVIVES, cleared only by the next open on that pane. Used
     /// on explicit close and when the program exits. No-op (false) with no overlay on that pane.
     @discardableResult public func closePaneOverlay(_ sessionID: UUID, pane: OverlayPane) -> Bool {
-        guard let session = session(withID: sessionID), session.paneOverlay(pane) != nil else { return false }
+        guard let session = session(withID: sessionID), let overlay = session.paneOverlay(pane) else { return false }
+        HtmlOverlayReleases.shared.release(overlay.html)
         session.setPaneOverlay(nil, pane: pane)
         session.paneOverlaySurface(pane)?.teardown()
         session.setPaneOverlaySurface(nil, pane: pane)
+        if let replica = overlay.replica { session.onReplicaOverlayClosed?(replica.job) }
+        scheduleTreeChanged()
         return true
     }
 
     /// Toggles the scratch terminal — a third, full-overlay login shell. Its surface is created lazily by the
     /// detail pane and, like the split, kept alive when hidden, so a re-show reuses the same shell. Not
     /// persisted, so no `save()`.
-    public func toggleScratch(_ sessionID: UUID) {
+    /// `emitVisibility: false` is for a teardown-and-respawn whose final shown state equals its initial one,
+    /// where a hidden-then-shown pair would break the "real change only" contract of `pane.scratch`.
+    public func toggleScratch(_ sessionID: UUID, emitVisibility: Bool = true) {
         guard let session = session(withID: sessionID) else { return }
         session.scratchActive.toggle()
+        if emitVisibility { emitPaneVisibility(.paneScratch, session: session, shown: session.scratchActive) }
     }
 
     /// Closes the scratch terminal: hides it AND tears down its surface, so a later show starts a fresh
     /// shell. Used on the scratch shell's own `exit` and on session/workspace/window teardown; false with no
     /// scratch surface.
-    @discardableResult public func closeScratch(_ sessionID: UUID) -> Bool {
+    @discardableResult public func closeScratch(_ sessionID: UUID, emitVisibility: Bool = true) -> Bool {
         guard let session = session(withID: sessionID), let scratch = session.scratchSurface else { return false }
+        let wasShown = session.scratchActive
         session.scratchActive = false
+        if wasShown, emitVisibility { emitPaneVisibility(.paneScratch, session: session, shown: false) }
         // a search bar pinned to the scratch being torn down would stay stuck; guarded on identity so a
         // search owned by the main/split pane survives.
         if session.searchSurface === scratch { session.clearSearch() }
         // the `.scratch`-tagged block loses its owning surface here; a main/split tag survives (helper guards).
         clearIndicatorOwnedByPane(.scratch, of: session)
+        // a respawned scratch runs another program, so a label for the old one must not carry over
+        dropPaneBackground(.scratch, of: session)
+        disposeMailbox(token: scratch.paneToken)
         scratch.teardown()
         session.scratchSurface = nil
+        session.scratchGeneration += 1
         return true
     }
 }

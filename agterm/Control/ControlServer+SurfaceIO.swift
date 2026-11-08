@@ -36,6 +36,7 @@ extension ControlServer {
             guard let surface = chosen as? GhosttySurfaceView else {
                 return ControlResponse(ok: false, error: "session not realized")
             }
+            if let refusal = self.coveredRefusal(surface) { return refusal }
             surface.expediteSpawn()
             // the cast alone only proves the SLOT is filled; a false return is the view without a surface.
             guard surface.performBindingAction(action) else {
@@ -52,6 +53,7 @@ extension ControlServer {
     /// hidden, its surface kept alive. A resolved-but-unrealized pane returns `session not realized` rather
     /// than silently no-opping in the layout beat after the pane is shown.
     /// Only the surface currently in the main role persists its size; split-role and scratch changes stay live-only.
+    /// A pane under an HTML page steps the app-wide page zoom instead, as the keys do.
     func font(_ target: String?, window: String?, pane: StatusPane?, action: String) -> ControlResponse {
         return resolver.resolveSession(target, window: window) { store, id in
             // resolveSession already resolved `id` from this store, so `session(withID:)` is non-nil.
@@ -72,6 +74,12 @@ extension ControlServer {
                     return ControlResponse(ok: false, error: "session has no scratch terminal")
                 }
                 chosen = scratch
+            }
+            // after the pane checks, so a missing pane keeps its error, and before the realized one, since a
+            // page zooms without its terminal
+            if session.htmlHidesTerminal(pane) {
+                self.settingsModel.stepHtmlOverlayZoom(action)
+                return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
             }
             guard let surface = chosen as? GhosttySurfaceView else {
                 return ControlResponse(ok: false, error: "session not realized")
@@ -113,6 +121,7 @@ extension ControlServer {
             guard surface.isRealized else {
                 return ControlResponse(ok: false, error: "session not realized")
             }
+            if let refusal = self.coveredRefusal(surface) { return refusal }
             guard let text = surface.readSelection() else {
                 return ControlResponse(ok: false, error: "no selection")
             }
@@ -130,9 +139,15 @@ extension ControlServer {
     /// session-wide slot. Shared by both, so `no overlay` and `overlay not realized` cannot come to mean
     /// different things on one command than the other. A filled slot with an unrealized surface is the ms
     /// after `overlay.open`, and it names the OVERLAY rather than borrowing `session not realized`: the
-    /// session is fine, it is the cover that is not up. A HUD is refused ahead of everything, `overlayActive`
-    /// alone being unable to tell the app's own painter from a caller's program.
+    /// session is fine, it is the cover that is not up. An overlay shown on another Mac is refused first, then
+    /// a HUD, `overlayActive` alone being unable to tell the app's own painter from a caller's program.
     private func overlayReadSurface(_ session: Session, pane: OverlayPane?) -> OverlayReadSurface {
+        if let slot = session.remoteOverlays.slot(pane) {
+            return .rejected(ControlResponse(ok: false, error: slot.page == nil ? OverlayResultError.shownElsewhere : OverlayHtmlError.noRead))
+        }
+        if session.htmlCovers(pane) {
+            return .rejected(ControlResponse(ok: false, error: OverlayHtmlError.noRead))
+        }
         let occupied: Bool
         let surface: (any TerminalSurface)?
         if let pane {
@@ -215,30 +230,38 @@ extension ControlServer {
             guard let session = store.session(withID: id) else {
                 return ControlResponse(ok: false, error: "no such session")
             }
+            // an override for a pane that does not exist would outlive nothing and land on the next one
+            if options.pane == .right, !session.hasSplit {
+                return ControlResponse(ok: false, error: "session has no split pane")
+            }
+            if options.pane == .scratch, session.scratchSurface == nil {
+                return ControlResponse(ok: false, error: "session has no scratch terminal")
+            }
             // gate on a real change: applyWatermark RETAINS a per-surface config freed only on teardown, so
             // re-applying an unchanged spec (a scripted set-loop) leaks owned configs. the store no-ops too.
-            guard store.setBackgroundWatermark(watermark, forSession: id) else {
+            guard store.setBackgroundWatermark(watermark, forSession: id, pane: options.pane) else {
                 return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
             }
-            // clearing a `.text` watermark drops its rendered PNG so the state dir doesn't accumulate.
-            if watermark == nil { WatermarkStorage.removeRenderedText(sessionID: id) }
-            applyWatermark(to: session)
+            // clearing a `.text` default drops its rendered PNG so the state dir doesn't accumulate.
+            if watermark == nil, options.pane == nil { WatermarkStorage.removeRenderedText(sessionID: id) }
+            applyWatermark(to: session, pane: options.pane)
             return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
         }
     }
 
-    /// Apply a session's watermark spec to its realized main + split + scratch surfaces. A never-realized one
-    /// (nil) is skipped — it applies the spec itself on creation (`GhosttySurfaceView.createSurface`).
-    private func applyWatermark(to session: Session) {
-        for surface in [session.surface, session.splitSurface, session.scratchSurface] {
+    // a default change skips overridden panes: re-applying one would drop its live OSC 11 latch
+    private func applyWatermark(to session: Session, pane: StatusPane?) {
+        let slots: [(StatusPane, (any TerminalSurface)?)] = [(.left, session.surface), (.right, session.splitSurface),
+                                                             (.scratch, session.scratchSurface)]
+        for (slot, surface) in slots where pane == slot || (pane == nil && session.paneBackgrounds[slot] == nil) {
             (surface as? GhosttySurfaceView)?.applyWatermarkFromSession()
         }
     }
 
     /// Returns a pane's terminal buffer as plain text: the visible screen by default, screen + scrollback
-    /// with `all`, or the last `lines` lines (reads the screen, then trims). `paneID` resolves the surface's
-    /// live slot before `pane`, which picks left/right/scratch (the scratch readable while hidden, its surface
-    /// kept alive), or the on-screen pane when omitted. `all` and `lines` are mutually exclusive and `lines`
+    /// with `all`, or the last `lines` lines (reads the screen, then trims). `Session.paneAddress` resolves
+    /// `paneID` and `pane` to left/right/scratch (the scratch readable while hidden, its surface kept alive),
+    /// or the on-screen pane when both are omitted. Success names the pane read in `result.pane`. `all` and `lines` are mutually exclusive and `lines`
     /// must be > 0, rejected here as well as in the CLI so a raw socket client can't bypass it.
     /// A genuinely blank screen reads ok with an empty string; a failed read is an error, not a silent empty.
     func readSessionText(_ target: String?, window: String?, options: ControlSessionTextOptions) -> ControlResponse {
@@ -253,7 +276,11 @@ extension ControlServer {
             guard let session = store.session(withID: id) else {
                 return ControlResponse(ok: false, error: "session not realized")
             }
-            let pane = Self.resolvedSessionTextPane(in: session, pane: options.pane, paneID: options.paneID)
+            let pane: StatusPane?
+            switch session.paneAddress(token: options.paneID, pane: options.pane) {
+            case .unknownToken(let token): return Self.unknownPaneID(token)
+            case .pane(let resolved): pane = resolved
+            }
             let chosen: (any TerminalSurface)?
             switch pane {
             case nil:
@@ -283,18 +310,20 @@ extension ControlServer {
             guard surface.isRealized else {
                 return ControlResponse(ok: false, error: "session not realized")
             }
-            guard let text = surface.readScreenText(all: all, lines: lines) else {
-                return ControlResponse(ok: false, error: "failed to read surface buffer")
-            }
-            return ControlResponse(ok: true, result: ControlResult(text: text))
+            let read: StatusPane = surface === session.scratchSurface ? .scratch
+                : (surface === session.splitSurface ? .right : .left)
+            var response = self.coveredText(surface, all: all, lines: lines)
+                ?? surface.readScreenText(all: all, lines: lines).map {
+                    ControlResponse(ok: true, result: ControlResult(text: $0))
+                }
+                ?? ControlResponse(ok: false, error: "failed to read surface buffer")
+            if response.ok { response.result?.pane = read.rawValue }
+            return response
         }
     }
 
-    /// A stable surface token wins over its baked role by resolving against the session's current slots.
-    /// Empty or unknown tokens preserve the explicit pane fallback.
-    static func resolvedSessionTextPane(in session: Session, pane: StatusPane?,
-                                        paneID: String?) -> StatusPane? {
-        paneID.flatMap { session.paneRole(forToken: $0) } ?? pane
+    static func unknownPaneID(_ token: String) -> ControlResponse {
+        ControlResponse(ok: false, error: "unknown pane id: \(token)")
     }
 
     /// Returns the addressed surface's zero-based cursor column. Takes `surface.zoom`'s target vocabulary —
@@ -302,8 +331,26 @@ extension ControlServer {
     /// window's active surface — so both `surface.*` commands address the same set. Unlike zoom it changes
     /// nothing, so it neither selects nor realizes the target: an unrealized surface is reported, not waited
     /// for. `GhosttySurfaceView.readCursorColumn` owns how the column is derived and when it declines.
-    func readSurfaceCursor(_ target: String?, window: String?) -> ControlResponse {
+    ///
+    /// a nonempty `paneID` requires a session target and resolves left, right or scratch.
+    func readSurfaceCursor(_ target: String?, window: String?, paneID: String?) -> ControlResponse {
         let rawTarget = trimmed(target) ?? "active"
+        if let paneID, !paneID.isEmpty {
+            guard rawTarget != "quick", TerminalSurfaceID(rawValue: rawTarget) == nil else {
+                return ControlResponse(ok: false, error: "surface.cursor: --pane-id takes a session target")
+            }
+            return resolver.resolveSession(rawTarget, window: window) { store, id in
+                guard let session = store.session(withID: id), let pane = session.paneRole(forToken: paneID),
+                      let kind = TerminalZoomSurface(controlName: pane.rawValue) else {
+                    return Self.unknownPaneID(paneID)
+                }
+                let zoomTarget = TerminalZoomTarget.session(id, kind)
+                guard TerminalZoomController.isTargetValid(zoomTarget, in: store) else {
+                    return ControlResponse(ok: false, error: "surface not available: \(zoomTarget.controlID)")
+                }
+                return cursorResponse(kind.surface(in: session) as? GhosttySurfaceView, controlID: zoomTarget.controlID)
+            }
+        }
         if rawTarget == "quick" {
             // `hide()` deliberately keeps the panel's surface alive, so visibility is the gate, not the
             // surface existing — otherwise a panel shown once stays readable forever. Same test `setZoom` makes.
@@ -350,6 +397,10 @@ extension ControlServer {
         return cursorResponse(kind.surface(in: session) as? GhosttySurfaceView, controlID: resolved.target.controlID)
     }
 
+    func readSurfaceCursor(_ target: String?, window: String?) -> ControlResponse {
+        readSurfaceCursor(target, window: window, paneID: nil)
+    }
+
     private func cursorResponse(_ surface: GhosttySurfaceView?, controlID: String) -> ControlResponse {
         guard let surface else {
             return ControlResponse(ok: false, error: "surface not available: \(controlID)")
@@ -359,6 +410,7 @@ extension ControlServer {
         guard surface.isRealized else {
             return ControlResponse(ok: false, error: "surface not realized")
         }
+        if let covered = coveredCursor(surface, controlID: controlID) { return covered }
         guard let column = surface.readCursorColumn() else {
             return ControlResponse(ok: false, error: "failed to read cursor position")
         }
@@ -409,6 +461,13 @@ extension ControlServer {
             }
         }
 
+        // the PINNED owner when a search is open, else the pane an open would land on: split focus can move
+        // while a search stays bound to its pane. Close, above, stays available as cleanup.
+        if let owner = (session.searchSurface ?? session.onScreenSurface) as? GhosttySurfaceView,
+           let refusal = coveredRefusal(owner) {
+            return refusal
+        }
+
         // open/needle/navigate need the bar + highlights visible, so select the target (which also realizes
         // a never-shown surface). The OPEN uses the search target — a covering scratch wins, mirroring
         // `AppActions.searchTarget()`, else the focused pane; the factory pins it as `searchSurface`.
@@ -429,6 +488,8 @@ extension ControlServer {
             return ControlResponse(ok: false, error: "session not realized")
         }
 
+        // the role can change across every wait below, so the owner is re-checked before each mutation
+        if let refusal = coveredRefusal((session.searchSurface as? GhosttySurfaceView) ?? openSurface) { return refusal }
         openSurface.expediteSpawn()
         // `searchActive` here means a prior open settled (set by the async START callback); two rapid
         // scripted opens could mis-toggle, but the GUI's single-⌘F path is the common case.
@@ -447,6 +508,7 @@ extension ControlServer {
             if needleChanged {
                 await Task.yield()
                 try? await Task.sleep(nanoseconds: 30_000_000)
+                if let refusal = coveredRefusal(surface) { return refusal }
                 session.searchTotal = nil
                 session.searchSelected = nil
             }
@@ -471,37 +533,12 @@ extension ControlServer {
             try? await Task.sleep(nanoseconds: 30_000_000)
             if session.searchTotal != nil { break }
         }
+        if let refusal = coveredRefusal(surface) { return refusal }
         // an empty display string (the bar opened with no query yet) maps to nil so the CLI prints `ok`
         // rather than a blank line; the count is nil until a query runs.
         let display = session.searchDisplayText
         return ControlResponse(ok: true, result: ControlResult(text: display.isEmpty ? nil : display,
                                                                count: session.searchTotal))
-    }
-
-    /// Identity comparison and delivery must stay synchronous on the main actor: a swap cannot interleave.
-    func injectGuardedText(_ text: String, into id: UUID, store: AppStore, pane: StatusPane?, expectedPaneID: String,
-                           send: (GhosttySurfaceView, String) -> Bool = { $0.injectAsUserInput(text: $1) }) -> ControlResponse {
-        guard let expected = UUID(uuidString: expectedPaneID) else {
-            return ControlResponse(ok: false, error: "--expect-pane-id must be a UUID")
-        }
-        guard pane == .left || pane == .right else {
-            return ControlResponse(ok: false, error: "--expect-pane-id requires explicit --pane left or right")
-        }
-        guard let session = store.session(withID: id) else {
-            return ControlResponse(ok: false, error: "session not found")
-        }
-        let identity = pane == .left ? session.paneIdentity : (session.hasSplit ? session.splitPaneIdentity : nil)
-        guard identity == expected else {
-            return ControlResponse(ok: false, error: "pane identity mismatch")
-        }
-        guard let surface = (pane == .left ? session.surface : session.splitSurface) as? GhosttySurfaceView else {
-            return ControlResponse(ok: false, error: "session not realized")
-        }
-        guard UUID(uuidString: surface.paneToken) == expected else {
-            return ControlResponse(ok: false, error: "pane identity mismatch")
-        }
-        guard send(surface, text) else { return ControlResponse(ok: false, error: "session not realized") }
-        return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
     }
 
     /// Injects `text` into session `id`'s surface. The deck mounts every session, but realization still
@@ -528,8 +565,18 @@ extension ControlServer {
     /// previous session's auto-reset indicator, and rewrites recency. `quick.type` polls after `quick show`
     /// for the same reason. A call that succeeds on the first probe pays no wait at all; the sleeps below are
     /// only reached once that probe has already failed.
+    ///
+    /// `token` is the pane id the main pane was resolved from. The wait follows it into whichever slot holds
+    /// that terminal at each probe, so a swap or a close cannot hand the keystrokes to another terminal.
     func injectText(_ text: String, into id: UUID, store: AppStore, select: Bool,
-                    pane: StatusPane?) async -> ControlResponse {
+                    pane: StatusPane?, token: String? = nil) async -> ControlResponse {
+        // a pane that does not lead its daemon takes scripted input through the daemon, never through
+        // its own surface, whose keystrokes the daemon drops
+        let session = store.session(withID: id)
+        let slot = pane == .right ? session?.splitSurface : (pane == .scratch ? nil : session?.surface)
+        if let surface = slot as? GhosttySurfaceView, let covered = coveredType(text, into: surface, session: id) {
+            return covered
+        }
         switch pane {
         case nil, .left:
             break
@@ -571,10 +618,25 @@ extension ControlServer {
         (store.session(withID: id)?.surface as? GhosttySurfaceView)?.expediteSpawn()
         for _ in 0..<12 {
             try? await Task.sleep(nanoseconds: 30_000_000)
+            let live = store.session(withID: id)
+            var role = StatusPane.left
+            if let token {
+                guard let current = live?.paneRole(forToken: token) else { return Self.unknownPaneID(token) }
+                role = current
+            }
+            let slot = role == .right ? live?.splitSurface : (role == .scratch ? live?.scratchSurface : live?.surface)
             // poll for the surface AND its realization (a false inject keeps polling), so a just-created or
             // just-selected session isn't reported ok before its libghostty surface is up.
-            if let surface = store.session(withID: id)?.surface as? GhosttySurfaceView, surface.injectAsUserInput(text: text) {
-                return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
+            if let surface = slot as? GhosttySurfaceView {
+                // a pane that realized during the wait may have come up managed, or following
+                var response = coveredType(text, into: surface, session: id)
+                if response == nil, surface.injectAsUserInput(text: text) {
+                    response = ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
+                }
+                if var response {
+                    if response.ok, token != nil { response.result?.pane = role.rawValue }
+                    return response
+                }
             }
         }
         return ControlResponse(ok: false, error: "session not realized")

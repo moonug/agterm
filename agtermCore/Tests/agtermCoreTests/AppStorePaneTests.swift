@@ -361,6 +361,40 @@ struct AppStorePaneTests {
         #expect(node.backedByZmx == true)
     }
 
+    @Test func controlTreeReportsEachPanesLeadOnceItsZmxHasReportedOne() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        session.surface = SpySurface(backedByZmx: true)
+        session.hasSplit = true
+        session.isSplit = true
+        session.splitPaneIdentity = UUID()
+        session.splitSurface = SpySurface(backedByZmx: true)
+        func lead(_ kind: String) -> ZmxLeadRole? {
+            store.controlTree().workspaces[0].sessions[0].surfaces?.first { $0.kind == kind }?.lead
+        }
+        #expect(lead("left") == nil)
+
+        let book = ZmxLeadBook.shared
+        book.begin(ZmxLeadAttachment(nonce: "l", claim: true), pane: session.paneIdentity)
+        book.begin(ZmxLeadAttachment(nonce: "r", claim: true), pane: try #require(session.splitPaneIdentity))
+        defer {
+            book.forget(pane: session.paneIdentity)
+            session.splitPaneIdentity.map(book.forget)
+        }
+        #expect(lead("left") == nil, "an attachment that has not reported has no role")
+
+        _ = book.apply(try #require(ZmxLeadNotice(title: "zmx-role;l:leader:1")), pane: session.paneIdentity)
+        _ = book.apply(try #require(ZmxLeadNotice(title: "zmx-role;r:follower:1")),
+                       pane: try #require(session.splitPaneIdentity))
+        #expect(lead("left") == .leader)
+        #expect(lead("right") == .follower)
+
+        let encoded = String(decoding: try JSONEncoder().encode(ControlSurfaceNode(
+            id: "s", kind: "left", active: true, visible: true, backedByZmx: true)), as: UTF8.self)
+        #expect(!encoded.contains("lead"), "omitted, not null, for a pane with no role")
+    }
+
     @Test func addressableSurfaceIsTheMainPaneUntilThePrimaryExits() {
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
@@ -1244,6 +1278,45 @@ struct AppStorePaneTests {
         #expect(session.hudSpec == nil)
     }
 
+    @Test func softClosingASessionTakesDownAPanelThatWasCountingItselfOut() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/a"))
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "deploying", hideAfter: 10),
+                      file: "/tmp/body", size: HudPanelSize(widthPercent: 20, heightPercent: 9))
+
+        #expect(store.softCloseSession(session.id))
+
+        #expect(!session.hudActive, "an expiry could not resolve it once the session leaves the tree")
+    }
+
+    @Test func softClosingASessionKeepsAPanelWithNoAutoHide() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/a"))
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "waiting"),
+                      file: "/tmp/body", size: HudPanelSize(widthPercent: 20, heightPercent: 9))
+
+        #expect(store.softCloseSession(session.id))
+
+        #expect(session.hudActive, "undo restores the session exactly as it was")
+    }
+
+    @Test func discardingAHudCancelsWhateverArmedItsAutoHide() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/a"))
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "deploying", hideAfter: 10),
+                      file: "/tmp/body", size: HudPanelSize(widthPercent: 20, heightPercent: 9))
+        var cancelled = 0
+        session.onHudDiscarded = { cancelled += 1 }
+
+        store.closeHud(session.id)
+
+        #expect(cancelled == 1)
+        #expect(session.onHudDiscarded == nil, "a second discard must not call a hook the first one spent")
+    }
+
     @Test func overlaySlotGenerationTracksOpensOnly() {
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
@@ -1637,8 +1710,10 @@ struct AppStorePaneTests {
         #expect(session.scratchActive == false)
         #expect(session.scratchSurface == nil)
         #expect(scratch.teardownCount == 1)
+        #expect(session.scratchGeneration == 1)
         // closing again (no surface) is a no-op.
         #expect(store.closeScratch(session.id) == false)
+        #expect(session.scratchGeneration == 1)
     }
 
     @Test func closeScratchClearsStuckSearchWhenScratchOwnsIt() {

@@ -1,0 +1,143 @@
+import XCTest
+@testable import agterm
+import agtermCore
+
+@MainActor
+final class SettingsModelTests: XCTestCase {
+    private var stateDir: URL!
+    private var library: WindowLibrary!
+    private var model: SettingsModel!
+
+    override func setUp() async throws {
+        try await super.setUp()
+        await MainActor.run {
+            stateDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("agterm-settings-model-tests-\(UUID().uuidString)", isDirectory: true)
+            library = WindowLibrary(directory: stateDir)
+            model = SettingsModel(library: library, settingsStore: SettingsStore(directory: stateDir))
+        }
+    }
+
+    override func tearDown() async throws {
+        await MainActor.run {
+            GhosttyApp.shared.setFlaggedViewLayout(.flat)
+            GhosttyApp.shared.setSidebarDensity(.standard)
+            HtmlOverlayRegistry.shared.setZoom(1)
+            model = nil
+            library = nil
+            try? FileManager.default.removeItem(at: stateDir)
+            stateDir = nil
+        }
+        try await super.tearDown()
+    }
+
+    func testStepHtmlOverlayZoomPersistsAndMirrors() {
+        model.stepHtmlOverlayZoom("increase_font_size:1")
+        model.stepHtmlOverlayZoom("increase_font_size:1")
+
+        XCTAssertEqual(HtmlOverlayRegistry.shared.zoom, 1.25)
+        XCTAssertEqual(SettingsStore(directory: stateDir).load().htmlOverlayZoom, 1.25)
+        XCTAssertEqual(SettingsModel(library: library, settingsStore: SettingsStore(directory: stateDir)).settings.htmlOverlayZoom, 1.25)
+    }
+
+    func testStepHtmlOverlayZoomBackToActualSizeClearsTheStoredField() {
+        model.stepHtmlOverlayZoom("decrease_font_size:1")
+
+        model.stepHtmlOverlayZoom("reset_font_size")
+
+        XCTAssertEqual(HtmlOverlayRegistry.shared.zoom, 1)
+        XCTAssertNil(SettingsStore(directory: stateDir).load().htmlOverlayZoom)
+    }
+
+    func testLaunchMirrorsTheSavedHtmlOverlayZoomToTheRegistry() throws {
+        try SettingsStore(directory: stateDir).save(AppSettings(htmlOverlayZoom: 1.5))
+
+        _ = SettingsModel(library: library, settingsStore: SettingsStore(directory: stateDir))
+
+        XCTAssertEqual(HtmlOverlayRegistry.shared.zoom, 1.5)
+    }
+
+    func testSetTerminalInputSourcePersistsAndOffRemovesTheKey() {
+        model.setTerminalInputSource("test.source.not-enabled")
+        XCTAssertEqual(SettingsStore(directory: stateDir).load().terminalInputSource, "test.source.not-enabled")
+        model.setTerminalInputSource(nil)
+        XCTAssertNil(SettingsStore(directory: stateDir).load().terminalInputSource)
+    }
+
+    func testSetLinkOpenModePersistsAndTheDefaultRemovesTheKey() {
+        model.setLinkOpenMode(.overlay)
+        XCTAssertEqual(model.settings.effectiveLinkOpenMode, .overlay)
+        XCTAssertEqual(SettingsStore(directory: stateDir).load().linkOpenMode, "overlay")
+        model.setLinkOpenMode(.browser)
+        XCTAssertNil(SettingsStore(directory: stateDir).load().linkOpenMode)
+    }
+
+    func testSetFlaggedViewLayoutPersistsMirrorsAndBroadcasts() {
+        let posted = expectation(forNotification: .agtermAppearanceChanged, object: nil)
+
+        model.setFlaggedViewLayout(.tree)
+
+        wait(for: [posted], timeout: 1)
+        XCTAssertEqual(GhosttyApp.shared.flaggedViewLayout, .tree)
+        XCTAssertEqual(SettingsStore(directory: stateDir).load().flaggedViewLayout, "tree")
+    }
+
+    func testSetFlaggedViewLayoutReachesTheLibraryAndEveryOpenStore() throws {
+        let first = try XCTUnwrap(library.windows.first.flatMap { library.store(for: $0.id) })
+        let second = try XCTUnwrap(library.store(for: library.newWindow(name: "second").id))
+
+        model.setFlaggedViewLayout(.plain)
+
+        XCTAssertEqual(library.flaggedLayout, .plain)
+        XCTAssertEqual(first.flaggedLayout, .plain)
+        XCTAssertEqual(second.flaggedLayout, .plain)
+    }
+
+    func testSetFlaggedViewLayoutBackToFlatClearsTheStoredField() {
+        model.setFlaggedViewLayout(.tree)
+
+        model.setFlaggedViewLayout(.flat)
+
+        XCTAssertEqual(GhosttyApp.shared.flaggedViewLayout, .flat)
+        XCTAssertNil(SettingsStore(directory: stateDir).load().flaggedViewLayout)
+    }
+
+    func testSetFlaggedViewLayoutSkipsAnUnchangedValue() {
+        model.setFlaggedViewLayout(.tree)
+        let posted = expectation(forNotification: .agtermAppearanceChanged, object: nil)
+        posted.isInverted = true
+
+        model.setFlaggedViewLayout(.tree)
+
+        wait(for: [posted], timeout: 0.3)
+    }
+
+    func testSetSidebarDensityPersistsMirrorsAndBroadcasts() {
+        let posted = expectation(forNotification: .agtermAppearanceChanged, object: nil)
+
+        model.setSidebarDensity(.compact)
+
+        wait(for: [posted], timeout: 1)
+        XCTAssertEqual(GhosttyApp.shared.sidebarDensity, .compact)
+        XCTAssertEqual(SettingsStore(directory: stateDir).load().sidebarDensity, "compact")
+    }
+
+    func testSetSidebarDensityBackToDefaultClearsTheStoredField() {
+        model.setSidebarDensity(.compact)
+
+        model.setSidebarDensity(.standard)
+
+        XCTAssertEqual(GhosttyApp.shared.sidebarDensity, .standard)
+        XCTAssertNil(SettingsStore(directory: stateDir).load().sidebarDensity)
+    }
+
+    func testSetSidebarDensitySkipsAnUnchangedValue() {
+        model.setSidebarDensity(.compact)
+        let posted = expectation(forNotification: .agtermAppearanceChanged, object: nil)
+        posted.isInverted = true
+
+        model.setSidebarDensity(.compact)
+
+        wait(for: [posted], timeout: 0.3)
+    }
+}

@@ -3,7 +3,7 @@ import Testing
 
 /// Resolves a qualifying `node` for OpenCodeStatusHookTests. Kept outside the suite type so
 /// `@Suite(.enabled(if:))` can reference it without a circular macro resolution on the suite itself.
-private enum OpenCodeStatusHookSupport {
+enum OpenCodeStatusHookSupport {
     /// First `node` on PATH that meets the module-syntax-detection floor (≥ 20.19 or ≥ 22.7), or nil.
     /// Suite-gated via `.enabled(if:)` so older/missing Node skips visibly rather than failing the
     /// import of the plugin's bare `.js` (no package.json above it).
@@ -229,6 +229,46 @@ struct OpenCodeStatusHookTests {
             "blocked",
             "active --blink",
             "active --blink",
+            "active --blink",
+        ])
+    }
+
+    @Test func replyToOnePromptStaysBlockedWhileAnotherIsPending() throws {
+        let calls = try runEvents([
+            status("busy"),
+            event("permission.asked", properties: ["sessionID": "ses_root", "id": "per_1"]),
+            event("question.asked", properties: ["sessionID": "ses_root", "id": "que_1"]),
+            event("permission.asked", properties: ["sessionID": "ses_root", "id": "per_2"]),
+            event("permission.replied", properties: ["sessionID": "ses_root", "requestID": "per_1"]),
+            event("question.rejected", properties: ["sessionID": "ses_root", "requestID": "que_1"]),
+            event("permission.replied", properties: ["sessionID": "ses_root", "requestID": "per_2"]),
+        ])
+        #expect(calls == [
+            "active --blink",
+            "blocked",
+            "blocked",
+            "blocked",
+            "blocked",
+            "blocked",
+            "active --blink",
+        ])
+    }
+
+    @Test func promptAbandonedAtIdleDoesNotHoldBackLaterReplies() throws {
+        let calls = try runEvents([
+            status("busy"),
+            event("permission.asked", properties: ["sessionID": "ses_root", "id": "per_1"]),
+            status("idle"),
+            status("busy"),
+            event("permission.asked", properties: ["sessionID": "ses_root", "id": "per_2"]),
+            event("permission.replied", properties: ["sessionID": "ses_root", "requestID": "per_2"]),
+        ])
+        #expect(calls == [
+            "active --blink",
+            "blocked",
+            "completed --auto-reset",
+            "active --blink",
+            "blocked",
             "active --blink",
         ])
     }

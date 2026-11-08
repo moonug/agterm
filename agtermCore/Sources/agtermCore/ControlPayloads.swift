@@ -61,8 +61,10 @@ public struct ControlZmxEntry: Codable, Sendable, Equatable {
     public let sessionID: String?
     public let sessionName: String?
     public let pane: String?
+    /// outdated is true when the daemon was created before the launch's recorded zmx build change; omitted otherwise.
+    public let outdated: Bool?
 
-    public init(row: ZmxInventoryRow) {
+    public init(row: ZmxInventoryRow, outdatedBefore: Date? = nil) {
         daemon = row.daemon
         state = row.state.rawValue
         observation = row.observation.rawValue
@@ -76,6 +78,7 @@ public struct ControlZmxEntry: Codable, Sendable, Equatable {
         sessionID = row.claim?.sessionID.uuidString
         sessionName = row.claim?.sessionName
         pane = row.claim?.pane.rawValue
+        outdated = LiveReset.isOutdated(created: row.createdAt, cutoff: outdatedBefore) ? true : nil
     }
 }
 
@@ -127,10 +130,27 @@ public struct ControlRemoteSession: Codable, Sendable, Equatable {
     /// Divider direction, present only for a session that has a split.
     public let splitAxis: String?
     public let panes: [ControlRemotePane]
+    /// status is omitted for idle sessions and older origins.
+    public let status: String?
+    public let statusColor: String?
+    public let statusShape: String?
+    /// parent is the far side's parent session of a companion, omitted for a top-level session.
+    public let parent: String?
+    /// content is `page` for a page, which has no panes; a page companion attaches only under its parent's row.
+    public let content: String?
+    /// companions lists every companion of a top-level session in sidebar order, attachable or not, so a
+    /// group attach can keep that order and name a member it could not bring. `[]` means none; nil means
+    /// unknown, which is what a companion row and an older origin carry.
+    public let companions: [ControlRemoteMember]?
 
     public init(id: String, name: String, windowID: String, windowName: String, workspaceID: String,
                 workspaceName: String, context: String? = nil, cwd: String, splitAxis: String?,
-                panes: [ControlRemotePane]) {
+                panes: [ControlRemotePane], status: String? = nil, statusColor: String? = nil,
+                statusShape: String? = nil, parent: String? = nil, content: String? = nil,
+                companions: [ControlRemoteMember]? = nil) {
+        self.parent = parent
+        self.content = content
+        self.companions = companions
         self.id = id
         self.name = name
         self.windowID = windowID
@@ -141,6 +161,45 @@ public struct ControlRemoteSession: Codable, Sendable, Equatable {
         self.cwd = cwd
         self.splitAxis = splitAxis
         self.panes = panes
+        self.status = status
+        self.statusColor = statusColor
+        self.statusShape = statusShape
+    }
+}
+
+/// ControlRemoteGroup is `zmx.attach.group`'s receipt. `membershipKnown` is false when the origin did not list
+/// its groups, so a companion it did not list cannot be named as missing.
+public struct ControlRemoteGroup: Codable, Sendable, Equatable {
+    public let membershipKnown: Bool
+    public let companions: [ControlRemoteGroupMember]
+
+    public init(membershipKnown: Bool, companions: [ControlRemoteGroupMember]) {
+        self.membershipKnown = membershipKnown
+        self.companions = companions
+    }
+}
+
+/// ControlRemoteGroupMember is one companion's outcome: `id` is the local row it created, which may have closed
+/// since, and `error` why it was not attached.
+public struct ControlRemoteGroupMember: Codable, Sendable, Equatable {
+    public let origin: String
+    public let id: String?
+    public let error: String?
+
+    public init(origin: String, id: String? = nil, error: String? = nil) {
+        self.origin = origin
+        self.id = id
+        self.error = error
+    }
+}
+
+public struct ControlRemoteMember: Codable, Sendable, Equatable {
+    public let id: String
+    public let name: String
+
+    public init(id: String, name: String) {
+        self.id = id
+        self.name = name
     }
 }
 
@@ -152,11 +211,22 @@ public struct ControlRemoteTree: Codable, Sendable, Equatable {
     public let host: String?
     public let endpoint: ControlZmxEndpoint
     public let sessions: [ControlRemoteSession]
+    /// The presentation protocol version this app speaks. Absent from an app that predates the presentation
+    /// stream, which is how an attaching Mac learns not to open one.
+    public let presentation: Int?
 
-    public init(host: String?, endpoint: ControlZmxEndpoint, sessions: [ControlRemoteSession]) {
+    public init(host: String?, endpoint: ControlZmxEndpoint, sessions: [ControlRemoteSession],
+                presentation: Int? = nil) {
         self.host = host
         self.endpoint = endpoint
         self.sessions = sessions
+        self.presentation = presentation
+    }
+
+    /// This answer with the ssh destination the requesting app was given. A field added to this type has to
+    /// be copied here too, or the requesting app loses it.
+    public func stamped(host: String) -> ControlRemoteTree {
+        ControlRemoteTree(host: host, endpoint: endpoint, sessions: sessions, presentation: presentation)
     }
 }
 
@@ -174,13 +244,13 @@ public struct ControlZmxInventory: Codable, Sendable, Equatable {
     public let liveReset: ControlLiveResetReadback?
     public let entries: [ControlZmxEntry]
 
-    public init(restore: ControlRestoreStatus, result: ZmxInventoryResult,
-                endpoint: ControlZmxEndpoint? = nil, liveReset: ControlLiveResetReadback? = nil) {
+    public init(restore: ControlRestoreStatus, result: ZmxInventoryResult, endpoint: ControlZmxEndpoint? = nil,
+                liveReset: ControlLiveResetReadback? = nil, outdatedBefore: Date? = nil) {
         self.restore = restore
         inventoryComplete = result.inventoryComplete
         self.endpoint = endpoint
         self.liveReset = liveReset
-        entries = result.rows.map(ControlZmxEntry.init(row:))
+        entries = result.rows.map { ControlZmxEntry(row: $0, outdatedBefore: outdatedBefore) }
     }
 }
 
@@ -190,11 +260,14 @@ public struct ControlLiveResetStatus: Codable, Sendable, Equatable {
     public let sessions: Int
     public let panes: Int
     public let pending: Bool
+    /// outdated is how many of `sessions` predate the recorded zmx build change; omitted when none.
+    public let outdated: Int?
 
-    public init(sessions: Int, panes: Int, pending: Bool) {
+    public init(sessions: Int, panes: Int, pending: Bool, outdated: Int? = nil) {
         self.sessions = sessions
         self.panes = panes
         self.pending = pending
+        self.outdated = outdated
     }
 }
 

@@ -30,7 +30,7 @@ extension ControlServer {
         return ControlResponse(ok: true)
     }
 
-    /// Set the frontmost window's sidebar VIEW mode (tree vs the flat flagged list), distinct from
+    /// Set the frontmost window's sidebar VIEW mode (tree vs the flagged view), distinct from
     /// `setSidebarVisibility`. Delta-computed so a no-op mode skips the write; unknown mode + no window error.
     func setSidebarViewMode(_ mode: ControlSidebarViewMode) -> ControlResponse {
         guard let store = library.activeStore else {
@@ -46,8 +46,39 @@ extension ControlServer {
         return ControlResponse(ok: true)
     }
 
+    /// Set how EVERY window's flagged view arranges its sessions. App-wide state, so unlike `setSidebarViewMode`
+    /// it needs no open window and takes no window target. Writes through the `SettingsModel` setter the
+    /// Settings picker uses, which skips an unchanged value; echoes the resulting layout so a `toggle`
+    /// caller learns which way it went.
+    func setFlaggedViewLayout(_ mode: ControlFlaggedLayoutMode) -> ControlResponse {
+        let current = settingsModel.settings.effectiveFlaggedViewLayout
+        let want: FlaggedViewLayout
+        switch mode {
+        case .flat: want = .flat
+        case .plain: want = .plain
+        case .tree: want = .tree
+        case .toggle: want = current == .tree ? .flat : .tree
+        }
+        settingsModel.setFlaggedViewLayout(want)
+        return ControlResponse(ok: true, result: ControlResult(text: want.rawValue))
+    }
+
+    /// Set every window's sidebar row spacing. App-wide like `setFlaggedViewLayout`, through the same
+    /// `SettingsModel` setter the Settings picker uses; echoes the resulting density.
+    func setSidebarDensity(_ mode: ControlSidebarDensityMode) -> ControlResponse {
+        let want: SidebarDensity
+        switch mode {
+        case .standard: want = .standard
+        case .compact: want = .compact
+        case .toggle: want = settingsModel.settings.effectiveSidebarDensity == .compact ? .standard : .compact
+        }
+        settingsModel.setSidebarDensity(want)
+        return ControlResponse(ok: true, result: ControlResult(text: want.rawValue))
+    }
+
     /// Expand every workspace in a window's sidebar tree; `--window` picks the OPEN target, default frontmost.
-    /// Idempotent, and a graceful no-op in flagged mode (no workspace rows); a closed or absent window errors.
+    /// Idempotent, and a graceful no-op under the flat flagged list (no workspace rows); a closed or absent
+    /// window errors.
     /// Drives the same `AppActions.expandAllWorkspaces(in:)` the View menu / palette drive.
     func expandSidebar(window: String?) -> ControlResponse {
         resolver.resolveOpenPlacementStore(window) { store in
@@ -57,7 +88,7 @@ extension ControlServer {
     }
 
     /// Collapse every workspace except the current one, which stays expanded and scrolled into view; same
-    /// window selector and flagged-mode/idempotency/error behavior as `expandSidebar`.
+    /// window selector and flat-list/idempotency/error behavior as `expandSidebar`.
     func collapseSidebar(window: String?) -> ControlResponse {
         resolver.resolveOpenPlacementStore(window) { store in
             actions.collapseOtherWorkspaces(in: store)
@@ -95,11 +126,56 @@ extension ControlServer {
         return ControlResponse(ok: true, result: ControlResult(keymap: payload))
     }
 
+    func runCustomCommand(name: String, target: String?, window: String?) -> ControlResponse {
+        // the keymap parser keeps one command per name, so a name addresses at most one
+        guard let command = settingsModel.keymap.commands.first(where: { $0.name == name }) else {
+            return ControlResponse(ok: false, error: "no custom command named \(name)")
+        }
+        guard let runner = actions.customCommandRunner else {
+            return ControlResponse(ok: false, error: "custom commands are not available")
+        }
+        return resolver.resolveSession(target, window: window) { store, id in
+            guard let session = store.session(withID: id) else {
+                return ControlResponse(ok: false, error: "no such session")
+            }
+            if let failure = runner.run(command, session: session, in: store) {
+                return ControlResponse(ok: false, error: "\(name) did not start: \(failure)")
+            }
+            return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
+        }
+    }
+
+    func clearBrowser() async -> ControlResponse {
+        if let failure = await HtmlOverlayRegistry.shared.clearPersistentStore() {
+            return ControlResponse(ok: false, error: "browser.clear: \(failure)")
+        }
+        return ControlResponse(ok: true)
+    }
+
+    /// Writes through the `SettingsModel` setter the Settings picker uses; the text is the effective mode.
+    func linkOpenMode(_ mode: LinkOpenMode?) -> ControlResponse {
+        if let mode { settingsModel.setLinkOpenMode(mode) }
+        return ControlResponse(ok: true, result: ControlResult(text: settingsModel.settings.effectiveLinkOpenMode.rawValue))
+    }
+
+    func reloadHooks() -> ControlResponse {
+        settingsModel.reloadHooks()
+        return ControlResponse(ok: true, result: ControlResult(count: settingsModel.hooksDiagnostics.count))
+    }
+
+    /// The read side of `hooks.reload`: the file, its diagnostics, and every hook's live state.
+    func listHooks() -> ControlResponse {
+        let diagnostics = settingsModel.hooksDiagnostics.map { ControlKeymapDiagnostic(line: $0.line, message: $0.message) }
+        let payload = ControlHooks(path: settingsModel.hooksPath, diagnostics: diagnostics, hooks: hookStatus())
+        return ControlResponse(ok: true, result: ControlResult(hooks: payload))
+    }
+
     /// Which app is serving this socket. App-global: no target, no `--window`, and no window needs to be
     /// open, which is what makes it usable as a preflight from a keymap-launched script — those inherit the
     /// app's launchd environment and so carry no `TERM_PROGRAM_VERSION`.
     func appIdentity() -> ControlResponse {
-        ControlResponse(ok: true, result: ControlResult(app: identity))
+        ControlResponse(ok: true, result: ControlResult(app: identity,
+                                                        installed: AppIdentity.installed(bundleURL: bundleURL)))
     }
 
     /// Every menu-bar item carrying a key equivalent, in the same kitty syntax the keymap uses so a caller can
@@ -116,7 +192,7 @@ extension ControlServer {
     /// reachable case, carrying whatever the user assigned in System Settings; top-level-only reporting would
     /// let a caller conclude nothing holds a chord when something does. `menu` stays the TOP-LEVEL title
     /// throughout, so a nested item is attributed to the menu-bar entry the reader can find it under. Internal
-    /// rather than private so `CloseSessionChordTests`' companion can drive it over a hand-built nested menu:
+    /// rather than private so `StockMenuChordTests`' companion can drive it over a hand-built nested menu:
     /// agterm's own submenus carry no key equivalents and Services entries depend on the user's system
     /// settings, so no real nested chord exists to assert against.
     @MainActor

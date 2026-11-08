@@ -338,7 +338,7 @@ def swap(accounts: list[Account], dry_run: bool) -> int:
         if stamp(original.transcript) != baseline:
             raise Fail("the transcript changed while it was being read")
         # datetime.UTC needs Python 3.11; this recipe runs on 3.10.
-        digest = build_digest(entries, DETAIL_TRIM, datetime.now(timezone.utc))  # noqa: UP017
+        digest = build_digest(entries, DETAIL_TRIM, datetime.now(timezone.utc))
         if not digest.strip():
             raise Fail("the transcript holds no conversation to summarize")
         cwd = transcript_cwd(entries, str(node.get("cwd") or os.getcwd()))
@@ -553,7 +553,7 @@ def relative_age(when: datetime, now: datetime) -> str:
 def parse_ts(value: str) -> datetime | None:
     try:
         # Python 3.10 cannot parse the "Z" suffix itself; this recipe runs there.
-        return datetime.fromisoformat(value.replace('Z', '+00:00'))  # noqa: FURB162
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
     except ValueError:
         return None
 

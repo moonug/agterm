@@ -9,10 +9,20 @@ import Testing
 import agtermCore
 @testable import agtermctlKit
 
-// serialized: the stdout-capturing tests redirect the process-global STDOUT_FILENO, so in parallel
-// one test's output lands in the other's pipe.
-@Suite(.serialized)
 struct SocketClientTests {
+    @Test func formatsCustomCommandErrorOptions() {
+        let payload = ControlKeymap(path: "/tmp/keymap.conf", actions: [], commands: [
+            ControlKeymapCommand(name: "quiet"),
+            ControlKeymapCommand(name: "default", errorHud: true),
+            ControlKeymapCommand(name: "placed", shortcut: "ctrl+a>p", errorHud: true,
+                                 errorPosition: .topRight, errorPane: .left)
+        ], diagnostics: [])
+        let output = SocketClient.formatKeymap(payload)
+        #expect(output.contains("    quiet  (palette only)\n"))
+        #expect(output.contains("    default  (palette only)  --error-hud --error-position center\n"))
+        #expect(output.contains("    placed  ctrl+a>p  --error-hud --error-position top-right --error-pane left"))
+    }
+
     @Test func consecutiveEventReadsUseIndependentOneShotConnections() throws {
         let run = UUID(uuidString: "CBB5E3D0-7A9B-4C96-9EA2-18B14380DDB1")!
         let script = EventReadScript(run: run)
@@ -22,12 +32,12 @@ struct SocketClientTests {
         let client = SocketClient(path: server.path)
 
         let first = try client.send(ControlRequest(cmd: .eventsRead))
-        let anchor = try #require(first.result?.events)
+        let anchor = try #require(first.response.result?.events)
         let second = try client.send(ControlRequest(
             cmd: .eventsRead, args: ControlArgs(after: String(anchor.next), run: anchor.run.uuidString)
         ))
 
-        #expect(second.result?.events?.next == 8)
+        #expect(second.response.result?.events?.next == 8)
         #expect(script.requests().map { $0.args?.after } == [nil, "7"])
     }
 
@@ -38,10 +48,10 @@ struct SocketClientTests {
         defer { server.stop() }
 
         let client = SocketClient(path: server.path)
-        let response = try client.send(ControlRequest(cmd: .sessionSelect, target: "active"))
+        let reply = try client.send(ControlRequest(cmd: .sessionSelect, target: "active"))
 
-        #expect(response.ok)
-        #expect(response.result?.id == "9f3c")
+        #expect(reply.response.ok)
+        #expect(reply.response.result?.id == "9f3c")
         #expect(server.received?.cmd == .sessionSelect)
         #expect(server.received?.target == "active")
     }
@@ -53,10 +63,10 @@ struct SocketClientTests {
         defer { server.stop() }
 
         let client = SocketClient(path: server.path)
-        let response = try client.send(ControlRequest(cmd: .workspaceDelete, target: "active"))
+        let reply = try client.send(ControlRequest(cmd: .workspaceDelete, target: "active"))
 
-        #expect(!response.ok)
-        #expect(response.error == "cannot delete last workspace")
+        #expect(!reply.response.ok)
+        #expect(reply.response.error == "cannot delete last workspace")
     }
 
     // a `session.text --all` payload exceeds the old 1 MiB read cap; it must round-trip, not fail.
@@ -67,10 +77,10 @@ struct SocketClientTests {
         defer { server.stop() }
 
         let client = SocketClient(path: server.path)
-        let response = try client.send(ControlRequest(cmd: .sessionText, target: "active"))
+        let reply = try client.send(ControlRequest(cmd: .sessionText, target: "active"))
 
-        #expect(response.ok)
-        #expect(response.result?.text == big)
+        #expect(reply.response.ok)
+        #expect(reply.response.result?.text == big)
     }
 
     @Test func connectFailureToMissingSocketThrows() {
@@ -137,6 +147,58 @@ struct SocketClientTests {
         } catch {
             Issue.record("unexpected error: \(error)")
         }
+    }
+
+    @Test func formatsHooksRowsAndDiagnostics() {
+        let payload = ControlHooks(
+            path: "/tmp/hooks.conf",
+            diagnostics: [ControlKeymapDiagnostic(line: 9, message: "unknown verb 'map'")],
+            hooks: [
+                ControlHookEntry(kind: "status", command: "~/s.sh", line: 1),
+                ControlHookEntry(kind: "notify", command: "echo x | cat", line: 4, runningPid: 4242,
+                                 elapsedSeconds: 12.7, pending: 3, dropped: 1, lastFailure: "exit 2"),
+                ControlHookEntry(kind: "status", command: "~/old.sh", line: 2, runningPid: 77, elapsedSeconds: 0.2,
+                                 retired: true),
+            ])
+
+        let out = SocketClient.formatHooks(payload)
+
+        #expect(out == """
+        hooks: /tmp/hooks.conf
+          line 1: on status ~/s.sh
+          line 4: on notify echo x | cat  running pid 4242 for 12s  pending 3  dropped 1  last failure: exit 2
+          line 2: on status ~/old.sh  running pid 77 for 0s  (retired, removed from the file)
+
+        diagnostics:
+            line 9: unknown verb 'map'
+        """)
+        #expect(SocketClient.formatHooks(ControlHooks(path: "/p", diagnostics: [], hooks: [])) == "hooks: /p\n  (no hooks)")
+        let response = ControlResponse(ok: true, result: ControlResult(hooks: payload))
+        #expect(SocketClient.formatResponse(response).hasPrefix("hooks: /tmp/hooks.conf"))
+    }
+
+    @Test func formatsRecentRowsWithFullIdsAndAnEmptyList() {
+        let session = ControlRecentItem(id: "R1", kind: "session", title: "api", subtitle: "project", closedAt: 1,
+                                        workspaceID: "W1", sessionIDs: ["S1"])
+        let workspace = ControlRecentItem(id: "R2", kind: "workspace", title: "project", subtitle: nil, closedAt: 2,
+                                          workspaceID: "W1", sessionIDs: ["S1", "S2"])
+
+        #expect(SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(recent: [session, workspace])))
+            == "R1  session  api (project)\nR2  workspace  project")
+        #expect(SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(recent: [])))
+            == "no recently closed items")
+    }
+
+    @Test func formatsRecentOpenAndSaysWhenTheEntryStays() {
+        let item = ControlRecentItem(id: "R1", kind: "session", title: "api", subtitle: nil, closedAt: 1,
+                                     workspaceID: "W1", sessionIDs: ["S1"])
+        let complete = ControlRecentOpen(item: item, window: "WIN", complete: true)
+        let partial = ControlRecentOpen(item: item, window: "WIN", complete: false)
+
+        #expect(SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(recentOpen: complete)))
+            == "reopened session api")
+        #expect(SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(recentOpen: partial)))
+            == "reopened session api (incomplete: the entry stays in the list)")
     }
 
     @Test func formatsKeymapWithEveryActionAndTheLiveMenu() {
@@ -234,6 +296,8 @@ struct SocketClientTests {
             new_window                  cmd+opt+n
             rename_window               -
             delete_window               -
+            previous_window             -
+            next_window                 -
             new_workspace               cmd+shift+n
             rename_workspace            -
             delete_workspace            -
@@ -241,6 +305,9 @@ struct SocketClientTests {
             open_directory              cmd+o
             rename_session              -
             duplicate_session           -
+            new_companion               -
+            duplicate_companion         -
+            convert_companion           -
             close_session               cmd+w
             reopen_recent               cmd+shift+t
             undo_close                  cmd+z
@@ -252,6 +319,7 @@ struct SocketClientTests {
             toggle_horizontal_split     cmd+shift+d
             toggle_scratch              cmd+j
             toggle_terminal_zoom        cmd+shift+return
+            toggle_overlay              cmd+shift+j
             toggle_search               cmd+f
             open_link_at_cursor         -
           * toggle_sidebar              t
@@ -278,6 +346,9 @@ struct SocketClientTests {
             custom_command_palette      ctrl+shift+o
             show_attention              ctrl+shift+i
             dashboard                   cmd+shift+g
+            attach_remote               cmd+shift+r
+            edit_flagged_sessions       -
+            edit_focused_workspaces     -
 
         commands:
             Deploy  cmd+shift+y
@@ -309,8 +380,7 @@ struct SocketClientTests {
     @Test func formatResponsePicksTheKeymapRenderer() {
         let payload = ControlKeymap.project(keymap: Keymap(builtinOverrides: [:], commands: []),
                                             diagnostics: [], path: "/tmp/keymap.conf")
-        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(keymap: payload)),
-                                              json: false)
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(keymap: payload)))
         #expect(out.hasPrefix("keymap: /tmp/keymap.conf"))
     }
 
@@ -319,9 +389,143 @@ struct SocketClientTests {
         try server.start()
         defer { server.stop() }
 
-        let command = try Session.New.parse(["--socket", server.path])
-        let printed = try captureStdout { try command.run() }
-        #expect(printed == "9f3c\n")
+        let run = try runCLI(["session", "new", "--socket", server.path])
+        #expect(run.status == 0)
+        #expect(run.out == Data("9f3c\n".utf8))
+    }
+
+    @Test func anAppTooOldForCompanionsIsNamedAndNothingElseIsSent() throws {
+        let decodeError = "invalid request: Cannot initialize Command from invalid String value session.companion.new"
+        let server = StubServer(response: ControlResponse(ok: false, error: decodeError))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["session", "new", "--parent", "p1", "--socket", server.path])
+
+        #expect(run.status == 1)
+        #expect(run.out.isEmpty)
+        #expect(server.received?.cmd == .sessionCompanionNew)
+    }
+
+    @Test func anAppTooOldForConvertIsNamedAndNothingElseIsSent() throws {
+        let decodeError = "invalid request: Cannot initialize Command from invalid String value session.companion.convert"
+        let server = StubServer(response: ControlResponse(ok: false, error: decodeError))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["session", "convert", "--companion", "--socket", server.path])
+
+        #expect(run.status == 1)
+        #expect(run.out.isEmpty)
+        #expect(String(decoding: run.err, as: UTF8.self) == "error: the running app is too old for convert\n")
+        #expect(server.received?.cmd == .sessionCompanionConvert)
+    }
+
+    @Test func anAppTooOldForPageSessionsIsNamedAndNothingElseIsSent() throws {
+        let decodeError = "invalid request: Cannot initialize Command from invalid String value session.page"
+        let server = StubServer(response: ControlResponse(ok: false, error: decodeError))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["session", "overlay", "open", "--html", "/tmp/p.html", "--page", "--socket", server.path])
+
+        #expect(run.status == 1)
+        #expect(run.out.isEmpty)
+        #expect(String(decoding: run.err, as: UTF8.self) == "error: the running app is too old for page sessions\n")
+        #expect(server.received?.cmd == .sessionPage)
+    }
+
+    @Test func aPageSessionPrintsTheRowItCreated() throws {
+        let server = StubServer(response: ControlResponse(ok: true, result: ControlResult(id: "PS1", pageID: "P1")))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["session", "overlay", "open", "--url", "https://example.com/", "--page", "--socket", server.path])
+
+        #expect(run.status == 0)
+        #expect(run.out == Data("PS1\n".utf8))
+    }
+
+    @Test func aConvertPrintsTheFreshParentItCreated() throws {
+        let server = StubServer(response: ControlResponse(ok: true, result: ControlResult(id: "S1", parent: "N1")))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["session", "convert", "--companion", "--target", "S1", "--socket", server.path])
+
+        #expect(run.status == 0)
+        #expect(run.out == Data("N1\n".utf8))
+    }
+
+    @Test func aRefusedConvertReportsTheReasonAndFails() throws {
+        let server = StubServer(response: ControlResponse(ok: false, error: "already a companion"))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["session", "convert", "--companion", "--socket", server.path])
+
+        #expect(run.status == 1)
+        #expect(run.out.isEmpty)
+        #expect(String(decoding: run.err, as: UTF8.self).contains("already a companion"))
+    }
+
+    @Test func anAppTooOldForCompanionsKeepsTheRawReplyUnderJSON() throws {
+        let response = ControlResponse(ok: false, error: "invalid request: Cannot initialize Command from invalid String value session.companion.new")
+        let server = StubServer(response: response)
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["session", "new", "--parent", "p1", "--json", "--socket", server.path])
+
+        #expect(run.status == 1)
+        let decoded = try JSONDecoder().decode(ControlResponse.self, from: run.out)
+        #expect(decoded == response)
+    }
+
+    @Test func anAppTooOldForGroupAttachIsNamedAndNothingElseIsSent() throws {
+        let decodeError = "invalid request: Cannot initialize Command from invalid String value zmx.attach.group"
+        let server = StubServer(response: ControlResponse(ok: false, error: decodeError))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["zmx", "attach", "buildbox", "s1", "--companions", "--socket", server.path])
+
+        #expect(run.status == 1)
+        #expect(run.out.isEmpty)
+        #expect(String(decoding: run.err, as: UTF8.self) == "error: the running app is too old for group attach\n")
+        #expect(server.received?.cmd == .zmxAttachGroup)
+    }
+
+    @Test func aPartialGroupAttachNamesTheFailureAndTheUnknownMembershipThenFails() throws {
+        let group = ControlRemoteGroup(membershipKnown: false, companions: [ControlRemoteGroupMember(origin: "c1", error: "boom")])
+        let server = StubServer(response: ControlResponse(ok: false, result: ControlResult(id: "P", remoteGroup: group),
+                                                          error: "kept build (P) and 0 companion(s); not attached: logs (boom)"))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["zmx", "attach", "buildbox", "s1", "--companions", "--socket", server.path])
+
+        #expect(run.status == 1)
+        #expect(run.out.isEmpty)
+        #expect(String(decoding: run.err, as: UTF8.self) == """
+        error: kept build (P) and 0 companion(s); not attached: logs (boom)
+        note: buildbox does not report group membership; unlisted companions cannot be detected
+
+        """)
+    }
+
+    @Test func aGroupAttachUnderJSONPrintsTheRawReplyAndNoNote() throws {
+        let line = " {\"ok\": true, \"result\": {\"id\": \"P\", \"remoteGroup\": {\"membershipKnown\": false, \"companions\": []}, "
+            + "\"futureField\": 1}} "
+        let server = StubServer(line: Data(line.utf8))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["zmx", "attach", "buildbox", "s1", "--companions", "--json", "--socket", server.path])
+
+        #expect(run.status == 0)
+        #expect(run.out == Data((line + "\n").utf8))
+        #expect(run.err.isEmpty)
     }
 
     @Test func runQuietsIdForNonCreateCommand() throws {
@@ -329,24 +533,30 @@ struct SocketClientTests {
         try server.start()
         defer { server.stop() }
 
-        let command = try Tree.parse(["--socket", server.path])
-        let printed = try captureStdout { try command.run() }
-        #expect(printed == "ok\n")
+        let run = try runCLI(["tree", "--socket", server.path])
+        #expect(run.status == 0)
+        #expect(run.out == Data("ok\n".utf8))
     }
 
-    /// Runs `body` with the process stdout redirected to a pipe, returning everything it printed.
-    private func captureStdout(_ body: () throws -> Void) throws -> String {
-        let pipe = Pipe()
-        let saved = dup(STDOUT_FILENO)
-        defer { close(saved) }
-        fflush(nil)
-        dup2(pipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO)
-        try body()
-        fflush(nil)
-        dup2(saved, STDOUT_FILENO)
-        try pipe.fileHandleForWriting.close()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8) ?? ""
+    // a separate process: redirecting this one's stdout or stderr also catches what parallel suites print
+    private func runCLI(_ args: [String]) throws -> (status: Int32, out: Data, err: Data) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent(".build/debug/agtermctl")
+        process.arguments = args
+        let out = Pipe(), err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        try process.run()
+        let clock = ContinuousClock(), started = clock.now
+        while process.isRunning, clock.now - started < .seconds(10) { Thread.sleep(forTimeInterval: 0.01) }
+        if process.isRunning {
+            Issue.record("agtermctl \(args) did not exit within 10 s")
+            kill(process.processIdentifier, SIGKILL)
+            process.waitUntilExit()
+        }
+        return (process.terminationStatus, out.fileHandleForReading.readDataToEndOfFile(),
+                err.fileHandleForReading.readDataToEndOfFile())
     }
 
     @Test func runThrowsExitCodeFailureOnErrorResponse() throws {
@@ -455,7 +665,7 @@ struct SocketClientTests {
             input: Data("One\n".utf8),
             send: { request in
                 requests.append(request)
-                return ControlResponse(ok: true, result: ControlResult(id: "pick-1"))
+                return SocketReply(ControlResponse(ok: true, result: ControlResult(id: "pick-1")))
             },
             sleep: { _ in Issue.record("--no-block must not sleep") },
             output: { output.append($0) }
@@ -483,17 +693,17 @@ struct SocketClientTests {
             send: { request in
                 requests.append(request)
                 if request.cmd == .pickOpen {
-                    return ControlResponse(ok: true, result: ControlResult(id: "pick-1"))
+                    return SocketReply(ControlResponse(ok: true, result: ControlResult(id: "pick-1")))
                 }
                 polls += 1
                 if polls <= 11 {
-                    return ControlResponse(ok: true, result: ControlResult(
+                    return SocketReply(ControlResponse(ok: true, result: ControlResult(
                         pick: ControlPickResult(result: .pending)
-                    ))
+                    )))
                 }
-                return ControlResponse(ok: true, result: ControlResult(
+                return SocketReply(ControlResponse(ok: true, result: ControlResult(
                     pick: ControlPickResult(result: .picked, id: "One", label: "One", index: 0)
-                ))
+                )))
             },
             sleep: { sleeps.append($0) },
             output: { output.append($0) }
@@ -519,10 +729,10 @@ struct SocketClientTests {
                 input: Data("One\n".utf8),
                 send: { request in
                     request.cmd == .pickOpen
-                        ? ControlResponse(ok: true, result: ControlResult(id: "pick-1"))
-                        : ControlResponse(ok: true, result: ControlResult(
+                        ? SocketReply(ControlResponse(ok: true, result: ControlResult(id: "pick-1")))
+                        : SocketReply(ControlResponse(ok: true, result: ControlResult(
                             pick: ControlPickResult(result: .cancelled)
-                        ))
+                        )))
                 },
                 sleep: { _ in Issue.record("a terminal result must not sleep") },
                 output: { output.append($0) }
@@ -545,7 +755,7 @@ struct SocketClientTests {
         #expect(throws: ExitCode.failure) {
             try command.execute(
                 input: Data("One\n".utf8),
-                send: { _ in ControlResponse(ok: false, error: "boom") },
+                send: { _ in SocketReply(ControlResponse(ok: false, error: "boom")) },
                 sleep: { _ in },
                 output: { _ in Issue.record("a non-JSON server error must not use stdout") },
                 errorOutput: { errors.append($0) }
@@ -559,8 +769,8 @@ struct SocketClientTests {
                 input: Data("One\n".utf8),
                 send: { request in
                     request.cmd == .pickOpen
-                        ? ControlResponse(ok: true, result: ControlResult(id: "pick-1"))
-                        : ControlResponse(ok: true)
+                        ? SocketReply(ControlResponse(ok: true, result: ControlResult(id: "pick-1")))
+                        : SocketReply(ControlResponse(ok: true))
                 },
                 sleep: { _ in },
                 output: { _ in Issue.record("a protocol error must not use stdout") },
@@ -574,11 +784,11 @@ struct SocketClientTests {
         let command = try Pick.Open.parse([])
         var sent: [ControlRequest] = []
         // ok, but with no pick payload: the server still holds the picker, so it must be dismissed.
-        let malformedPoll: (ControlRequest) throws -> ControlResponse = { request in
+        let malformedPoll: (ControlRequest) throws -> SocketReply = { request in
             sent.append(request)
             return request.cmd == .pickOpen
-                ? ControlResponse(ok: true, result: ControlResult(id: "pick-1"))
-                : ControlResponse(ok: true)
+                ? SocketReply(ControlResponse(ok: true, result: ControlResult(id: "pick-1")))
+                : SocketReply(ControlResponse(ok: true))
         }
 
         #expect(throws: ExitCode.failure) {
@@ -614,8 +824,8 @@ struct SocketClientTests {
                 send: { request in
                     sent.append(request)
                     return request.cmd == .pickOpen
-                        ? ControlResponse(ok: true, result: ControlResult(id: "pick-1"))
-                        : ControlResponse(ok: false, error: "unknown pick: pick-1")
+                        ? SocketReply(ControlResponse(ok: true, result: ControlResult(id: "pick-1")))
+                        : SocketReply(ControlResponse(ok: false, error: "unknown pick: pick-1"))
                 },
                 sleep: { _ in }, output: { _ in }, errorOutput: { _ in }
             )
@@ -635,9 +845,9 @@ struct SocketClientTests {
                 send: { request in
                     sent.append(request)
                     switch request.cmd {
-                    case .pickOpen: return ControlResponse(ok: true, result: ControlResult(id: "pick-1"))
+                    case .pickOpen: return SocketReply(ControlResponse(ok: true, result: ControlResult(id: "pick-1")))
                     case .pickResult: throw SocketClientError("no response from /tmp/agterm.sock")
-                    default: return ControlResponse(ok: true)
+                    default: return SocketReply(ControlResponse(ok: true))
                     }
                 },
                 sleep: { _ in }, output: { _ in }, errorOutput: { _ in }
@@ -656,7 +866,7 @@ struct SocketClientTests {
         #expect(throws: ExitCode.failure) {
             try command.execute(
                 input: Data("One\n".utf8),
-                send: { _ in ControlResponse(ok: false, error: "boom") },
+                send: { _ in SocketReply(ControlResponse(ok: false, error: "boom")) },
                 sleep: { _ in },
                 output: { output.append($0) },
                 errorOutput: { _ in Issue.record("a JSON server error must not use stderr") }
@@ -685,9 +895,9 @@ struct SocketClientTests {
             try command.execute(
                 send: {
                     request = $0
-                    return ControlResponse(ok: true, result: ControlResult(
+                    return SocketReply(ControlResponse(ok: true, result: ControlResult(
                         pick: ControlPickResult(result: outcome)
-                    ))
+                    )))
                 },
                 output: { output.append($0) }
             )
@@ -720,7 +930,7 @@ struct SocketClientTests {
 
         #expect(throws: ExitCode.failure) {
             try command.execute(
-                send: { _ in ControlResponse(ok: false, error: "boom") },
+                send: { _ in SocketReply(ControlResponse(ok: false, error: "boom")) },
                 output: { _ in Issue.record("a non-JSON server error must not use stdout") },
                 errorOutput: { errors.append($0) }
             )
@@ -730,7 +940,7 @@ struct SocketClientTests {
         errors.removeAll()
         #expect(throws: ExitCode.failure) {
             try command.execute(
-                send: { _ in ControlResponse(ok: true) },
+                send: { _ in SocketReply(ControlResponse(ok: true)) },
                 output: { _ in Issue.record("a protocol error must not use stdout") },
                 errorOutput: { errors.append($0) }
             )
@@ -744,7 +954,7 @@ struct SocketClientTests {
 
         #expect(throws: ExitCode.failure) {
             try command.execute(
-                send: { _ in ControlResponse(ok: false, error: "boom") },
+                send: { _ in SocketReply(ControlResponse(ok: false, error: "boom")) },
                 output: { output.append($0) },
                 errorOutput: { _ in Issue.record("a JSON server error must not use stderr") }
             )
@@ -756,35 +966,52 @@ struct SocketClientTests {
     }
 
     @Test func formatResponseBareOk() {
-        #expect(SocketClient.formatResponse(ControlResponse(ok: true), json: false) == "ok")
+        #expect(SocketClient.formatResponse(ControlResponse(ok: true)) == "ok")
+    }
+
+    @Test func formatRecentCountsAParentEntrysCompanions() {
+        let items = [
+            ControlRecentItem(id: "R1", kind: "session", title: "api", subtitle: "work", closedAt: 0,
+                              workspaceID: "W", sessionIDs: ["P", "C1", "C2"]),
+            ControlRecentItem(id: "R2", kind: "session", title: "db", subtitle: nil, closedAt: 0,
+                              workspaceID: "W", sessionIDs: ["S"]),
+            ControlRecentItem(id: "R3", kind: "workspace", title: "work", subtitle: "2 sessions", closedAt: 0,
+                              workspaceID: "W", sessionIDs: ["A", "B"]),
+        ]
+
+        #expect(SocketClient.formatRecent(items) == """
+        R1  session  api (work) +2 companion(s)
+        R2  session  db
+        R3  workspace  work (2 sessions)
+        """)
     }
 
     @Test func formatResponseEchoesIdWhenRequested() {
         let response = ControlResponse(ok: true, result: ControlResult(id: "9f3c"))
-        #expect(SocketClient.formatResponse(response, json: false, echoID: true) == "9f3c")
+        #expect(SocketClient.formatResponse(response, echoID: true) == "9f3c")
     }
 
     @Test func formatResponseSuppressesIdByDefault() {
         let response = ControlResponse(ok: true, result: ControlResult(id: "9f3c"))
-        #expect(SocketClient.formatResponse(response, json: false) == "ok")
+        #expect(SocketClient.formatResponse(response) == "ok")
     }
 
     @Test func formatResponseText() {
         let response = ControlResponse(ok: true, result: ControlResult(text: "selected\nlines"))
-        #expect(SocketClient.formatResponse(response, json: false) == "selected\nlines")
+        #expect(SocketClient.formatResponse(response) == "selected\nlines")
     }
 
     @Test(arguments: [0, 42])
     func formatResponseCursorPrintsTheBareColumn(_ column: Int) {
         let response = ControlResponse(ok: true, result: ControlResult(id: "surface:s1:left",
                                                                       cursor: ControlCursor(column: column)))
-        #expect(SocketClient.formatResponse(response, json: false) == "\(column)")
+        #expect(SocketClient.formatResponse(response) == "\(column)")
     }
 
     @Test func formatResponseZeroCountIsOk() {
         // keymap.reload reports a parse-diagnostic count; 0 reads as a clean reload.
         let response = ControlResponse(ok: true, result: ControlResult(count: 0))
-        #expect(SocketClient.formatResponse(response, json: false) == "ok")
+        #expect(SocketClient.formatResponse(response) == "ok")
     }
 
     /// `restore.capture` carries both `count` and its own `text`; the text must win, or the shared `count`
@@ -793,27 +1020,37 @@ struct SocketClientTests {
         var result = ControlResult(count: 3)
         result.text = "captured 3 panes"
         let response = ControlResponse(ok: true, result: result)
-        #expect(SocketClient.formatResponse(response, json: false) == "captured 3 panes")
+        #expect(SocketClient.formatResponse(response) == "captured 3 panes")
     }
 
     @Test func formatResponseNonZeroCountPluralizes() {
         let response = ControlResponse(ok: true, result: ControlResult(count: 3))
-        #expect(SocketClient.formatResponse(response, json: false) == "3 diagnostic(s)")
+        #expect(SocketClient.formatResponse(response) == "3 diagnostic(s)")
     }
 
     @Test(arguments: [(1, "1 session"), (2, "2 sessions"), (0, "0 sessions")])
     func formatResponseAffectedSessions(_ affected: Int, _ expected: String) {
         let response = ControlResponse(ok: true, result: ControlResult(affected: affected))
-        #expect(SocketClient.formatResponse(response, json: false) == expected)
+        #expect(SocketClient.formatResponse(response) == expected)
+    }
+
+    @Test(arguments: [
+        (ControlResult(id: "9f3c", undoable: true), "ok (undoable)"),
+        (ControlResult(id: "9f3c", undoable: false), "ok (not undoable)"),
+        (ControlResult(affected: 2, undoable: true), "2 sessions (undoable)"),
+        (ControlResult(affected: 1, undoable: false), "1 session (not undoable)")
+    ])
+    func formatResponseUndoableClose(_ result: ControlResult, _ expected: String) {
+        #expect(SocketClient.formatResponse(ControlResponse(ok: true, result: result)) == expected)
     }
 
     @Test func formatResponseError() {
-        #expect(SocketClient.formatResponse(ControlResponse(ok: false, error: "boom"), json: false) == "error: boom")
+        #expect(SocketClient.formatResponse(ControlResponse(ok: false, error: "boom")) == "error: boom")
     }
 
     @Test func formatResponseRatio() {
         let response = ControlResponse(ok: true, result: ControlResult(id: "9f3c", ratio: 0.85))
-        #expect(SocketClient.formatResponse(response, json: false) == "0.850")
+        #expect(SocketClient.formatResponse(response) == "0.850")
     }
 
     // the caller compares its request against the echo to detect a clamp, so both directions are pinned:
@@ -822,19 +1059,48 @@ struct SocketClientTests {
     @Test(arguments: [(271.3, "271.3"), (271.34, "271.34"), (300.0, "300.0")])
     func formatResponseSidebarWidth(_ stored: Double, _ rendered: String) {
         let response = ControlResponse(ok: true, result: ControlResult(sidebarWidth: stored))
-        #expect(SocketClient.formatResponse(response, json: false) == rendered)
+        #expect(SocketClient.formatResponse(response) == rendered)
     }
 
     @Test func formatResponseErrorFallback() {
-        #expect(SocketClient.formatResponse(ControlResponse(ok: false), json: false) == "error: unknown error")
+        #expect(SocketClient.formatResponse(ControlResponse(ok: false)) == "error: unknown error")
     }
 
-    @Test func formatResponseJSONIsRaw() throws {
-        let response = ControlResponse(ok: true, result: ControlResult(id: "9f3c"))
-        let line = SocketClient.formatResponse(response, json: true)
-        let decoded = try JSONDecoder().decode(ControlResponse.self, from: Data(line.utf8))
-        #expect(decoded.ok)
-        #expect(decoded.result?.id == "9f3c")
+    /// Fields this build does not model, at both levels, plus spelling the encoder would never produce:
+    /// boundary and separator spaces, a `\u0020` escape, and a decomposed `é`, which `String ==` would
+    /// equate with the precomposed form. #625: a re-encode drops the fields and rewrites the rest.
+    private static let unmodeledLine = " {\"ok\": true, \"result\": {\"tree\": {\"idleMs\": 1, \"sidebarMode\": \"tree\", \"workspaces\": []}, "
+        + "\"futureField\": {\"a\": 1}}, \"warning\": \"deprecated\\u0020flag e\u{0301}\"} "
+
+    @Test func sendKeepsTheServerLineByteForByte() throws {
+        let server = StubServer(line: Data(Self.unmodeledLine.utf8))
+        try server.start()
+        defer { server.stop() }
+
+        let reply = try SocketClient(path: server.path).send(ControlRequest(cmd: .tree))
+        #expect(reply.raw == Data(Self.unmodeledLine.utf8))
+        #expect(reply.response.result?.tree?.idleMs == 1)
+    }
+
+    @Test func jsonPrintsTheServerLineUnchanged() throws {
+        let server = StubServer(line: Data(Self.unmodeledLine.utf8))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["tree", "--json", "--socket", server.path])
+        #expect(run.status == 0)
+        #expect(run.out == Data((Self.unmodeledLine + "\n").utf8))
+    }
+
+    @Test func jsonPrintsAnErrorLineUnchangedBeforeFailing() throws {
+        let line = "{\"ok\": false, \"error\": \"boom\", \"hint\": \"unmodeled e\u{0301}\"} "
+        let server = StubServer(line: Data(line.utf8))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["tree", "--json", "--socket", server.path])
+        #expect(run.status == 1)
+        #expect(run.out == Data((line + "\n").utf8))
     }
 
     @Test(arguments: [("/other", "/main  split cwd: /other"), ("/main", "/main")])
@@ -843,21 +1109,13 @@ struct SocketClientTests {
         let session = try JSONDecoder().decode(ControlSessionNode.self, from: data)
         let tree = ControlTree(workspaces: [ControlWorkspaceNode(id: "w", name: "work", active: true, sessions: [session])])
         let response = ControlResponse(ok: true, result: ControlResult(tree: tree))
-        let output = SocketClient.formatResponse(response, json: false)
+        let output = SocketClient.formatResponse(response)
         #expect(output == "* work  [w]\n  * shell (split)  [s]  \(expected)")
-        let json = SocketClient.formatResponse(response, json: true)
-        let decoded = try JSONDecoder().decode(ControlResponse.self, from: Data(json.utf8))
-        #expect(decoded.result?.tree?.workspaces[0].sessions[0].splitCwd == splitCwd)
     }
 
     @Test func formatWindowResizeReportsAppliedWidthAndHeight() throws {
         let response = try JSONDecoder().decode(ControlResponse.self, from: Data(#"{"ok":true,"result":{"id":"w","width":1200,"height":800}}"#.utf8))
-        #expect(SocketClient.formatResponse(response, json: false) == "1200 800")
-        let encoded = SocketClient.formatResponse(response, json: true)
-        let json = try #require(JSONSerialization.jsonObject(with: Data(encoded.utf8)) as? [String: Any])
-        let result = try #require(json["result"] as? [String: Any])
-        #expect(result["width"] as? Int == 1200)
-        #expect(result["height"] as? Int == 800)
+        #expect(SocketClient.formatResponse(response) == "1200 800")
     }
 
     @Test func formatTreeIncludesBothAttributionsWhenPresent() throws {
@@ -867,16 +1125,50 @@ struct SocketClientTests {
         """#.utf8)
         let session = try JSONDecoder().decode(ControlSessionNode.self, from: data)
         let tree = ControlTree(workspaces: [ControlWorkspaceNode(id: "w", name: "work", active: true, sessions: [session])])
-        let output = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)), json: false)
+        let output = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)))
         #expect(output.contains("live attribution: supervisor"))
         #expect(output.contains("split live attribution: orphaned"))
+    }
+
+    @Test func formatTreeShowsTheViewersStreamStateAndTheOriginsMirrorCount() {
+        let viewer = ControlSessionNode(id: "s1", name: "build", cwd: "/tmp", active: true, split: false,
+                                        backedByZmx: nil,
+                                        presentation: ControlPresentationNode(state: "failed", mode: "mirror",
+                                                                              error: "exit 255"))
+        let origin = ControlSessionNode(id: "s2", name: "api", cwd: "/tmp", active: false, split: false,
+                                        backedByZmx: nil,
+                                        presenters: ControlPresentersNode(mirrors: 2))
+        let tree = ControlTree(workspaces: [ControlWorkspaceNode(id: "w", name: "work", active: true,
+                                                                 sessions: [viewer, origin])])
+
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)))
+
+        #expect(out.contains("presentation: failed (exit 255)"))
+        #expect(out.contains("mirrored by: 2"))
+    }
+
+    @Test func formatTreeShowsThePresenterOnBothSides() {
+        let viewer = ControlSessionNode(id: "s1", name: "build", cwd: "/tmp", active: true, split: false,
+                                        backedByZmx: nil,
+                                        presentation: ControlPresentationNode(state: "connected", mode: "presenter"))
+        let origin = ControlSessionNode(id: "s2", name: "api", cwd: "/tmp", active: false, split: false,
+                                        backedByZmx: nil,
+                                        presenters: ControlPresentersNode(mirrors: 0, presenter: true))
+        let tree = ControlTree(workspaces: [ControlWorkspaceNode(id: "w", name: "work", active: true,
+                                                                 sessions: [viewer, origin])])
+
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)))
+
+        #expect(out.contains("presentation: connected, presenter"))
+        #expect(out.contains("presented remotely"))
+        #expect(!out.contains("mirrored by"))
     }
 
     @Test func formatResponseTree() {
         let session = ControlSessionNode(id: "s1", name: "shell", cwd: "/tmp", active: true, split: true)
         let workspace = ControlWorkspaceNode(id: "w1", name: "work", active: true, sessions: [session])
         let tree = ControlTree(workspaces: [workspace])
-        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)), json: false)
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)))
         let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         #expect(lines.count == 2)
         #expect(lines[0] == "* work  [w1]")
@@ -888,9 +1180,20 @@ struct SocketClientTests {
                                          hasSplit: true)
         let workspace = ControlWorkspaceNode(id: "w1", name: "work", active: true, sessions: [session])
         let tree = ControlTree(workspaces: [workspace])
-        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)), json: false)
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)))
         let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         #expect(lines[1] == "  * shell (split hidden)  [s1]  /tmp")
+    }
+
+    @Test(arguments: [([String]?.none, " (overlay)"), (["session"], " (overlay hidden)"), (["left"], " (overlay)")])
+    func formatTreeTagsAHiddenSessionOverlay(hidden: [String]?, tag: String) {
+        let session = ControlSessionNode(id: "s1", name: "shell", cwd: "/tmp", active: true, split: false,
+                                         backedByZmx: nil, overlay: true, hiddenOverlays: hidden)
+        let workspace = ControlWorkspaceNode(id: "w1", name: "work", active: true, sessions: [session])
+        let tree = ControlTree(workspaces: [workspace])
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)))
+        let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines[1] == "  * shell\(tag)  [s1]  /tmp")
     }
 
     @Test func formatTreeTagsAnUnrealizedSession() {
@@ -898,7 +1201,7 @@ struct SocketClientTests {
                                          realized: false)
         let workspace = ControlWorkspaceNode(id: "w1", name: "work", active: true, sessions: [session])
         let tree = ControlTree(workspaces: [workspace])
-        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)), json: false)
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)))
         let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         #expect(lines[1] == "  * shell (not realized)  [s1]  /tmp")
     }
@@ -908,7 +1211,7 @@ struct SocketClientTests {
                                          realized: true)
         let workspace = ControlWorkspaceNode(id: "w2", name: "work", active: true, sessions: [session])
         let tree = ControlTree(workspaces: [workspace])
-        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)), json: false)
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)))
         let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         #expect(lines[1] == "  * shell  [s2]  /tmp", "only the failing state earns a tag; nil must stay quiet too")
     }
@@ -918,7 +1221,7 @@ struct SocketClientTests {
                                          overlay: false, scratch: true)
         let workspace = ControlWorkspaceNode(id: "w3", name: "work", active: true, sessions: [session])
         let tree = ControlTree(workspaces: [workspace])
-        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)), json: false)
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)))
         let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         #expect(lines[1] == "  * shell (scratch)  [s3]  /tmp")
     }
@@ -927,7 +1230,7 @@ struct SocketClientTests {
         let session = ControlSessionNode(id: "s2", name: "logs", cwd: "/var", active: false, split: false)
         let workspace = ControlWorkspaceNode(id: "w2", name: "other", active: false, sessions: [session])
         let tree = ControlTree(workspaces: [workspace])
-        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)), json: false)
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(tree: tree)))
         let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         #expect(lines[0] == "  other  [w2]")
         #expect(lines[1] == "    logs  [s2]  /var")
@@ -941,7 +1244,7 @@ struct SocketClientTests {
             // a closed-but-active window (a frontmost id not yet loaded) renders [active] without [open].
             ControlWindowNode(id: "w4", name: "pending", open: false, active: true),
         ]
-        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(windows: windows)), json: false)
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(windows: windows)))
         let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         #expect(lines.count == 4)
         #expect(lines[0] == "w1  work [open] [active]")
@@ -951,14 +1254,14 @@ struct SocketClientTests {
     }
 
     @Test func formatResponseEmptyWindows() {
-        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(windows: [])), json: false)
+        let out = SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(windows: [])))
         // a present-but-empty `windows` payload still takes the windows branch, so it renders empty.
         #expect(out == "")
     }
 
     @Test func formatResponseThemesMarksCurrent() {
         let response = ControlResponse(ok: true, result: ControlResult(theme: "Nord", themes: ["Dracula", "Nord"]))
-        let out = SocketClient.formatResponse(response, json: false)
+        let out = SocketClient.formatResponse(response)
         let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         #expect(lines == ["  default ghostty", "  Dracula", "* Nord"])
     }
@@ -966,7 +1269,7 @@ struct SocketClientTests {
     @Test func formatResponseThemesMarksGhosttyDefaultWhenCurrent() {
         // nil current theme = ghostty's built-in is active, so the leading "default ghostty" row is marked.
         let response = ControlResponse(ok: true, result: ControlResult(theme: nil, themes: ["Dracula"]))
-        let out = SocketClient.formatResponse(response, json: false)
+        let out = SocketClient.formatResponse(response)
         let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         #expect(lines == ["* default ghostty", "  Dracula"])
     }
@@ -974,13 +1277,13 @@ struct SocketClientTests {
     @Test func formatResponseThemeSetIsBareOk() {
         // theme.set returns only `theme` (no `themes` array), so it prints `ok` like other mutations.
         let response = ControlResponse(ok: true, result: ControlResult(theme: "Dracula"))
-        #expect(SocketClient.formatResponse(response, json: false) == "ok")
+        #expect(SocketClient.formatResponse(response) == "ok")
     }
 
     @Test func formatResponseThemesMarksBothSyncedSides() {
         let response = ControlResponse(ok: true, result: ControlResult(
             theme: nil, themes: ["agterm", "Builtin Light", "Nord"], sync: true, light: "Builtin Light", dark: "agterm"))
-        let out = SocketClient.formatResponse(response, json: false)
+        let out = SocketClient.formatResponse(response)
         let lines = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         #expect(lines.first == "syncing with macOS appearance — light: Builtin Light, dark: agterm")
         #expect(lines.contains("* agterm"))
@@ -991,22 +1294,158 @@ struct SocketClientTests {
 
     @Test func formatsAppIdentityAndOmitsAnEmptyCommit() {
         let withCommit = ControlResponse(ok: true, result: ControlResult(app: AppIdentity(version: "0.24.0", commit: "a1b2c3d")))
-        #expect(SocketClient.formatResponse(withCommit, json: false) == "0.24.0 (a1b2c3d)")
+        #expect(SocketClient.formatResponse(withCommit) == "0.24.0 (a1b2c3d)")
 
         for commit in [nil, ""] as [String?] {
             let response = ControlResponse(ok: true, result: ControlResult(app: AppIdentity(version: "0.24.0", commit: commit)))
-            #expect(SocketClient.formatResponse(response, json: false) == "0.24.0")
+            #expect(SocketClient.formatResponse(response) == "0.24.0")
         }
     }
 
-    @Test func versionJSONCarriesTheRawResponseWithoutTheClientPath() throws {
-        let response = ControlResponse(ok: true, result: ControlResult(app: AppIdentity(version: "0.24.0", commit: "a1b2c3d")))
-        let line = SocketClient.formatResponse(response, json: true)
-        #expect(!line.contains("client"))
-        #expect(!line.contains(Version.clientPath() ?? "agtermctl"))
+    @Test func formatsInstalledIdentityOnlyWhenItDiffersFromTheRunningOne() {
+        let app = AppIdentity(version: "0.34.0", commit: "a1b2c3d")
+        func format(installed: AppIdentity?) -> String {
+            SocketClient.formatResponse(ControlResponse(ok: true, result: ControlResult(app: app, installed: installed)))
+        }
 
-        let decoded = try JSONDecoder().decode(ControlResponse.self, from: Data(line.utf8))
-        #expect(decoded == response)
+        #expect(format(installed: nil) == "0.34.0 (a1b2c3d)")
+        #expect(format(installed: app) == "0.34.0 (a1b2c3d)")
+        #expect(format(installed: AppIdentity(version: "0.35.1", commit: "def5678"))
+            == "0.34.0 (a1b2c3d)\ninstalled: 0.35.1 (def5678)")
+        #expect(format(installed: AppIdentity(version: "0.34.0", commit: "def5678"))
+            == "0.34.0 (a1b2c3d)\ninstalled: 0.34.0 (def5678)")
+        #expect(format(installed: AppIdentity(version: "0.35.1")) == "0.34.0 (a1b2c3d)\ninstalled: 0.35.1")
+    }
+
+    @Test func versionJSONCarriesTheRawResponseWithoutTheClientPath() throws {
+        let line = "{\"ok\": true, \"result\": {\"app\": {\"version\": \"0.24.0\", \"commit\": \"a1b2c3d\\u0020\"}}} "
+        let server = StubServer(line: Data(line.utf8))
+        try server.start()
+        defer { server.stop() }
+
+        let run = try runCLI(["version", "--json", "--socket", server.path])
+        #expect(run.status == 0)
+        #expect(run.out == Data((line + "\n").utf8))
+        #expect(!String(decoding: run.out, as: UTF8.self).contains("client"))
+    }
+
+    @Test func refusedConnectWithAHeldOwnershipLockReportsThePresentOwner() throws {
+        let socket = try RefusedSocket()
+        defer { socket.stop() }
+        let lock = try socket.holdOwnershipLock()
+        defer { close(lock) }
+
+        let error = try #require(throws: SocketClientError.self) { _ = try SocketClient(path: socket.path).connect() }
+        #expect(error.description.contains("the socket owner is present but not accepting connections"))
+        #expect(error.description.contains("Connection refused"))
+    }
+
+    @Test func refusedConnectWithAnUnheldOwnershipLockDoesNotClaimTheAppIsGone() throws {
+        let socket = try RefusedSocket()
+        defer { socket.stop() }
+        close(try socket.holdOwnershipLock(hold: false))
+
+        let error = try #require(throws: SocketClientError.self) { _ = try SocketClient(path: socket.path).connect() }
+        #expect(error.description.contains("agterm may be stopped or unable to accept connections"))
+        #expect(!error.description.contains("is agterm running?"))
+    }
+
+    @Test func refusedConnectWithNoOwnershipLockFileDoesNotClaimTheAppIsGone() throws {
+        let socket = try RefusedSocket()
+        defer { socket.stop() }
+
+        let error = try #require(throws: SocketClientError.self) { _ = try SocketClient(path: socket.path).connect() }
+        #expect(error.description.contains("agterm may be stopped or unable to accept connections"))
+        // the absent lock file sets errno to ENOENT inside the probe, after the connect error is read
+        #expect(error.description.contains("Connection refused"))
+        #expect(error.connectErrno == ECONNREFUSED)
+    }
+
+    @Test func aMissingSocketWithAHeldOwnershipLockReportsThePresentOwner() throws {
+        let path = NSTemporaryDirectory() + "agterm-unbound-\(UUID().uuidString.prefix(8)).sock"
+        let lockPath = ControlResolve.ownershipLockPath(forSocket: path)
+        let lock = open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        try #require(lock >= 0)
+        defer { close(lock); unlink(lockPath) }
+        try #require(flock(lock, LOCK_EX | LOCK_NB) == 0)
+
+        let error = try #require(throws: SocketClientError.self) { _ = try SocketClient(path: path).connect() }
+        #expect(error.description.contains("the socket owner is present but not accepting connections"))
+        #expect(error.description.contains("No such file or directory"))
+    }
+
+    @Test func aMissingSocketWithNoOwnershipLockStaysUncertainAndKeepsItsErrno() throws {
+        let path = NSTemporaryDirectory() + "agterm-absent-\(UUID().uuidString.prefix(8)).sock"
+
+        let error = try #require(throws: SocketClientError.self) { _ = try SocketClient(path: path).connect() }
+        #expect(error.description.contains("agterm may be stopped or unable to accept connections"))
+        #expect(error.description.contains("No such file or directory"))
+        #expect(error.connectErrno == ENOENT)
+    }
+
+    @Test func probingTheOwnershipLockLeavesItAcquirable() throws {
+        let socket = try RefusedSocket()
+        defer { socket.stop() }
+        close(try socket.holdOwnershipLock(hold: false))
+
+        _ = try? SocketClient(path: socket.path).connect()
+
+        let owner = open(ControlResolve.ownershipLockPath(forSocket: socket.path), O_CREAT | O_RDWR, 0o600)
+        defer { close(owner) }
+        #expect(flock(owner, LOCK_EX | LOCK_NB) == 0)
+    }
+}
+
+private final class RefusedSocket {
+    let path: String
+    private let fd: Int32
+
+    init() throws {
+        path = NSTemporaryDirectory() + "agterm-refused-\(UUID().uuidString.prefix(8)).sock"
+        fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw SocketClientError("refused socket() failed") }
+        unlink(path)
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let bytes = path.utf8CString
+        withUnsafeMutablePointer(to: &addr.sun_path) { dst in
+            dst.withMemoryRebound(to: CChar.self, capacity: bytes.count) { buf in
+                bytes.withUnsafeBufferPointer { src in buf.update(from: src.baseAddress!, count: src.count) }
+            }
+        }
+        let bound = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                bind(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard bound == 0 else {
+            close(fd)
+            throw SocketClientError("refused bind() failed: \(String(cString: strerror(errno)))")
+        }
+    }
+
+    func holdOwnershipLock(hold: Bool = true) throws -> Int32 {
+        let lockFD = open(ControlResolve.ownershipLockPath(forSocket: path), O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        guard lockFD >= 0 else { throw SocketClientError("lock open() failed") }
+        guard hold else { return lockFD }
+        guard flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
+            close(lockFD)
+            throw SocketClientError("lock flock() failed")
+        }
+        return lockFD
+    }
+
+    func stop() {
+        close(fd)
+        unlink(path)
+        unlink(ControlResolve.ownershipLockPath(forSocket: path))
+    }
+}
+
+/// A `SocketReply` for a fake `send`, carrying the response's own encoding as the line it arrived as.
+extension SocketReply {
+    init(_ response: ControlResponse) {
+        self.init(response: response, raw: try! JSONEncoder().encode(response)) // swiftlint:disable:this force_try
     }
 }
 
@@ -1031,9 +1470,9 @@ private final class EventReadScript: @unchecked Sendable {
 
 /// An in-process unix-socket server for the round-trip tests: binds a short temp path, accepts one
 /// connection, reads the request line, records it, and writes back a canned `ControlResponse`.
-private final class StubServer: @unchecked Sendable {
+final class StubServer: @unchecked Sendable {
     let path: String
-    private let canned: ControlResponse
+    private let canned: Data
     private var listenFD: Int32 = -1
     private let queue = DispatchQueue(label: "stub.server")
     private let finished = DispatchSemaphore(value: 0)
@@ -1041,9 +1480,14 @@ private final class StubServer: @unchecked Sendable {
     private var stopped = false
     private(set) var received: ControlRequest?
 
-    init(response: ControlResponse) {
-        self.canned = response
+    /// Answers with `line` exactly, so a test can send bytes no encoder would produce.
+    init(line: Data) {
+        self.canned = line
         self.path = NSTemporaryDirectory() + "agterm-stub-\(UUID().uuidString.prefix(8)).sock"
+    }
+
+    convenience init(response: ControlResponse) {
+        self.init(line: try! JSONEncoder().encode(response)) // swiftlint:disable:this force_try
     }
 
     func start() throws {
@@ -1094,7 +1538,7 @@ private final class StubServer: @unchecked Sendable {
         }
         received = try? JSONDecoder().decode(ControlRequest.self, from: buffer)
 
-        guard var data = try? JSONEncoder().encode(canned) else { return }
+        var data = canned
         data.append(UInt8(ascii: "\n"))
         data.withUnsafeBytes { raw in
             var offset = 0

@@ -164,7 +164,7 @@ final class SurfaceFactorySeedTests: XCTestCase {
         ))
 
         XCTAssertEqual(seed.command, ZmxSupport.attachCommand(
-            configuration, replaying: nil, creationCommand: "ssh example", denylist: []
+            configuration, replaying: nil, paneCommand: "ssh example", denylist: []
         ))
         XCTAssertNil(seed.initialInput)
     }
@@ -178,7 +178,7 @@ final class SurfaceFactorySeedTests: XCTestCase {
         ))
 
         XCTAssertEqual(seed.command, ZmxSupport.attachCommand(
-            configuration, replaying: nil, creationCommand: "watch date", denylist: []
+            configuration, replaying: nil, paneCommand: "watch date", denylist: []
         ))
         XCTAssertNil(seed.initialInput)
     }
@@ -293,6 +293,26 @@ final class SurfaceFactorySeedTests: XCTestCase {
 
     private func overlaySurface(for session: Session) -> GhosttySurfaceView {
         agtermApp.makeOverlaySurface(for: session, store: store, pane: nil, env: [:])
+    }
+
+    func testAHudSurfaceIsCreatedAtTheHudsOwnFontSize() throws {
+        let workspace = store.addWorkspace(name: "work")
+        let session = try XCTUnwrap(store.addSession(toWorkspace: workspace.id, cwd: NSHomeDirectory()))
+        store.setFontSize(session.id, 14)
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "a", fontSize: 20),
+                      file: stateDir.appendingPathComponent("body").path,
+                      size: HudPanelSize(widthPercent: 20, heightPercent: 9), fontSize: 20)
+
+        XCTAssertEqual(overlaySurface(for: session).initialFontSize, 20)
+    }
+
+    func testAProgramOverlayKeepsTheSessionsFontSize() throws {
+        let workspace = store.addWorkspace(name: "work")
+        let session = try XCTUnwrap(store.addSession(toWorkspace: workspace.id, cwd: NSHomeDirectory()))
+        store.setFontSize(session.id, 14)
+        XCTAssertTrue(store.openOverlay(session.id, command: "htop"))
+
+        XCTAssertEqual(overlaySurface(for: session).initialFontSize, 14)
     }
 
     private func remoteSession(reportedCwd: String) -> Session {

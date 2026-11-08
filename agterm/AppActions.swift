@@ -56,12 +56,10 @@ final class AppActions {
     /// for a banner-clicked session whose window had closed. Nil before the scene `.task` runs.
     var openWindow: ((WindowInfo.ID) -> Void)?
 
-    /// The settings model, holding the parsed keymap whose custom commands feed the action palette. It and
-    /// `customCommandRunner` are built AFTER `actions` in `agtermApp.init`, so both are wired from the scene
-    /// `.task` rather than passed to `init(library:)` — an init-order break. Nil until that `.task` runs.
+    /// settingsModel is wired during app initialization, before commands are evaluated.
     var settingsModel: SettingsModel?
 
-    /// The custom-command runner the palette's custom items invoke. Wired in the scene `.task` like `settingsModel`.
+    /// customCommandRunner runs the palette's custom commands; wired in the scene `.task`.
     var customCommandRunner: CustomCommandRunner?
 
     /// The command-palette controller, so "Select Theme…" and the View menu item can open the `.themes`
@@ -115,7 +113,8 @@ final class AppActions {
     func newSession() {
         guard uiActionsEnabled else { return }
         guard let store, let workspaceID = store.currentWorkspaceID,
-              let session = store.addSession(toWorkspace: workspaceID, cwd: resolvedNewSessionCwd())
+              let session = store.addSession(toWorkspace: workspaceID, cwd: resolvedNewSessionCwd(),
+                                             at: resolvedNewSessionIndex(in: workspaceID, store: store))
         else { return }
         // note activity so the new session buys the full idle grace before auto-follow moves the selection.
         store.noteUserActivity()
@@ -130,6 +129,12 @@ final class AppActions {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let current = store?.activeSession.map { $0.localWorkingDirectory(reported: $0.focusedCwd, homeDirectory: home) }
         return settingsModel?.settings.resolveNewSessionCwd(currentSessionCwd: current, home: home) ?? home
+    }
+
+    /// resolvedNewSessionIndex applies the placement setting to the supplied store's tree; nil appends.
+    func resolvedNewSessionIndex(in workspaceID: UUID, store: AppStore) -> Int? {
+        store.newSessionInsertionIndex(inWorkspace: workspaceID,
+                                       placement: settingsModel?.settings.effectiveNewSessionPlacement ?? .end)
     }
 
     func openDirectory() {
@@ -231,14 +236,18 @@ final class AppActions {
         if terminalZoomActive { frontmostTerminalZoom?.clear(); return true }
         if let dashboard = frontmostDashboard, dashboard.isOpen { dashboard.close(); focusActiveSession(); return true }
         guard let store, let session = store.activeSession else { return false }
-        if session.overlayActive { store.closeOverlay(session.id); return true }
+        // a page companion's page is the row, so Cmd-W takes the session close with its confirmation and undo
+        if session.hudActive || (session.coverOverlayVisible && session.content == .terminal) {
+            store.closeOverlay(session.id)
+            return true
+        }
         if session.scratchActive { store.toggleScratch(session.id); return true }
         // the focused pane's own overlay is the last cover: without this rung ⌘W over one falls straight
         // through and closes the SESSION. An overlay on the other pane is not in front of the user, so it
         // does not intercept — that pane stays live and ⌘W keeps its ordinary meaning.
         if let pane = session.focusedOverlayPane { store.closePaneOverlay(session.id, pane: pane); return true }
         // handled either way — returning true on cancel keeps the File menu from closing the whole window.
-        guard confirmCloseSession(session) else { return true }
+        guard confirmCloseSession(session, companions: store.companions(of: session.id)) else { return true }
         closeSessionAfterConfirmation(session.id, in: store)
         focusActiveSession()
         return true
@@ -279,8 +288,20 @@ final class AppActions {
     /// session; ⌘W/menu/palette use `closeActiveSession`, and the control `session.close` never prompts.
     func closeSession(_ id: UUID, in store: AppStore) {
         guard uiActionsEnabled else { return }
+        confirmAndCloseSession(id, in: store)
+    }
+
+    /// closePageSession closes page row `id` for its page's `window.close()` with the usual confirmation; false
+    /// only while a picker is pending in the page's own window, true once it closed or was cancelled.
+    func closePageSession(_ id: UUID, in store: AppStore) -> Bool {
+        if PickRegistry.shared.controller(for: library.windowID(for: store))?.modalPending == true { return false }
+        confirmAndCloseSession(id, in: store)
+        return true
+    }
+
+    private func confirmAndCloseSession(_ id: UUID, in store: AppStore) {
         guard let session = store.session(withID: id) else { return }
-        guard confirmCloseSession(session) else { return }
+        guard confirmCloseSession(session, companions: store.companions(of: session.id)) else { return }
         closeSessionAfterConfirmation(id, in: store)
     }
 
@@ -313,15 +334,13 @@ final class AppActions {
 
     /// A native warning confirm before closing `session`, gated by `AppSettings.confirmCloseSession`. Returns
     /// whether to proceed: true with no prompt when the setting is off or under XCUITest (a modal hangs it).
-    private func confirmCloseSession(_ session: Session) -> Bool {
+    private func confirmCloseSession(_ session: Session, companions: [Session]) -> Bool {
         guard settingsModel?.settings.confirmCloseSession == true,
               !ContentView.shouldBypassCloseConfirmation else { return true }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Close “\(session.displayName)”?"
-        alert.informativeText = closeGraceUndoEnabled
-            ? "The session will close after a short undo window."
-            : "The session will close immediately and can be reopened from File > Open Recent."
+        alert.informativeText = closeConfirmationText(for: [session], companions: companions)
         alert.addButton(withTitle: "Close")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
@@ -365,6 +384,31 @@ final class AppActions {
         guard let store, let id = store.selectedSessionID, let path = settingsModel?.keymapPath else { return }
         if store.openOverlay(id, command: ConfigPaths.editorCommand(forPath: path), sizePercent: 95) {
             keymapEditOverlaySession = id
+        } else {
+            beepIfHiddenOverlayRefused(id)
+        }
+    }
+
+    /// Re-read `hooks.conf` and apply it to the scheduler. Shared by the File menu, the palette and the Edit
+    /// Hooks overlay close (`hooks.reload` reaches the model directly, like `keymap.reload`); no-op before
+    /// the model wires.
+    func reloadHooks() { settingsModel?.reloadHooks() }
+
+    /// The session whose open overlay is the hooks editor, so its close reloads the hooks. Nil when none.
+    var hooksEditOverlaySession: UUID?
+    weak var remoteAttacher: (any RemoteAttaching)?
+    weak var companionDuplicator: (any CompanionDuplicating)?
+
+    /// Open `hooks.conf` in the user's editor in a 95% overlay over the active session, exactly like
+    /// `editKeymap`; exiting reloads the hooks.
+    func editHooks() {
+        guard uiActionsEnabled else { return }
+        guard let store, let id = store.selectedSessionID, let settingsModel else { return }
+        settingsModel.ensureStarterHooks()
+        if store.openOverlay(id, command: ConfigPaths.editorCommand(forPath: settingsModel.hooksPath), sizePercent: 95) {
+            hooksEditOverlaySession = id
+        } else {
+            beepIfHiddenOverlayRefused(id)
         }
     }
 
@@ -393,6 +437,8 @@ final class AppActions {
         if store.openOverlay(id, command: ConfigPaths.editorCommand(forPath: path), sizePercent: 95) {
             ghosttyEditOverlaySession = id
             ghosttyEditOverlaySnapshot = try? String(contentsOfFile: path, encoding: .utf8)
+        } else {
+            beepIfHiddenOverlayRefused(id)
         }
     }
 
@@ -404,67 +450,6 @@ final class AppActions {
         let after = settingsModel.flatMap { try? String(contentsOfFile: $0.ghosttyConfigPath, encoding: .utf8) }
         guard before != after else { return }
         reloadGhosttyConfig()
-    }
-
-    /// Step the selection prev/next/first/last in the sidebar's flattened visual order, through shared
-    /// `navigateSession` so GUI, palette and control can't drift, then `selectSession`
-    /// (recency/badge/persist/workspace) and first responder into the moved-to session's focused pane. Notes
-    /// the manual nav as user activity for the full idle grace against auto-follow; control `session.go`
-    /// drives `navigateSession` directly and stays silent. A step landing on the ALREADY-selected session only
-    /// re-focuses (next/previous wrap inside the filtered set, first/last repeat at that end): `selectSession`
-    /// still returns an indicator for a same-target select, and revealing on it would clear `splitFocused` and
-    /// yank first responder onto the primary pane, off the split being typed in. Attention nav DOES reveal.
-    private func navigatePlain(_ direction: SessionNavigation) {
-        guard uiActionsEnabled else { return }
-        store?.noteUserActivity()
-        let before = store?.selectedSessionID
-        // no live-indicator fallback (unlike attention nav): a plain direction returns nil only when
-        // `navigableSessions` is EMPTY, and then nothing was selected, which the moved-check below catches.
-        let indicator = store?.navigateSession(direction)
-        guard store?.selectedSessionID != before else { focusActiveSession(); return }
-        revealActiveBlockedPane(captured: indicator)
-    }
-
-    func selectNextSession() { navigatePlain(.next) }
-    func selectPreviousSession() { navigatePlain(.previous) }
-    func selectFirstSession() { navigatePlain(.first) }
-    func selectLastSession() { navigatePlain(.last) }
-
-    /// Step the CURRENT workspace prev/next through the sidebar's visible order and select its first session,
-    /// through shared `navigateWorkspace` so the menu, the palette and `workspace.go` can't drift. Notes the
-    /// step as user activity like session nav, then routes pane reveal off the step's captured indicator —
-    /// the same treatment plain session nav gives, so where focus lands does not depend on which keystroke
-    /// got you there. A step with nowhere to go (flagged mode, one visible workspace) leaves focus alone.
-    private func navigateWorkspace(_ direction: WorkspaceNavigation) {
-        guard uiActionsEnabled else { return }
-        store?.noteUserActivity()
-        guard let step = store?.navigateWorkspace(direction) else { return }
-        revealActiveBlockedPane(captured: step.indicator)
-    }
-
-    func selectNextWorkspace() { navigateWorkspace(.next) }
-    func selectPreviousWorkspace() { navigateWorkspace(.previous) }
-
-    /// Step to the next/previous session needing attention (`blocked`/`completed`), wrapping and skipping
-    /// idle/active, through `navigateSession` shared with the palette and `session.go next-attention|prev-attention`.
-    /// Notes user activity like plain nav, then `revealActiveBlockedPane` focuses the split/scratch pane that
-    /// SET the status. Unlike plain nav this DOES reveal on a selection no-op, and only the
-    /// `?? activeSession?.agentIndicator` fallback makes it: `attentionTarget` EXCLUDES the current session,
-    /// so when the sole session needing attention is the selected one, `navigateSession` selects nothing.
-    /// Without the fallback the reveal degrades to plain `focusActiveSession` and ⌃⌥↑/↓ stops landing on that
-    /// session's tagged pane — constant for an agent, since a pane-scoped block is not cleared by typing in
-    /// the OTHER pane. Keep it.
-    func selectNextAttentionSession() {
-        guard uiActionsEnabled else { return }
-        store?.noteUserActivity()
-        let indicator = store?.navigateSession(.nextAttention) ?? store?.activeSession?.agentIndicator
-        revealActiveBlockedPane(captured: indicator)
-    }
-    func selectPreviousAttentionSession() {
-        guard uiActionsEnabled else { return }
-        store?.noteUserActivity()
-        let indicator = store?.navigateSession(.previousAttention) ?? store?.activeSession?.agentIndicator
-        revealActiveBlockedPane(captured: indicator)
     }
 
     /// Delete a workspace and all its sessions from `store`'s window. Confirms while it still has sessions
@@ -531,7 +516,7 @@ final class AppActions {
 
     /// Expand every workspace in `store`'s window sidebar. The sidebar owns the outline, so this posts a
     /// store-scoped notification and only that window's `WorkspaceSidebar.Coordinator` acts — how
-    /// `sidebar.expand` targets a specific (default frontmost) window. No-op in flagged mode (no rows).
+    /// `sidebar.expand` targets a specific (default frontmost) window. No-op under the flat flagged list (no rows).
     func expandAllWorkspaces(in store: AppStore) {
         NotificationCenter.default.post(name: .agtermExpandWorkspaces, object: store)
     }
@@ -544,7 +529,7 @@ final class AppActions {
     }
 
     /// Collapse every workspace except the current one in `store`'s window sidebar, keeping that one
-    /// expanded and scrolled into view. Store-scoped like `expandAllWorkspaces(in:)`, no-op in flagged mode,
+    /// expanded and scrolled into view. Store-scoped like `expandAllWorkspaces(in:)`, no-op under the flat flagged list,
     /// and how `sidebar.collapse` targets a specific (default frontmost) window.
     func collapseOtherWorkspaces(in store: AppStore) {
         NotificationCenter.default.post(name: .agtermCollapseWorkspaces, object: store)
@@ -553,13 +538,14 @@ final class AppActions {
     /// Fold or unfold the CURRENT workspace alone, for the keyless `toggle_workspace_collapse`, its View-menu
     /// item and its palette row. The per-workspace counterpart of Expand / Collapse Workspaces, which act on
     /// every row and deliberately keep this one open — so before this there was no built-in way to fold the
-    /// workspace you are in. Tree mode only, matching those two and the rows it acts on. Targets what the row
+    /// workspace you are in. Needs workspace rows, matching those two and the rows it acts on. Targets what the row
     /// SHOWS (`isCurrentWorkspaceCollapsed`), not what is persisted: a reveal routinely leaves this workspace
     /// open on screen while its stored flag still says collapsed, and toggling the stored flag there costs the
     /// user a keystroke that changes nothing he can see.
     func toggleActiveWorkspaceCollapse() {
         guard uiActionsEnabled else { return }
-        guard let store, store.sidebarMode == .tree, let id = store.currentWorkspaceID else { return }
+        guard let store, store.rendersWorkspaceRows(flaggedLayout: GhosttyApp.shared.flaggedViewLayout),
+              let id = store.currentWorkspaceID else { return }
         setWorkspaceExpanded(id, expanded: store.isCurrentWorkspaceCollapsed, in: store)
     }
 
@@ -581,7 +567,7 @@ final class AppActions {
 
     // MARK: - Flagged working-set
 
-    /// Toggle a session's flagged membership (the durable working-set the flat sidebar view projects), from
+    /// Toggle a session's flagged membership (the durable working-set the flagged sidebar view projects), from
     /// the row's "Flag"/"Unflag" item; clean no-op on an unknown id.
     func toggleFlag(_ sessionID: UUID) {
         guard uiActionsEnabled else { return }
@@ -595,7 +581,7 @@ final class AppActions {
         toggleFlag(id)
     }
 
-    /// Flip the sidebar between the workspace tree and the flat flagged working-set list. Shared by the
+    /// Flip the sidebar between the workspace tree and the flagged working-set view. Shared by the
     /// bottom-bar toggle, the View menu, the palette and `sidebar.mode`; `ContentView` animates the switch.
     func toggleFlaggedView() {
         guard uiActionsEnabled else { return }
@@ -734,7 +720,7 @@ final class AppActions {
     private func toggleSplit(axis: SplitAxis?) {
         guard uiActionsEnabled else { return }
         guard let store, let session = store.activeSession else { return }
-        guard !session.fullOverlayActive else { return }
+        guard !session.fullOverlayVisible else { return }
         // the deck's `scratchActive` onChange reclaims first responder for the pane, as it does for ⌘J.
         if session.scratchActive { store.toggleScratch(session.id); return }
         store.toggleSplit(session.id, axis: axis)
@@ -749,7 +735,7 @@ final class AppActions {
     func closeSplit() {
         guard uiActionsEnabled else { return }
         guard let store, let session = store.activeSession else { return }
-        guard session.hasSplit, !session.fullOverlayActive else { return }
+        guard session.hasSplit, !session.fullOverlayVisible else { return }
         if session.scratchActive { store.toggleScratch(session.id); return }
         store.closeSplit(session.id)
         focusSplitPane(session, wantSplit: false)
@@ -898,61 +884,61 @@ final class AppActions {
 
     // NOT zoom-gated: font commands act on the FOCUSED surface — while zoomed that is the zoomed terminal —
     // and never touch hidden deck state, so ⌘+/⌘−/⌘0 keep working.
-    func increaseFontSize() {
-        focusedSurface()?.performBindingAction("increase_font_size:1")
+    func increaseFontSize() { resizeFont("increase_font_size:1") }
+    func decreaseFontSize() { resizeFont("decrease_font_size:1") }
+    func resetFontSize() { resizeFont("reset_font_size") }
+
+    // a page owning the keys zooms the pages instead: `focusedSurface()` would fall back to the terminal the
+    // page hides. An open dashboard hides every page, so it keeps the terminal behavior.
+    private func resizeFont(_ action: String) {
+        let session = frontmostDashboard?.isOpen == true ? nil : store?.activeSession
+        if Self.htmlPageOwnsKeys(responder: NSApp.keyWindow?.firstResponder, session: session) {
+            settingsModel?.stepHtmlOverlayZoom(action)
+            return
+        }
+        focusedSurface()?.performBindingAction(action)
     }
-    func decreaseFontSize() {
-        focusedSurface()?.performBindingAction("decrease_font_size:1")
-    }
-    func resetFontSize() {
-        focusedSurface()?.performBindingAction("reset_font_size")
+
+    /// htmlPageOwnsKeys is true when a page has focus, or covers `session` while focus sits outside every
+    /// terminal, as on the sidebar.
+    static func htmlPageOwnsKeys(responder: NSResponder?, session: Session?) -> Bool {
+        let view = responder as? NSView
+        if let view, sequence(first: view, next: \.superview).contains(where: { $0 is HtmlOverlayWebView }) {
+            return true
+        }
+        if view is GhosttySurfaceView { return false }
+        return session?.topmostHtmlOverlay != nil
     }
 
     // MARK: - Search (on the surface that opened it)
 
-    /// The search-capable target. A covering SCRATCH wins FIRST, so ⌘F over a scratch never opens the bar on
-    /// the hidden pane beneath — even with key-window focus off the surface (e.g. the sidebar), where
-    /// `focusedSurface()` would fall back to the hidden `activeSurface`. Else the focused surface IFF
-    /// searchable, else the active session's focused pane. Full overlay and quick terminal are unsearchable
-    /// (blocked by `coverHidesActiveSession`); a FLOATING overlay leaves the pane visible, so it targets it.
+    /// searchTarget is the surface ⌘F searches once no cover owns the key (`coverTakesSearch`): the scratch first, so
+    /// its bar never opens on the hidden pane beneath even with focus off the surface, as on the sidebar, where
+    /// `focusedSurface()` falls back to the hidden `activeSurface`; else the focused surface when searchable, else
+    /// the active session's focused pane.
     private func searchTarget() -> GhosttySurfaceView? {
-        if let session = store?.activeSession, session.scratchActive, !session.programOverlayActive {
+        if let session = store?.activeSession, session.scratchActive {
             return session.topmostSurface as? GhosttySurfaceView
         }
-        // the focused pane hidden under its OWN overlay has no searchable target: the overlay is unsearchable
-        // and returning the pane would strand the bar over it. The sibling pane keeps its own ⌘F once focused.
-        // AFTER the scratch rung on purpose: the scratch covers the pane overlays too, and it IS searchable.
-        if store?.activeSession?.focusedOverlayPane != nil { return nil }
         if let view = focusedSurface(), view.isSearchable { return view }
         return store?.activeSession?.activeSurface as? GhosttySurfaceView
     }
 
-    /// Whether a SESSION-WIDE cover BLOCKS ⌘F — the frontmost quick terminal or the active session's FULL
-    /// overlay, neither searchable, so the bar would strand over a hidden pane. The scratch IS searchable, so
-    /// it never blocks and ⌘F opens the bar over it; the ⌘F-again CLOSE runs regardless. A covering PANE
-    /// overlay is NOT a term here — `searchTarget` owns that rung, in the one order that gets the
-    /// scratch-above-a-pane-overlay case right; duplicating it here would block ⌘F on the searchable scratch.
-    private var coverHidesActiveSession: Bool {
-        if quickTerminal.holdsKey { return true }
-        guard let session = store?.activeSession else { return false }
-        // a FLOATING overlay leaves the session visible, so only a FULL overlay hides it (and is not searchable).
-        return session.fullOverlayActive
-    }
-
     /// Toggle the search bar for the active session; shared by the Find menu item, the palette, and ⌘F.
+    /// A cover on top takes ⌘F first (`coverTakesSearch`), so the terminal behind it never opens or closes its bar.
     /// CLOSE: `end_search` DIRECTLY to the pinned `searchSurface` (the surface that opened search) so the END
     /// callback clears the fields and refocuses — never a re-resolved target or a `start_search` round-trip,
     /// which on a split with focus moved to the OTHER pane puts that pane into search mode while
-    /// `onSearchStart` closes only the pinned owner, stranding it. OPEN: no-op with no searchable surface or
-    /// behind a cover, else `start_search` on the search target, whose `onSearchStart` opens and pins the bar.
+    /// `onSearchStart` closes only the pinned owner, stranding it. OPEN: `start_search` on the search target,
+    /// whose `onSearchStart` opens and pins the bar.
     func toggleSearch() {
         guard !pickActive(for: library.activeWindowID) else { return }
+        if coverTakesSearch() { return }
         if store?.activeSession?.searchActive == true {
             (store?.activeSession?.searchSurface as? GhosttySurfaceView)?.endSearch()
             return
         }
-        guard !terminalZoomActive else { return }
-        guard let target = searchTarget(), !coverHidesActiveSession else { return }
+        guard !terminalZoomActive, let target = searchTarget() else { return }
         target.startSearch()
     }
 

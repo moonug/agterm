@@ -12,6 +12,12 @@ public struct RemoteCommandResult: Sendable, Equatable {
         self.stdout = stdout
         self.stderr = stderr
     }
+
+    /// refusedArguments is the far `agtermctl` rejecting its own command line before sending anything: ArgumentParser's
+    /// usage exit, 64, with nothing on stdout, which is what a CLI older than an option or subcommand answers.
+    public var refusedArguments: Bool {
+        status == 64 && stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }
 
 /// Runs an ssh invocation somewhere that is not the main actor. The app supplies a `Process`-backed
@@ -78,6 +84,10 @@ public enum RemoteTreeMerger {
     /// taken beside the model walk rather than inside it, so these guards are eligibility rules and not
     /// only a defence against that gap.
     ///
+    /// A page owns no daemon, so it is listed with no panes. This Mac's own top-level page is always listed, and a page
+    /// companion is when its parent is: it attaches under that parent's row through `session.companion.page.attach`.
+    /// A row attached from another Mac is never offered again.
+    ///
     /// An empty result is a successful answer. It cannot be told apart from a store that is simply not
     /// running in `live` mode, and does not try to be: `zmx list` is the restore-mode diagnostic.
     public static func candidates(windows: [RemoteWindowProjection],
@@ -93,7 +103,7 @@ public enum RemoteTreeMerger {
             daemons[sessionID, default: [:]][pane] = entry.daemon
         }
 
-        let sessions = windows.flatMap { window in
+        let terminals = windows.flatMap { window in
             window.tree.workspaces.flatMap { workspace in
                 workspace.sessions.compactMap { node in
                     remoteSession(node, window: window, workspace: workspace,
@@ -101,7 +111,26 @@ public enum RemoteTreeMerger {
                 }
             }
         }
-        return ControlRemoteTree(host: nil, endpoint: endpoint, sessions: sessions)
+        let pageRoots = windows.flatMap { window in
+            window.tree.workspaces.flatMap { workspace in
+                workspace.sessions.filter { $0.content == "page" && $0.parent == nil && $0.remoteHost == nil }.map(\.id)
+            }
+        }
+        let attachable = Set(terminals.map(\.id) + pageRoots)
+        let pages = windows.flatMap { window in
+            window.tree.workspaces.flatMap { workspace in
+                workspace.sessions.compactMap { node -> ControlRemoteSession? in
+                    guard node.content == "page", node.remoteHost == nil else { return nil }
+                    guard let parent = node.parent else { return remotePageRoot(node, window: window, workspace: workspace) }
+                    guard attachable.contains(parent) else { return nil }
+                    return ControlRemoteSession(id: node.id, name: node.name, windowID: window.id, windowName: window.name,
+                                                workspaceID: workspace.id, workspaceName: workspace.name, cwd: node.cwd,
+                                                splitAxis: nil, panes: [], parent: parent, content: "page")
+                }
+            }
+        }
+        return ControlRemoteTree(host: nil, endpoint: endpoint, sessions: terminals + pages,
+                                 presentation: PresentationCodec.version)
     }
 
     /// Reads back what the far side's own `zmx tree` printed. The caller must reject a nonzero exit BEFORE
@@ -135,6 +164,22 @@ public enum RemoteTreeMerger {
         return ControlRemoteSession(id: node.id, name: node.name, windowID: window.id,
                                     windowName: window.name, workspaceID: workspace.id,
                                     workspaceName: workspace.name, context: node.context, cwd: node.cwd,
-                                    splitAxis: node.hasSplit == true ? node.splitAxis : nil, panes: panes)
+                                    splitAxis: node.hasSplit == true ? node.splitAxis : nil, panes: panes,
+                                    status: node.status, statusColor: node.statusColor,
+                                    statusShape: node.statusShape, parent: node.parent,
+                                    companions: node.parent == nil ? members(of: node, in: workspace) : nil)
+    }
+
+    private static func remotePageRoot(_ node: ControlSessionNode, window: RemoteWindowProjection,
+                                       workspace: ControlWorkspaceNode) -> ControlRemoteSession {
+        ControlRemoteSession(id: node.id, name: node.name, windowID: window.id, windowName: window.name,
+                             workspaceID: workspace.id, workspaceName: workspace.name, context: node.context,
+                             cwd: node.cwd, splitAxis: nil, panes: [], status: node.status, statusColor: node.statusColor,
+                             statusShape: node.statusShape, content: "page", companions: members(of: node, in: workspace))
+    }
+
+    // from the unfiltered workspace, so a companion this listing drops is still named as a member
+    private static func members(of node: ControlSessionNode, in workspace: ControlWorkspaceNode) -> [ControlRemoteMember] {
+        workspace.sessions.filter { $0.parent == node.id }.map { ControlRemoteMember(id: $0.id, name: $0.name) }
     }
 }

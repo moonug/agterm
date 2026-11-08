@@ -30,11 +30,46 @@ struct ConfigPathsTests {
         #expect(ConfigPaths.keymapPath(configDirectory: dir).path == "/Users/test/.config/agterm/keymap.conf")
     }
 
+    @Test func hooksPathIsHooksConfInDir() {
+        let dir = URL(fileURLWithPath: "/Users/test/.config/agterm")
+        #expect(ConfigPaths.hooksPath(configDirectory: dir).path == "/Users/test/.config/agterm/hooks.conf")
+    }
+
+    @Test(arguments: [
+        ("/custom/dir", nil, "/custom/dir/remotes.conf"),
+        (nil, "/tmp/agt-state", "/tmp/agt-state/config/remotes.conf"),
+        (nil, nil, "/Users/test/.config/agterm/remotes.conf"),
+    ] as [(String?, String?, String)])
+    func remotesPathFollowsTheResolvedConfigDirectory(setting: String?, stateDir: String?, expected: String) {
+        let dir = ConfigPaths.configDirectory(setting: setting, stateDir: stateDir, home: URL(fileURLWithPath: "/Users/test"))
+        #expect(ConfigPaths.remotesPath(configDirectory: dir).path == expected)
+    }
+
+    @Test func starterHooksConfIsCommentedListsKindsAndParsesToNothing() {
+        let starter = ConfigPaths.starterHooksConf()
+        #expect(starter.contains("on <kind> <shell...>"))
+        #expect(starter.contains("AGT_EVENT_KIND"))
+        #expect(starter.contains("AGT_SOCKET"))
+        #expect(starter.contains("agtermctl events --json"))
+        #expect(starter.contains("mkdir -p ~/.local/state/agterm"))
+        // a status filter must exit 0 for the statuses it ignores, or every idle event banners a failure
+        #expect(starter.contains(#"[ "$AGT_EVENT_STATUS" = blocked ] || exit 0; afplay"#))
+        for kind in ControlEventKind.allCases {
+            #expect(starter.contains(kind.rawValue))
+        }
+        for line in starter.split(separator: "\n") {
+            #expect(line.trimmingCharacters(in: .whitespaces).hasPrefix("#") || line.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+        let (hooks, diagnostics) = parseHooksConf(starter)
+        #expect(hooks.entries.isEmpty)
+        #expect(diagnostics.isEmpty)
+    }
+
     @Test func starterKeymapConfIsCommentedAndListsActions() {
         let starter = ConfigPaths.starterKeymapConf()
         #expect(starter.contains("agterm keymap — a kitty-flavored config"))
-        #expect(starter.contains("map <chord> <action>"))
-        #expect(starter.contains("command \"<name>\" [chord] <shell...>"))
+        #expect(starter.contains("map <chord> [--repeat] <action>"))
+        #expect(starter.contains("command \"<name>\" [chord] [--repeat] <shell...>"))
         #expect(starter.contains("single chord OR a leader like `ctrl+a>g`"))
         #expect(starter.contains("command \"Open in Zed\"  cmd+shift+e  open -a Zed \"$AGT_SESSION_PWD\""))
         #expect(starter.contains("command \"Lazygit\"      ctrl+a>g     agtermctl session overlay open 'zsh -lc lazygit' --target \"$AGT_SESSION_ID\" --socket \"$AGT_SOCKET\""))
@@ -93,9 +128,9 @@ struct ConfigPathsTests {
                   !text.contains("<") else { return nil }
             return String(text)
         }
-        // an example silently dropped from the guard must fail here: three `map`, three `command`, three
+        // an example silently dropped from the guard must fail here: three `map`, three `command`, four
         // `global-hotkey`.
-        #expect(examples.count == 9)
+        #expect(examples.count == 10)
         var bound = 0
         for example in examples {
             let (keymap, diagnostics) = parseKeymap(example)
@@ -107,9 +142,9 @@ struct ConfigPathsTests {
                 + (keymap.globalHotkey == nil ? 0 : 1)
         }
         // all three `map` examples and the two chorded `command` ones; `Deploy` is palette-only by design.
-        // the alternatives example counts twice, its menu chord and its monitor-bound half. Then the three
+        // the alternatives example counts twice, its menu chord and its monitor-bound half. Then the four
         // `global-hotkey` examples, each of which must yield a chord rather than a diagnostic.
-        #expect(bound == 9)
+        #expect(bound == 10)
     }
 
     @Test func ghosttyConfigPathIsGhosttyConfInDir() {

@@ -130,6 +130,21 @@ final class FullScreenChordTests: XCTestCase {
         XCTAssertEqual(window.toggleCount, 0, "an armed leader must outrank the full screen chord")
     }
 
+    func testRepeatTailEqualToTheFullScreenChordRepeatsInstead() throws {
+        let repeatRunner = try runner(keymap: "map ctrl+a>ctrl+cmd+f --repeat toggle_sidebar\n")
+        repeatRunner.start()
+        defer { repeatRunner.stop() }
+
+        XCTAssertTrue(repeatRunner.handleKeyDown(keyDown("a", keyCode: 0, mods: [.control]), in: window))
+        XCTAssertTrue(repeatRunner.handleKeyDown(controlCommandF, in: window))
+        XCTAssertTrue(repeatRunner.handleKeyDown(controlCommandF, in: window), "the open window claims the chord")
+        XCTAssertEqual(window.toggleCount, 0)
+
+        XCTAssertFalse(repeatRunner.handleKeyDown(keyDown("\u{1B}", keyCode: 53, mods: []), in: window))
+        XCTAssertTrue(repeatRunner.handleKeyDown(controlCommandF, in: window))
+        XCTAssertEqual(window.toggleCount, 1, "with the window closed the chord is full screen again")
+    }
+
     func testKeyRepeatDoesNotToggleTwice() throws {
         let repeated = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.control, .command],
                                         timestamp: 0, windowNumber: window.windowNumber, context: nil,
