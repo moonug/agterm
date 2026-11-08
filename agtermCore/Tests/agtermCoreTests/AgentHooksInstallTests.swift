@@ -23,14 +23,16 @@ struct AgentHooksInstallTests {
         (entry["hooks"] as? [[String: Any]])?.first?["command"] as? String
     }
 
-    @Test func mergeWhenAbsentAddsAllFourHooks() throws {
+    @Test func mergeWhenAbsentAddsAllFiveHooks() throws {
         let result = try AgentHooksInstall.mergeClaudeSettings(existing: nil, scriptDir: scriptDir)
         #expect(result.changed)
         let evts = events(result.json)
+        #expect(evts.count == 5)
         #expect(evts["UserPromptSubmit"]?.count == 1)
         #expect(evts["PostToolUse"]?.count == 1)
         #expect(evts["Stop"]?.count == 1)
         #expect(evts["Notification"]?.count == 1)
+        #expect(evts["PermissionRequest"]?.count == 1)
         // the entries invoke the Claude adapter, which guards on ownership and forwards to the wrapper
         let adapter = AgentHooksInstall.claudeWrapperPath(scriptDir: scriptDir)
         #expect(command(evts["UserPromptSubmit"]![0]) == "'\(adapter)' active --blink")
@@ -39,9 +41,12 @@ struct AgentHooksInstallTests {
         // only the Stop hook passes --auto-reset (clear-on-visit); active/blocked stay keep-state
         #expect(command(evts["Stop"]![0]) == "'\(adapter)' completed --auto-reset")
         #expect(command(evts["Notification"]![0]) == "'\(adapter)' blocked")
+        #expect(command(evts["PermissionRequest"]?.first ?? [:]) == "'\(adapter)' blocked")
         #expect(command(evts["UserPromptSubmit"]![0])?.contains("--auto-reset") == false)
         #expect(command(evts["Notification"]![0])?.contains("--auto-reset") == false)
         #expect(evts["Notification"]![0]["matcher"] as? String == "permission_prompt")
+        // unmatched, so it covers every tool that asks, where a tool-name matcher would narrow it
+        #expect(evts["PermissionRequest"]?.first?["matcher"] == nil)
         #expect(evts["UserPromptSubmit"]![0]["matcher"] == nil)
         #expect(evts["PostToolUse"]![0]["matcher"] == nil)
     }
@@ -81,6 +86,7 @@ struct AgentHooksInstallTests {
         #expect(evts["PostToolUse"]?.count == 1)
         #expect(evts["Stop"]?.count == 1)
         #expect(evts["Notification"]?.count == 1)
+        #expect(evts["PermissionRequest"]?.count == 1)
     }
 
     @Test func mergeRemergePreservesUnrelatedAndStaysNoOp() throws {
@@ -140,11 +146,42 @@ struct AgentHooksInstallTests {
         #expect(command(evts["PostToolUse"]![0]) == "'\(adapter)' active --blink")
         #expect(command(evts["Stop"]![0]) == "'\(adapter)' completed --auto-reset")
         #expect(command(evts["Notification"]![0]) == "'\(adapter)' blocked")
+        // an install that old never wrote PermissionRequest, so there is nothing to migrate and it is added
+        #expect(evts["PermissionRequest"]?.count == 1)
+        #expect(command(evts["PermissionRequest"]?.first ?? [:]) == "'\(adapter)' blocked")
         // rewritten in place: the matcher and the entry's other keys are untouched
         #expect(evts["Notification"]![0]["matcher"] as? String == "permission_prompt")
         #expect((evts["Stop"]![0]["hooks"] as? [[String: Any]])?.first?["type"] as? String == "command")
         // migrated, not appended alongside a fresh set
         #expect(!result.json.contains(AgentHooksInstall.wrapperPath(scriptDir: scriptDir) + "'"))
+    }
+
+    @Test func mergeAddsPermissionRequestToFourEventInstall() throws {
+        let adapter = AgentHooksInstall.claudeWrapperPath(scriptDir: scriptDir)
+        let existing = """
+        {
+          "hooks": {
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "'\(adapter)' active --blink"}]}],
+            "PostToolUse": [{"hooks": [{"type": "command", "command": "'\(adapter)' active --blink"}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": "'\(adapter)' completed --auto-reset"}]}],
+            "Notification": [
+              {"matcher": "permission_prompt", "hooks": [{"type": "command", "command": "'\(adapter)' blocked"}]}
+            ]
+          }
+        }
+        """
+        let first = try AgentHooksInstall.mergeClaudeSettings(existing: existing, scriptDir: scriptDir)
+        #expect(first.changed)
+        let evts = events(first.json)
+        #expect(evts.count == 5)
+        for event in ["UserPromptSubmit", "PostToolUse", "Stop", "Notification", "PermissionRequest"] {
+            #expect(evts[event]?.count == 1)
+        }
+        #expect(command(evts["PermissionRequest"]?.first ?? [:]) == "'\(adapter)' blocked")
+        #expect(evts["Notification"]?.first?["matcher"] as? String == "permission_prompt")
+        let second = try AgentHooksInstall.mergeClaudeSettings(existing: first.json, scriptDir: scriptDir)
+        #expect(!second.changed)
+        #expect(second.json == first.json)
     }
 
     @Test func mergeMigratesPreBlinkPromptEntry() throws {
@@ -257,13 +294,13 @@ struct AgentHooksInstallTests {
         // a whitespace-only file has no content to lose, so it starts fresh like an empty file
         let result = try AgentHooksInstall.mergeClaudeSettings(existing: "   \n\t\n", scriptDir: scriptDir)
         #expect(result.changed)
-        #expect(events(result.json).count == 4)
+        #expect(events(result.json).count == 5)
     }
 
     @Test func mergeHandlesEmptyExisting() throws {
         let result = try AgentHooksInstall.mergeClaudeSettings(existing: "", scriptDir: scriptDir)
         #expect(result.changed)
-        #expect(events(result.json).count == 4)
+        #expect(events(result.json).count == 5)
     }
 
     @Test func codexHooksBlockContainsAllSixEvents() {
@@ -458,10 +495,13 @@ struct AgentHooksInstallTests {
     }
 
     @Test func opencodePluginPathsUseOpenCodePluginsDirectory() {
-        #expect(AgentHooksInstall.opencodePluginDirectory(home: "/Users/me")
-                == "/Users/me/.config/opencode/plugins")
+        #expect(AgentHooksInstall.OpenCode.configurationDirectory(home: "/Users/me") == "/Users/me/.config/opencode")
+        #expect(AgentHooksInstall.OpenCode.configurationDirectory(home: "~") == "~/.config/opencode")
+        #expect(AgentHooksInstall.OpenCode.pluginPath(configurationDirectory: "/Users/me/.config/opencode", version: .v1)
+                == "/Users/me/.config/opencode/plugins/agterm-status.js")
         #expect(AgentHooksInstall.opencodePluginPath(home: "/Users/me")
                 == "/Users/me/.config/opencode/plugins/agterm-status.js")
+        #expect(AgentHooksInstall.opencodePluginPath(home: "~") == "~/.config/opencode/plugins/agterm-status.js")
         #expect(AgentHooksInstall.opencodePluginRelativePath == "opencode/agterm-status.js")
         #expect(AgentHooksInstall.opencodePluginMarker == "// agterm-opencode-status-plugin")
     }
@@ -477,6 +517,53 @@ struct AgentHooksInstallTests {
             existingContents: "export const Other = async () => ({})\n"
         ))
         #expect(!AgentHooksInstall.mayOverwriteOpenCodePlugin(fileExists: true, existingContents: nil))
+    }
+
+    @Test func opencodeV2UsesASeparateTUIEntrypointAndOwnershipMarker() throws {
+        let version = AgentHooksInstall.OpenCode.Version.v2
+        #expect(AgentHooksInstall.opencodePluginPath(home: "/Users/me", version: version) == "/Users/me/.config/opencode/plugins/agterm-v2/tui.js")
+        #expect(AgentHooksInstall.mayOverwriteOpenCodePlugin(fileExists: true, existingContents: "// agterm-opencode-v2-status-plugin\n", version: version))
+        #expect(!AgentHooksInstall.mayOverwriteOpenCodePlugin(fileExists: true, existingContents: AgentHooksInstall.opencodePluginMarker, version: version))
+        #expect(AgentHooksInstall.OpenCode.pluginPath(configurationDirectory: "/Users/me/.config/opencode", version: version)
+                == "/Users/me/.config/opencode/plugins/agterm-v2/tui.js")
+        #expect(AgentHooksInstall.OpenCode.relativePath(version: version) == "opencode/agterm-v2/tui.js")
+        #expect(AgentHooksInstall.OpenCode.marker(version: version) == "// agterm-opencode-v2-status-plugin")
+        #expect(AgentHooksInstall.OpenCode.mayOverwrite(fileExists: false, existingContents: nil, version: version))
+        #expect(!AgentHooksInstall.OpenCode.mayOverwrite(fileExists: true, existingContents: nil, version: version))
+        #expect(!AgentHooksInstall.OpenCode.mayOverwrite(fileExists: true, existingContents: AgentHooksInstall.opencodePluginMarker, version: version))
+        #expect(!AgentHooksInstall.OpenCode.mayOverwrite(fileExists: true, existingContents: "export default { id: 'user' }", version: version))
+        #expect(AgentHooksInstall.OpenCode.mayOverwrite(fileExists: true, existingContents: "// agterm-opencode-v2-status-plugin\n", version: version))
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let bundled = root.appendingPathComponent("agterm/Resources/agent-status/" + AgentHooksInstall.OpenCode.relativePath(version: version))
+        #expect(try String(contentsOf: bundled, encoding: .utf8).contains(AgentHooksInstall.OpenCode.marker(version: version)))
+    }
+
+    @Test func opencodeV2ConfigHonorsOverrideBeforeXDG() {
+        let resolve = AgentHooksInstall.OpenCode.configurationDirectory
+        #expect(resolve("/home/user", "/chosen", "/xdg", "/work") == "/chosen")
+        #expect(resolve("/home/user", nil, "/xdg", "/work") == "/xdg/opencode")
+        #expect(resolve("/home/user", nil, "", "/work") == "/home/user/.config/opencode")
+        #expect(resolve("/home/user", "", "/xdg", "/work") == nil)
+        #expect(resolve("/home/user", "relative", nil, "/work") == "/work/relative")
+        #expect(resolve("/home/user", "~/literal", nil, "/work") == "/work/~/literal")
+    }
+
+    @Test func opencodeMajorVersionAcceptsReleaseAndPrereleaseOutput() {
+        let outputs: [(String, AgentHooksInstall.OpenCode.Version)] = [
+            ("1.18.31\n", .v1), ("2.0.12\n", .v2), (" v2.0.12 \n", .v2),
+            ("2.1.0-beta.3+build.7", .v2), ("1.19.0-dev", .v1),
+            ("opencode v2.0.12\n", .v2), ("opencode 2.0.12\n", .v2),
+        ]
+        for (output, expected) in outputs {
+            #expect(AgentHooksInstall.OpenCode.Version(versionOutput: output) == expected)
+        }
+    }
+
+    @Test func opencodeMajorVersionRequiresUnambiguousSupportedVersion() {
+        for output in ["", "3.0.0", "0.0.0-dev", "2", "2.0", "2.x.1", "opencode version 2.0.12", "warning\n2.0.12", "1.18.31\n2.0.12"] {
+            #expect(AgentHooksInstall.OpenCode.Version(versionOutput: output) == nil)
+        }
     }
 
     @Test func fishIntegrationExportsAnExistingAgentRegexOverride() throws {

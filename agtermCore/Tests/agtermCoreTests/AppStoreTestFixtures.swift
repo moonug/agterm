@@ -1,4 +1,5 @@
 import Foundation
+import Testing
 @testable import agtermCore
 
 /// A store backed by a throwaway temp directory so mutation-time saves never
@@ -16,6 +17,41 @@ import Foundation
     let recentClosed = RecentClosedStore(directory: dir)
     let persistence = PersistenceStore(directory: dir)
     return (AppStore(persistence: persistence, recentClosedStore: recentClosed), recentClosed, persistence)
+}
+
+@MainActor func addPageRow(to store: AppStore, workspace: UUID, overlay: HtmlOverlay, cwd: String = "/page",
+                           backgroundColor: String? = nil) throws -> Session {
+    let page = try #require(store.addSession(toWorkspace: workspace, cwd: cwd, content: .page))
+    #expect(store.openHtmlOverlay(page.id, pane: nil, overlay: overlay, sizePercent: nil, backgroundColor: backgroundColor) == nil)
+    return page
+}
+
+@MainActor struct CompanionGroup {
+    let store: AppStore
+    let work: Workspace
+    let personal: Workspace
+    let parent: Session
+    let first: Session
+    let second: Session
+    let after: Session
+
+    init() throws {
+        store = makeStore()
+        work = store.addWorkspace(name: "work")
+        personal = store.addWorkspace(name: "personal")
+        guard let parent = store.addSession(toWorkspace: work.id, cwd: "/parent"),
+              let after = store.addSession(toWorkspace: work.id, cwd: "/after") else { throw CompanionGroupFailure.setup }
+        self.parent = parent
+        self.after = after
+        first = try store.addCompanion(to: parent.id, options: CompanionOptions(cwd: "/first")).get()
+        second = try store.addCompanion(to: parent.id, options: CompanionOptions(cwd: "/second")).get()
+    }
+
+    var order: [UUID] { store.workspaces[0].sessions.map(\.id) }
+}
+
+enum CompanionGroupFailure: Error {
+    case setup
 }
 
 final class SpySurface: PaneRoleMutableSurface {

@@ -18,6 +18,17 @@ struct ZmxCommandsTests {
         #expect(try JSONDecoder().decode(ControlRequest.self, from: JSONEncoder().encode(request)) == request)
     }
 
+    @Test func presentNamesTheSessionAsItsTarget() throws {
+        let present = try Zmx.Present.parse(["s1", "--socket", "/tmp/x.sock"])
+
+        #expect(present.makeRequest() == ControlRequest(cmd: .zmxPresent, target: "s1"))
+        #expect(present.options.socketPath() == "/tmp/x.sock")
+    }
+
+    @Test func presentRequiresASession() {
+        #expect(throws: (any Error).self) { try Zmx.Present.parse([]) }
+    }
+
     @Test func treeCarriesItsHostAsAnArgumentNotATarget() throws {
         let tree = try Zmx.Tree.parse(["buildbox"])
 
@@ -40,6 +51,29 @@ struct ZmxCommandsTests {
         #expect(try attach.makeRequest().cmd == .zmxAttach)
         #expect(try attach.makeRequest().args?.host == "buildbox")
         #expect(try attach.makeRequest().target == "s1")
+    }
+
+    @Test func attachWithCompanionsSendsTheGroupCommandWithTheSameArguments() throws {
+        let attach = try Zmx.Attach.parse(["buildbox", "s1", "--companions", "--window", "local-window"])
+        let request = try attach.makeRequest()
+
+        #expect(request == ControlRequest(cmd: .zmxAttachGroup, target: "s1",
+                                          args: ControlArgs(host: "buildbox", window: "local-window")))
+        #expect(try Zmx.Attach.parse(["buildbox", "s1"]).makeRequest().cmd == .zmxAttach)
+    }
+
+    @Test func aGroupAttachPrintsTheParentThenEachCompanionOriginToLocal() {
+        let group = ControlRemoteGroup(membershipKnown: true, companions: [
+            ControlRemoteGroupMember(origin: "c1", id: "L1"), ControlRemoteGroupMember(origin: "pg", id: "L2"),
+        ])
+
+        #expect(SocketClient.formatRemoteGroup(parent: "P", group: group) == "P\n  c1 -> L1\n  pg -> L2")
+        #expect(SocketClient.formatRemoteGroup(parent: "P", group: ControlRemoteGroup(membershipKnown: true, companions: [])) == "P")
+    }
+
+    @Test func theMembershipNoteNamesTheHost() {
+        #expect(SocketClient.remoteGroupNote(host: "buildbox")
+            == "note: buildbox does not report group membership; unlisted companions cannot be detected")
     }
 
     @Test(arguments: [[], ["buildbox"]])
@@ -87,6 +121,22 @@ struct ZmxCommandsTests {
 
         #expect(SocketClient.formatRemoteTree(tree) == "no attachable sessions on buildbox",
                 "silence reads the same as a failed read")
+    }
+
+    @Test func screenSendsTheDaemonNameAndExtent() throws {
+        let plain = try Zmx.Screen.parse(["agterm-a"]).makeRequest()
+        #expect(plain.cmd == .zmxScreen)
+        #expect(plain.target == nil)
+        #expect(plain.args?.name == "agterm-a")
+        #expect(plain.args?.all == nil)
+
+        #expect(try Zmx.Screen.parse(["agterm-a", "--all"]).makeRequest().args?.all == true)
+        #expect(try Zmx.Screen.parse(["agterm-a", "--lines", "20"]).makeRequest().args?.lines == 20)
+    }
+
+    @Test(arguments: [["agterm-a", "--all", "--lines", "3"], ["agterm-a", "--lines", "0"], []])
+    func screenRefusesABadExtentOrAMissingName(arguments: [String]) {
+        #expect(throws: (any Error).self) { try Zmx.Screen.parse(arguments) }
     }
 
     @Test func listAndPruneSendTheirCommandWithNothingToResolve() throws {
@@ -163,6 +213,23 @@ struct ZmxCommandsTests {
         // kill resolves by id, never by name, and a closed row may not appear in `tree` at all
         #expect(rendered.contains(String(claim.sessionID.uuidString.prefix(8))))
         #expect(rendered.contains("win \(claim.windowID.uuidString.prefix(8))"))
+    }
+
+    @Test func aDaemonCreatedBeforeTheCutoffIsMarkedOutdated() throws {
+        let old = UUID(), current = UUID()
+        let output = """
+        name=\(ZmxSupport.daemonName(for: old))\tpid=10\tclients=1\tcreated=999\tcwd=/tmp
+        name=\(ZmxSupport.daemonName(for: current))\tpid=11\tclients=1\tcreated=1000\tcwd=/tmp
+        """
+        let result = ZmxInventory.join(observed: try ZmxListParser.parse(output), claims: [], inventoryComplete: false)
+        let status = ControlRestoreStatus(configured: .live, requestedAtLaunch: .live, active: .live, unavailableReason: nil)
+        let inventory = ControlZmxInventory(restore: status, result: result, outdatedBefore: Date(timeIntervalSince1970: 1000))
+
+        let flags = Dictionary(uniqueKeysWithValues: inventory.entries.map { ($0.daemon, $0.outdated) })
+        #expect(flags == [ZmxSupport.daemonName(for: old): true, ZmxSupport.daemonName(for: current): Bool?.none])
+        let rendered = SocketClient.formatZmx(inventory).split(separator: "\n")
+        #expect(rendered.contains { $0.hasPrefix(ZmxSupport.daemonName(for: old)) && $0.contains("running outdated") })
+        #expect(rendered.contains { $0.hasPrefix(ZmxSupport.daemonName(for: current)) && !$0.contains("outdated") })
     }
 
     @Test func anIncompleteInventorySaysSoBeforeItsRows() {

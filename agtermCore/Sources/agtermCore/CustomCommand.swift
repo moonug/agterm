@@ -13,11 +13,39 @@ public struct CustomCommand: Codable, Equatable, Sendable, Identifiable {
     /// The keybind string (e.g. `cmd+shift+e` or `ctrl+a>b`); empty means palette-only.
     public var shortcut: String
 
-    public init(id: UUID = UUID(), name: String, command: String, shortcut: String) {
+    public var errorHud: Bool
+    public var errorPosition: HudPosition
+    public var errorPane: OverlayPane?
+    /// `--repeat`: a leader shortcut stays live for another press of its last chord after firing.
+    public var repeats: Bool
+
+    public init(id: UUID = UUID(), name: String, command: String, shortcut: String,
+                errorHud: Bool = false, errorPosition: HudPosition = .defaultPosition, errorPane: OverlayPane? = nil,
+                repeats: Bool = false) {
         self.id = id
         self.name = name
         self.command = command
         self.shortcut = shortcut
+        self.errorHud = errorHud
+        self.errorPosition = errorPosition
+        self.errorPane = errorPane
+        self.repeats = repeats
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, command, shortcut, errorHud, errorPosition, errorPane, repeats
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        command = try values.decode(String.self, forKey: .command)
+        shortcut = try values.decode(String.self, forKey: .shortcut)
+        errorHud = try values.decodeIfPresent(Bool.self, forKey: .errorHud) ?? false
+        errorPosition = try values.decodeIfPresent(HudPosition.self, forKey: .errorPosition) ?? .defaultPosition
+        errorPane = try values.decodeIfPresent(OverlayPane.self, forKey: .errorPane)
+        repeats = try values.decodeIfPresent(Bool.self, forKey: .repeats) ?? false
     }
 }
 
@@ -52,13 +80,16 @@ public struct CommandContext: Equatable, Sendable {
     /// back through `session type --pane` (re-validated CLI- AND server-side — the enum pins the token
     /// emitted here, not the shell round-trip).
     public var pane: Pane
+    /// The stable token of the surface in `pane`'s slot (its shell's `AGTERM_PANE_ID`), for `--pane-id`
+    /// addressing that survives a swap or promotion; empty for an empty slot or a session-free context.
+    public var paneID: String
     public var selection: String
     public var socket: String
 
     public init(sessionID: String = "", sessionName: String = "", sessionPWD: String = "",
                 sessionHost: String = "", workspaceID: String = "", workspaceName: String = "",
-                windowID: String = "", windowName: String = "", pane: Pane = .left, selection: String = "",
-                socket: String = "") {
+                windowID: String = "", windowName: String = "", pane: Pane = .left, paneID: String = "",
+                selection: String = "", socket: String = "") {
         self.sessionID = sessionID
         self.sessionName = sessionName
         self.sessionPWD = sessionPWD
@@ -68,6 +99,7 @@ public struct CommandContext: Equatable, Sendable {
         self.windowID = windowID
         self.windowName = windowName
         self.pane = pane
+        self.paneID = paneID
         self.selection = selection
         self.socket = socket
     }
@@ -85,6 +117,7 @@ public struct CommandContext: Equatable, Sendable {
          ("AGT_WINDOW_ID", windowID),
          ("AGT_WINDOW_NAME", windowName),
          ("AGT_PANE", pane.rawValue),
+         ("AGT_PANE_ID", paneID),
          ("AGT_SELECTION", selection),
          ("AGT_SOCKET", socket)]
     }
@@ -99,7 +132,8 @@ public struct CommandContext: Equatable, Sendable {
     /// The token base names whose value comes from an active session/workspace/selection. In a
     /// session-free context each expands EMPTY, which is dangerous — an empty `{AGT_SESSION_PWD}` turns
     /// `rm -rf …/*` into a root glob. `AGT_SOCKET`/`AGT_WINDOW`/`AGT_PANE` are excluded: they resolve
-    /// with no session, which is what keeps a launcher command firable in an emptied window.
+    /// with no session, which is what keeps a launcher command firable in an emptied window; `AGT_PANE_ID`
+    /// stays usable there too and resolves empty.
     public static let sessionScopedTokenBases = ["AGT_SESSION", "AGT_WORKSPACE", "AGT_SELECTION"]
 
     /// Whether `commandBody` references any session-scoped token (`{AGT_X}`, `$AGT_X` or `${AGT_X}` — a

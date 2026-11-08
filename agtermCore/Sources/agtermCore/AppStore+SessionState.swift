@@ -3,13 +3,14 @@ import Foundation
 // Per-session durable state the sidebar and title bar project: flagged working-set membership, the
 // title-bar context, and the background watermark. Split out of `AppStore.swift` for the file size limit.
 extension AppStore {
-    /// Sets (or clears) a session's flag — the durable flagged working-set membership the flat sidebar view
+    /// Sets (or clears) a session's flag — the durable flagged working-set membership the flagged sidebar view
     /// projects — and persists. Clean no-op for an unknown id or a matching flag, so delta-computed callers
     /// stay idempotent. Unflagging narrows in `.flagged` mode (dropping the row rendering the active session),
     /// hence `reselectIfSelectionHidden`; in tree mode it only repairs a selection stranded by something else.
     public func setFlag(_ on: Bool, forSession id: UUID) {
         guard let session = session(withID: id), session.flagged != on else { return }
         session.flagged = on
+        if on { appendFlaggedArrivals() } else { dropFromFlaggedOrder([id]) }
         pruneSidebarSelection()
         reselectIfSelectionHidden()
         save()
@@ -22,9 +23,24 @@ extension AppStore {
     @discardableResult
     public func setContext(_ context: String?, forSession id: UUID) -> Bool {
         guard let session = session(withID: id), session.context != context else { return false }
+        let previous = session.effectiveContext
         session.context = context
         save()
-        scheduleTreeChanged()
+        presentationHub?.publish(.context(context), session: id)
+        if previous != session.effectiveContext { scheduleTreeChanged() }
+        return true
+    }
+
+    /// setInfo sets or clears a session's local sidebar info line. Runtime-only, so nothing is saved. Returns whether
+    /// the local value CHANGED, while `tree.changed` fires only when the effective line did; a clear goes through
+    /// `Session.discardInfo`, which cancels the app's expiry timer.
+    @discardableResult
+    public func setInfo(_ info: SessionInfo?, forSession id: UUID) -> Bool {
+        guard let session = session(withID: id), session.info != info else { return false }
+        let previous = session.effectiveInfo
+        if let info { session.info = info } else { session.discardInfo() }
+        presentationHub?.publish(.info(info.map(Self.presentationInfo)), session: id)
+        if previous != session.effectiveInfo { scheduleTreeChanged() }
         return true
     }
 
@@ -40,26 +56,49 @@ extension AppStore {
             }
         }
         if changed {
+            if on { appendFlaggedArrivals() } else { dropFromFlaggedOrder(targetIDs) }
             pruneSidebarSelection()
             reselectIfSelectionHidden() // the batch can unflag the active session too
             save()
         }
     }
 
-    /// Sets (or clears) a session's background watermark and persists it; clean no-op for an unknown id or an
-    /// unchanged spec, so a repeated `session.background` is idempotent. Returns whether the spec CHANGED, so
-    /// the app target can gate its (retained, teardown-only-freed) per-surface config apply on a real change
-    /// — without that a scripted set-loop keeps appending owned configs. The store owns only the spec; the
-    /// C-boundary apply lives app-side in `ControlServer`/`GhosttySurfaceView`.
+    /// Whether every session of the workspace is flagged; false for an empty or unknown workspace. The one
+    /// predicate behind the row menu's Flag All/Unflag All label and `workspace.flag toggle`.
+    public func allSessionsFlagged(inWorkspace id: UUID) -> Bool {
+        guard let workspace = workspaces.first(where: { $0.id == id }), !workspace.sessions.isEmpty else { return false }
+        return workspace.sessions.allSatisfy(\.flagged)
+    }
+
+    /// Applies one `workspace.flag` mode to EVERY session of the workspace, including ones the flagged view
+    /// hides. `toggle` unflags all only when all are flagged, otherwise flags all, so a mixed workspace
+    /// converges instead of inverting per session.
+    public func applyWorkspaceFlag(_ mode: ControlToggleMode, to id: UUID) {
+        guard let workspace = workspaces.first(where: { $0.id == id }) else { return }
+        setFlag(mode.desiredValue(current: allSessionsFlagged(inWorkspace: id)), forSessions: workspace.sessions.map(\.id))
+    }
+
+    /// setBackgroundWatermark writes the session default when `pane` is nil, leaving pane overrides in
+    /// place, or that pane's override, where nil returns the pane to inheriting. Returns whether it changed.
     @discardableResult
-    public func setBackgroundWatermark(_ watermark: BackgroundWatermark?, forSession id: UUID) -> Bool {
-        guard let session = session(withID: id), session.backgroundWatermark != watermark else { return false }
-        let previous = session.backgroundWatermark
-        session.backgroundWatermark = watermark
-        // a `.text` watermark owns a rendered `<id>.png`; switching away leaves it unreferenced. `clear` and
-        // teardown sweep the same file, so this is only the eager reclaim for text→image/nil.
+    public func setBackgroundWatermark(_ watermark: BackgroundWatermark?, forSession id: UUID,
+                                       pane: StatusPane? = nil) -> Bool {
+        guard let session = session(withID: id) else { return false }
+        let previous = pane.map { session.paneBackgrounds[$0] } ?? session.backgroundWatermark
+        guard previous != watermark else { return false }
+        if let pane {
+            session.paneBackgrounds[pane] = watermark
+        } else {
+            session.backgroundWatermark = watermark
+        }
+        // a `.text` watermark owns a rendered PNG that switching away leaves unreferenced. for a pane override
+        // this is the only removal short of the pane closing: `clear --pane` sweeps nothing app-side.
         if previous?.kind == .text, watermark?.kind != .text {
-            WatermarkStorage.removeRenderedText(sessionID: id)
+            if let pane {
+                session.backgroundFileKey(for: pane).map { WatermarkStorage.removeRenderedText(sessionID: id, paneKey: $0) }
+            } else {
+                WatermarkStorage.removeRenderedText(sessionID: id)
+            }
         }
         save()
         return true
@@ -69,6 +108,8 @@ extension AppStore {
     /// `session.flag clear` control mode. No `reselectIfSelectionHidden`, unlike the `setFlag` mutators:
     /// clearing EVERY flag leaves the list empty, so there is nowhere to move — a partial clear would need it.
     public func clearFlags() {
+        // parked pending-close ids go too, so an undo after the clear appends
+        if !flaggedOrder.isEmpty { flaggedOrder = [] }
         var changed = false
         for workspace in workspaces {
             for session in workspace.sessions where session.flagged {

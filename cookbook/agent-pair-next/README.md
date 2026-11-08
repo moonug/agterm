@@ -2,6 +2,8 @@
 
 Open one fresh agent pair for the next-session prompt you explicitly select, leaving the source pair intact.
 
+Author: [@moonug](https://github.com/moonug)
+
 ## What it does
 
 Invoke `agterm-next` or explicitly ask “open this prompt in a new pair” to hand the last selected next-session prompt to a new left/right pair.

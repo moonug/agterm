@@ -13,10 +13,22 @@ struct ZmxLifecycleTests {
         """
 
         #expect(try ZmxListParser.parse(output) == [
-            ZmxSessionRecord(name: "agterm-a", clients: 0, leaderPID: 10),
-            ZmxSessionRecord(name: "agterm-b", clients: 2, leaderPID: 11),
+            ZmxSessionRecord(name: "agterm-a", clients: 0, leaderPID: 10, createdAt: Date(timeIntervalSince1970: 1)),
+            ZmxSessionRecord(name: "agterm-b", clients: 2, leaderPID: 11, createdAt: Date(timeIntervalSince1970: 1)),
             ZmxSessionRecord(name: "agterm-busy", clients: nil),
         ])
+    }
+
+    @Test(arguments: [
+        ("\tcreated=1790000000", Date?.some(Date(timeIntervalSince1970: 1_790_000_000))),
+        ("", Date?.none),
+        ("\tcreated=0", Date?.none),
+        ("\tcreated=wat", Date?.none),
+        ("\tcreated=-5", Date?.none),
+    ])
+    func listParserReadsCreationTimeWithoutEverThrowingOnIt(field: String, expected: Date?) throws {
+        let records = try ZmxListParser.parse("name=agterm-a\tpid=10\tclients=0\(field)\n")
+        #expect(records == [ZmxSessionRecord(name: "agterm-a", clients: 0, leaderPID: 10, createdAt: expected)])
     }
 
     @Test func listParserRejectsPartialOutputInsteadOfReapingFromIt() {
@@ -399,6 +411,65 @@ struct ZmxLifecycleTests {
                           launchInventorySink: { inventories.append($0) })
 
         #expect(inventories == [nil])
+    }
+
+    @Test func theIdentityUpgradeLeavesAPageRowWithoutAnIdentity() {
+        let pane = UUID()
+        var snapshot = Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [
+            SessionSnapshot(id: UUID(), paneIdentity: pane, customName: nil, cwd: "/repo"),
+            pageRow(),
+        ])])
+
+        let upgrade = PaneIdentityInventory.upgrade(&snapshot)
+
+        #expect(!upgrade.changed)
+        #expect(upgrade.identities == [pane])
+        #expect(snapshot.workspaces[0].sessions[1].paneIdentity == nil)
+    }
+
+    @Test func theIdentityUpgradeLeavesAnUnreadablePageRowWithoutAnIdentity() throws {
+        let pane = UUID()
+        let json = #"{"id":"\#(UUID().uuidString)","cwd":"/repo","page":{"url":"ftp://example.com"}}"#
+        var snapshot = Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [
+            SessionSnapshot(id: UUID(), paneIdentity: pane, customName: nil, cwd: "/repo"),
+            try JSONDecoder().decode(SessionSnapshot.self, from: Data(json.utf8)),
+        ])])
+
+        let upgrade = PaneIdentityInventory.upgrade(&snapshot)
+
+        #expect(!upgrade.changed)
+        #expect(upgrade.identities == [pane])
+        #expect(snapshot.workspaces[0].sessions[1].paneIdentity == nil)
+    }
+
+    @Test func launchInventorySkipsPageRowsInOpenAndClosedWindows() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let open = UUID(), closed = UUID()
+        let openPane = UUID(), closedPane = UUID()
+        try writeIndex(WindowsIndex(windows: [
+            WindowEntry(id: open, name: "open", isOpen: true),
+            WindowEntry(id: closed, name: "closed", isOpen: false),
+        ]), directory: directory)
+        for (id, pane) in [(open, openPane), (closed, closedPane)] {
+            try writeWindow(Snapshot(workspaces: [WorkspaceSnapshot(id: UUID(), name: "work", sessions: [
+                SessionSnapshot(id: UUID(), paneIdentity: pane, customName: nil, cwd: "/repo"),
+                pageRow(),
+            ])]), id: id, directory: directory)
+        }
+        var inventories: [Set<UUID>?] = []
+
+        let library = WindowLibrary(directory: directory, paneFinalizer: nil,
+                                    launchInventorySink: { inventories.append($0) })
+
+        #expect(inventories == [Set([openPane, closedPane])])
+        let store = try #require(library.store(for: open))
+        #expect(Set(PaneIdentityInventory.identities(in: store.workspaces.flatMap(\.sessions))) == [openPane])
+        #expect(store.workspaces[0].sessions[1].htmlOverlay != nil)
+    }
+
+    private func pageRow() -> SessionSnapshot {
+        SessionSnapshot(id: UUID(), customName: nil, cwd: "/repo", page: PageSnapshot(source: .file(path: "/tmp/p.html", grantRoot: nil)))
     }
 
     private func paneSnapshot(_ pane: UUID) -> Snapshot {

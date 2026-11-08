@@ -20,12 +20,16 @@ public struct ControlKeymapAction: Codable, Sendable, Equatable {
     /// `map cmd+w close_session` parses fine and leaves the action on its default, and marking that overridden
     /// would report a difference a caller cannot see anywhere else.
     public var overridden: Bool?
+    /// `true` when the `map` line carried `--repeat` and kept a monitor-bound sequence; omitted otherwise.
+    public var repeats: Bool?
 
-    public init(action: String, chord: String? = nil, alternates: [String]? = nil, overridden: Bool? = nil) {
+    public init(action: String, chord: String? = nil, alternates: [String]? = nil, overridden: Bool? = nil,
+                repeats: Bool? = nil) {
         self.action = action
         self.chord = chord
         self.alternates = alternates
         self.overridden = overridden
+        self.repeats = repeats
     }
 }
 
@@ -36,9 +40,33 @@ public struct ControlKeymapCommand: Codable, Sendable, Equatable {
     /// dropped as colliding — the diagnostics say which).
     public var shortcut: String?
 
-    public init(name: String, shortcut: String? = nil) {
+    public var errorHud: Bool
+    public var errorPosition: HudPosition
+    public var errorPane: OverlayPane?
+    public var repeats: Bool
+
+    public init(name: String, shortcut: String? = nil, errorHud: Bool = false,
+                errorPosition: HudPosition = .defaultPosition, errorPane: OverlayPane? = nil, repeats: Bool = false) {
         self.name = name
         self.shortcut = shortcut
+        self.errorHud = errorHud
+        self.errorPosition = errorPosition
+        self.errorPane = errorPane
+        self.repeats = repeats
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name, shortcut, errorHud, errorPosition, errorPane, repeats
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        name = try values.decode(String.self, forKey: .name)
+        shortcut = try values.decodeIfPresent(String.self, forKey: .shortcut)
+        errorHud = try values.decodeIfPresent(Bool.self, forKey: .errorHud) ?? false
+        errorPosition = try values.decodeIfPresent(HudPosition.self, forKey: .errorPosition) ?? .defaultPosition
+        errorPane = try values.decodeIfPresent(OverlayPane.self, forKey: .errorPane)
+        repeats = try values.decodeIfPresent(Bool.self, forKey: .repeats) ?? false
     }
 }
 
@@ -122,10 +150,13 @@ public extension ControlKeymap {
             return ControlKeymapAction(action: action.rawValue,
                                        chord: resolved?.displayString,
                                        alternates: alternates.isEmpty ? nil : alternates,
-                                       overridden: resolved != action.defaultChord ? true : nil)
+                                       overridden: resolved != action.defaultChord ? true : nil,
+                                       repeats: keymap.builtinRepeating.contains(action) ? true : nil)
         }
         let commands = keymap.commands.map {
-            ControlKeymapCommand(name: $0.name, shortcut: $0.shortcut.isEmpty ? nil : $0.shortcut)
+            ControlKeymapCommand(name: $0.name, shortcut: $0.shortcut.isEmpty ? nil : $0.shortcut,
+                                errorHud: $0.errorHud, errorPosition: $0.errorPosition, errorPane: $0.errorPane,
+                                repeats: $0.repeats)
         }
         return ControlKeymap(path: path, actions: actions, commands: commands,
                              diagnostics: diagnostics.map { ControlKeymapDiagnostic(line: $0.line, message: $0.message) },

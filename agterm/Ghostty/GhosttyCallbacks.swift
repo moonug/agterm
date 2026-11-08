@@ -41,13 +41,31 @@ final class GhosttyCallbacks: @unchecked Sendable {
             // OSC 0/1/2 title, often from PROMPT_COMMAND or SSH; displayName prefers it to the cwd basename.
             guard let view = surfaceView(from: target), let ptr = action.action.set_title.title else { return true }
             let title = String(cString: ptr)
-            DispatchQueue.main.async { view.applyTitle(title) }
+            // the pane's zmx client reporting its role under the reserved prefix, never the pane's title
+            if let notice = ZmxLeadNotice(title: title) {
+                DispatchQueue.main.async { PaneLead.report(notice, from: view) }
+                return true
+            }
+            // the attach wrapper saying ssh lost the connection, never the pane's title
+            if let notice = RemoteLinkNotice(title: title) {
+                DispatchQueue.main.async { PaneLead.linkLost(notice, from: view) }
+                return true
+            }
+            // a static `title` in the user's config stands in for every title a program sets
+            guard view.titleAdmission.withLock({ $0.admit(title) }) else { return true }
+            DispatchQueue.main.async {
+                view.titleAdmission.withLock { $0.complete() }
+                view.applyTitle(GhosttyApp.shared.staticTitle ?? title)
+            }
             return true
         case GHOSTTY_ACTION_CELL_SIZE:
             // the cell pixel size changed (cmd +/- font size, or DPI): a trigger only — the view reads the
             // live font size and the app persists it.
             guard let view = surfaceView(from: target) else { return true }
-            DispatchQueue.main.async { view.reportFontSize() }
+            DispatchQueue.main.async {
+                view.reportFontSize()
+                view.onGridChange?()
+            }
             return true
         case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
             // an OSC 9 / 777 desktop notification. the manager resolves the session/pane and suppresses.
@@ -61,7 +79,11 @@ final class GhosttyCallbacks: @unchecked Sendable {
             // ghostty prints its "Process exited. Press any key to close" fallback unless the host consumes
             // this action: an overlay that should vanish returns true to suppress the prompt; a wait-opt-in
             // overlay (and every other surface) returns false, so the prompt shows and close_surface_cb closes.
-            guard let view = surfaceView(from: target), view.shouldCloseOnChildExitAction else { return false }
+            guard let view = surfaceView(from: target) else { return false }
+            guard view.shouldCloseOnChildExitAction else {
+                DispatchQueue.main.async { view.onExitHeld?() }
+                return false
+            }
             DispatchQueue.main.async { view.handleProcessExit() }
             return true
         case GHOSTTY_ACTION_START_SEARCH:
@@ -118,7 +140,8 @@ final class GhosttyCallbacks: @unchecked Sendable {
             let openURL = action.action.open_url
             guard let view = surfaceView(from: target), let ptr = openURL.url else { return true }
             let link = String(decoding: UnsafeRawBufferPointer(start: ptr, count: Int(openURL.len)), as: UTF8.self)
-            DispatchQueue.main.async { view.openLink(link) }
+            let intent = view.releaseIntent.withLock { $0 }
+            DispatchQueue.main.async { view.openLink(link, intent: intent) }
             return true
         case GHOSTTY_ACTION_COLOR_CHANGE:
             // a dynamic color set or RESET via OSC 10/11/12 (fg/bg/cursor) or their 110/111/112 resets,
@@ -174,7 +197,7 @@ final class GhosttyCallbacks: @unchecked Sendable {
 
     func readClipboard(_ read: ClipboardRead) -> ghostty_clipboard_read_result_e {
         guard let surface = surface(from: read.userdata) else { return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED }
-        let text = Self.readPasteboardText()
+        let text = Self.clipboardText(for: read.location)
         let requestsText = (0..<Int(read.mimesLen)).contains { index in
             read.mimes?[index].map { String(cString: $0) == "text/plain" } ?? false
         }
@@ -206,8 +229,16 @@ final class GhosttyCallbacks: @unchecked Sendable {
         ShellEscape.path(url.isFileURL ? url.path(percentEncoded: false) : url.absoluteString)
     }
 
-    /// Pasted text from the general clipboard (the libghostty paste callback).
-    static func readPasteboardText() -> String? { pasteboardText(.general) }
+    /// The pasteboard for a libghostty clipboard location: private for selection, general for the rest.
+    static func pasteboard(for location: ghostty_clipboard_e) -> NSPasteboard {
+        guard location == GHOSTTY_CLIPBOARD_SELECTION else { return .general }
+        return NSPasteboard(name: .init((Bundle.main.bundleIdentifier ?? "com.umputun.agterm") + ".selection"))
+    }
+
+    /// The text a libghostty clipboard read of `location` gets (the read callback's source).
+    static func clipboardText(for location: ghostty_clipboard_e) -> String? {
+        pasteboardText(pasteboard(for: location))
+    }
 
     /// Whether `pasteboardText` would return something, without building the joined result: menu validation
     /// runs on every Edit-menu open and ⌘V key-equivalent lookup, so it short-circuits on the first usable URL.
@@ -263,7 +294,8 @@ final class GhosttyCallbacks: @unchecked Sendable {
         }
     }
 
-    func writeClipboard(ud: UnsafeMutableRawPointer?, content: UnsafePointer<ghostty_clipboard_content_s>?, len: UInt, confirm: Bool) {
+    func writeClipboard(ud: UnsafeMutableRawPointer?, location: ghostty_clipboard_e,
+                        content: UnsafePointer<ghostty_clipboard_content_s>?, len: UInt, confirm: Bool) {
         guard let content, len > 0 else { return }
         // keep EVERY representation, not just text: a Kitty write can carry images, the callback is void,
         // and core reports `DONE` to the program right after it — dropping a representation here silently
@@ -277,7 +309,7 @@ final class GhosttyCallbacks: @unchecked Sendable {
         // confirm == false: ghostty's `allow` clipboard-write policy already permitted it. This callback runs
         // on the main actor (verified), so write SYNCHRONOUSLY — a same-tick OSC 52 read would see stale data.
         guard confirm else {
-            Self.setClipboard(items)
+            Self.setClipboard(items, location: location)
             return
         }
         // confirm == true: clipboard-write = ask. Gate behind the user, scoping coalescing to this surface
@@ -286,13 +318,13 @@ final class GhosttyCallbacks: @unchecked Sendable {
         let view = Unmanaged<GhosttySurfaceView>.fromOpaque(ud).takeUnretainedValue()
         DispatchQueue.main.async {
             ClipboardPromptController.shared.request(.write, requester: view) { allowed in
-                if allowed { Self.setClipboard(items) }
+                if allowed { Self.setClipboard(items, location: location) }
             }
         }
     }
 
-    private static func setClipboard(_ items: [ClipboardContent]) {
-        let pb = NSPasteboard.general
+    private static func setClipboard(_ items: [ClipboardContent], location: ghostty_clipboard_e) {
+        let pb = pasteboard(for: location)
         pb.clearContents()
         pb.declareTypes(items.compactMap { NSPasteboard.PasteboardType(mimeType: $0.mime) }, owner: nil)
         for item in items {

@@ -8,30 +8,29 @@ final class LiveResetQuitTests: XCTestCase {
         targets: [LiveReset.Target(paneIdentity: UUID(), sessionID: UUID(), daemon: "agterm-a", leaderPID: 10)],
         inventoryComplete: true)
 
-    private func flush(pending: LiveReset.Selection?, saveChecked: Bool = true, arm: Bool = true) -> (armed: Bool, order: [String]) {
+    private func flush(pending: LiveReset.Selection?, saved: Bool = true, arm: Bool = true) -> (armed: Bool, order: [String]) {
         var order: [String] = []
         let armed = AppDelegate.exitFlush(pending: pending, steps: AppDelegate.ExitFlushSteps(
             capture: { order.append("capture") },
             finalize: { order.append("finalize") },
-            saveChecked: { order.append("saveChecked"); return saveChecked },
-            save: { order.append("save") },
+            save: { order.append("save"); return saved },
             arm: { _ in order.append("arm"); return arm }))
         return (armed, order)
     }
 
-    func testCaptureRunsBeforeCheckedSave() {
+    func testCaptureRunsBeforeTheSave() {
         let result = flush(pending: Self.selection)
         XCTAssertTrue(result.armed)
-        XCTAssertEqual(result.order, ["capture", "finalize", "saveChecked", "arm"])
+        XCTAssertEqual(result.order, ["capture", "finalize", "save", "arm"])
     }
 
     func testNoMarkerWhenSaveFails() {
-        let result = flush(pending: Self.selection, saveChecked: false)
+        let result = flush(pending: Self.selection, saved: false)
         XCTAssertFalse(result.armed)
-        XCTAssertEqual(result.order, ["capture", "finalize", "saveChecked"])
+        XCTAssertEqual(result.order, ["capture", "finalize", "save"])
     }
 
-    func testOrdinaryQuitWritesNothing() {
+    func testOrdinaryQuitSavesWithoutArmingAMarker() {
         let result = flush(pending: nil)
         XCTAssertFalse(result.armed)
         XCTAssertEqual(result.order, ["capture", "finalize", "save"])

@@ -1,8 +1,86 @@
 import Foundation
 
 // Default `ControlActions` implementations, kept out of `ControlDispatcher.swift` so that file stays
-// inside the 1000-line limit.
+// inside the 1000-line limit. They keep outside conformers building when the shared protocol grows:
+// Mac-only commands refuse by name rather than answering an empty success, and compatibility overloads
+// delegate to the older form.
 public extension ControlActions {
+    func resolveMessagePane(_: MessageAddress) -> Result<MessageRecipient, MessagePaneError> {
+        .failure(.unsupported)
+    }
+
+    func messagePanes(workspace _: String?, window _: String?) -> Result<[MessageRecipient], MessagePaneError> {
+        .failure(.unsupported)
+    }
+
+    func messageQueued(_: UUID, from _: String?, to _: [MessageRecipient]) {}
+
+    func attachCompanionPage(_: String?, window _: String?) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.companion.page.attach"))
+    }
+
+    func duplicateAsCompanion(_: String?, window _: String?, select _: Bool) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.companion.duplicate"))
+    }
+
+    func convertToCompanion(_: String?, window _: String?) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.companion.convert"))
+    }
+
+    func createPageCompanion(_: String?, window _: String?, options _: ControlSessionOverlayOpenOptions) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.companion.page"))
+    }
+
+    func createPageSession(_: String?, window _: String?, options _: ControlSessionOverlayOpenOptions) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.page"))
+    }
+
+    func createCompanion(_: String?, options _: CompanionOptions, window _: String?) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.companion.new"))
+    }
+
+    func setSessionExpansion(_: String?, window _: String?, expanded: Bool) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message(expanded ? "session.expand" : "session.collapse"))
+    }
+
+    func reloadSessionOverlay(_: String?, window _: String?, pane _: OverlayPane?, current _: Bool) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.reload"))
+    }
+
+    func navigateSessionOverlay(_: String?, window _: String?, pane _: OverlayPane?,
+                                navigation _: HtmlNavigation) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.navigate"))
+    }
+
+    func submitSessionOverlay(_: String?, window _: String?, pane _: OverlayPane?, value _: String) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.submit"))
+    }
+
+    func setSessionOverlayVisibility(_: String?, window _: String?, pane _: OverlayPane?,
+                                     mode: OverlayVisibilityMode) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.\(mode.rawValue)"))
+    }
+
+    func setSessionOverlayFollow(_: String?, window _: String?, pane _: OverlayPane?,
+                                 mode _: ControlToggleMode) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.follow"))
+    }
+
+    func searchSessionOverlay(_: String?, window _: String?, pane _: OverlayPane?,
+                              request _: TextSearchRequest) async -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.search"))
+    }
+
+    func stepSessionOverlayChanges(_: String?, window _: String?, pane _: OverlayPane?,
+                                   forward _: Bool) async -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.changes"))
+    }
+
+    // outcomes live in agtermCore, so every host answers the read the same way and owes no conformance
+    func htmlPageResult(_ pageID: UUID) -> ControlResponse {
+        HtmlPageOutcomes.shared.response(for: pageID)
+    }
+
     func openAsk(_: PendingAsk, target _: String?, window _: String?,
                  placement _: ControlAskPlacement, follow _: Bool) -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("ask.open"))
@@ -16,8 +94,43 @@ public extension ControlActions {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("ask.cancel"))
     }
 
-    /// Defaults keep outside conformers building when the shared protocol grows. Mac-only commands refuse
-    /// by name rather than answering an empty success; compatibility overloads delegate to the older form.
+    func setFlaggedViewLayout(_: ControlFlaggedLayoutMode) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("sidebar.flagged-layout"))
+    }
+
+    func setSidebarDensity(_: ControlSidebarDensityMode) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("sidebar.density"))
+    }
+
+    func moveFlaggedSession(_: String?, window _: String?, anchor _: String,
+                            placement _: FlaggedOrderPlacement) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.flag move"))
+    }
+
+    func setWorkspaceFlag(_: String?, window _: String?, mode _: ControlToggleMode) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("workspace.flag"))
+    }
+
+    func reloadHooks() -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("hooks.reload"))
+    }
+
+    func listHooks() -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("hooks.list"))
+    }
+
+    func clearBrowser() async -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("browser.clear"))
+    }
+
+    func linkOpenMode(_: LinkOpenMode?) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("browser.links"))
+    }
+
+    func runCustomCommand(name _: String, target _: String?, window _: String?) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("keymap.run"))
+    }
+
     func readRestoreMode() -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("restore.mode"))
     }
@@ -34,12 +147,28 @@ public extension ControlActions {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.prune"))
     }
 
+    func readZmxScreen(name _: String, fullBuffer _: Bool, lines _: Int?) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.screen"))
+    }
+
     func killZmxDaemon(target _: String, window _: String?, pane _: ZmxPaneRole) -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.kill"))
     }
 
     func resetLiveSessions() -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.reset"))
+    }
+
+    func openPresentation(session _: String) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.present"))
+    }
+
+    func claimOverlayJob(_: String) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.job.run"))
+    }
+
+    func claimPageServe(_: String) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.page.serve"))
     }
 
     func remoteTree(host _: String?) async -> ControlResponse {
@@ -53,16 +182,41 @@ public extension ControlActions {
         return await attachRemoteSession(host: host, session: session)
     }
 
+    func readSurfaceCursor(_ target: String?, window: String?, paneID: String?) -> ControlResponse {
+        guard paneID?.isEmpty != false else {
+            return ControlResponse(ok: false, error: ControlActionsUnsupported.message("surface.cursor --pane-id"))
+        }
+        return readSurfaceCursor(target, window: window)
+    }
+
     func attachRemoteSession(host _: String, session _: String) async -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.attach"))
+    }
+
+    func attachRemoteGroup(host _: String, session _: String, window _: String?) async -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.attach.group"))
     }
 
     func splitSession(_ target: String?, window: String?, mode: String?, axis _: SplitAxis?) -> ControlResponse {
         splitSession(target, window: window, mode: mode)
     }
 
+    func scratchSession(_ target: String?, window: String?, mode: String?, command: String?,
+                        follow _: Bool) -> ControlResponse {
+        scratchSession(target, window: window, mode: mode, command: command)
+    }
+
     func swapSessionPanes(_: String?, window _: String?) async -> ControlResponse {
         ControlResponse(ok: false, error: "session.swap is not supported by this host")
+    }
+
+    func restartSessionPane(_: String?, window _: String?,
+                            options _: ControlSessionRestartOptions) async -> ControlResponse {
+        ControlResponse(ok: false, error: "session.restart is not supported by this host")
+    }
+
+    func takeSessionLead(_: String?, window _: String?, pane _: StatusPane?) -> ControlResponse {
+        ControlResponse(ok: false, error: "session.lead is not supported by this host")
     }
 
     /// Not `ControlActionsUnsupported.message`, which says "on this platform": the divider exists wherever
@@ -72,8 +226,63 @@ public extension ControlActions {
         ControlResponse(ok: false, error: "sidebar.width is not supported by this control host")
     }
 
+    func closeSession(_ target: String?, window: String?, undoable: Bool) -> ControlResponse {
+        guard !undoable else {
+            return ControlResponse(ok: false, error: "session.close --undoable is not supported by this control host")
+        }
+        return closeSession(target, window: window)
+    }
+
+    func closeSessions(_ targets: [String], window: String?, undoable: Bool) -> ControlResponse {
+        guard !undoable else {
+            return ControlResponse(ok: false, error: "session.close --undoable is not supported by this control host")
+        }
+        return closeSessions(targets, window: window)
+    }
+
+    func resizeSessionOverlay(_ target: String?, window: String?, sizePercent: Int?,
+                              points: OverlayPointSize) -> ControlResponse {
+        guard points.isEmpty else {
+            return ControlResponse(ok: false, error: "session.overlay.resize: --width/--height are not supported by this control host")
+        }
+        return resizeSessionOverlay(target, window: window, sizePercent: sizePercent)
+    }
+
     func setSessionContext(_: String?, window _: String?, context _: String?) -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.context"))
+    }
+
+    func setSessionInfo(_: String?, window _: String?, info _: SessionInfo?) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.info"))
+    }
+
+    func setSessionTint(_: String?, window _: String?, update _: ControlTintUpdate) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.tint"))
+    }
+
+    func setWorkspaceTint(_: String?, window _: String?, update _: ControlTintUpdate) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("workspace.tint"))
+    }
+
+    /// A host that predates tints creates an untinted session through its own form and refuses a tint,
+    /// so the request never answers ok over a tint it dropped.
+    func createSession(_ options: ControlSessionCreateOptions, tint: SidebarTint?) -> ControlResponse {
+        guard tint == nil else {
+            return ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.new --tint"))
+        }
+        return createSession(options)
+    }
+
+    /// The workspace twin of the session default above.
+    func createWorkspace(window: String?, name: String?, collapsed: Bool, tint: SidebarTint?) -> ControlResponse {
+        guard tint == nil else {
+            return ControlResponse(ok: false, error: ControlActionsUnsupported.message("workspace.new --tint"))
+        }
+        return createWorkspace(window: window, name: name, collapsed: collapsed)
+    }
+
+    func windowGo(direction _: WorkspaceNavigation) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("window.go"))
     }
 
     /// `agterm-linux` may implement the original session-wide HUD methods. New dispatchers preserve that
@@ -86,5 +295,17 @@ public extension ControlActions {
     func updateHud(_ target: String?, window: String?, spec: HudSpec,
                    placement _: ControlHudPlacement) -> ControlResponse {
         updateHud(target, window: window, spec: spec)
+    }
+
+    func listRecentClosed() -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("recent.list"))
+    }
+
+    func clearRecentClosed() -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("recent.clear"))
+    }
+
+    func openRecentClosed(_: String?, window _: String?) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("recent.open"))
     }
 }

@@ -1,4 +1,5 @@
 import AppKit
+import WebKit
 import XCTest
 @testable import agterm
 import agtermCore
@@ -14,6 +15,7 @@ final class CustomCommandRunnerTests: XCTestCase {
     private var window: NSWindow!
     private var windowID: WindowInfo.ID!
     private var started: [CustomCommandRunner] = []
+    private var failureServers: [ControlServer] = []
 
     /// A menu chord deliberately unlike `toggle_sidebar`'s shipped one, so the monitor cannot appear to work
     /// by accident, plus the leader alternative every case below drives.
@@ -40,6 +42,13 @@ final class CustomCommandRunnerTests: XCTestCase {
         await MainActor.run {
             started.forEach { $0.stop() }
             started = []
+            for storeID in library.openIDs() {
+                for session in library.store(for: storeID)?.workspaces.flatMap(\.sessions) ?? [] {
+                    session.discardHudBody()
+                }
+            }
+            failureServers.forEach { $0.stop() }
+            failureServers = []
             WindowRegistry.shared.unregister(windowID)
             windowID = nil
             window.orderOut(nil)
@@ -96,14 +105,203 @@ final class CustomCommandRunnerTests: XCTestCase {
         return (dashboard, { DashboardControllerRegistry.shared.unregister(windowID) })
     }
 
-    private func keyDown(_ key: String, keyCode: UInt16, mods: NSEvent.ModifierFlags) -> NSEvent {
-        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: mods, timestamp: 0,
+    private func keyDown(_ key: String, keyCode: UInt16, mods: NSEvent.ModifierFlags,
+                         type: NSEvent.EventType = .keyDown, repeating: Bool = false) -> NSEvent {
+        NSEvent.keyEvent(with: type, location: .zero, modifierFlags: mods, timestamp: 0,
                          windowNumber: window.windowNumber, context: nil,
-                         characters: key, charactersIgnoringModifiers: key, isARepeat: false, keyCode: keyCode)!
+                         characters: key, charactersIgnoringModifiers: key, isARepeat: repeating, keyCode: keyCode)!
+    }
+
+    private func functionKey(type: NSEvent.EventType = .keyDown, repeating: Bool = false,
+                             mods: NSEvent.ModifierFlags = .function) -> NSEvent {
+        keyDown("\u{F708}", keyCode: 96, mods: mods, type: type, repeating: repeating)
+    }
+
+    @MainActor
+    private final class MenuActionRecorder: NSObject {
+        var count = 0
+        var notifications = 0
+        var eventType: NSEvent.EventType?
+
+        @objc func menuAction(_ sender: NSMenuItem) { count += 1 }
+    }
+
+    func testMenuFunctionKeyConsumesRepeatAndRelease() throws {
+        try assertMenuFunctionKeyOwnership(keymap: "map f5 next_session\n")
+    }
+
+    func testMenuFunctionKeyUsesLiveMenuInsteadOfReloadedKeymap() throws {
+        try assertMenuFunctionKeyOwnership(keymap: "map f6 next_session\n")
+    }
+
+    private func assertMenuFunctionKeyOwnership(keymap: String) throws {
+        let fix = try fixture(keymap: keymap)
+        let recorder = MenuActionRecorder()
+        let menu = NSMenu(title: "Navigate")
+        menu.autoenablesItems = false
+        let item = NSMenuItem(title: "Next Session", action: #selector(MenuActionRecorder.menuAction(_:)), keyEquivalent: "\u{F708}")
+        item.target = recorder
+        item.keyEquivalentModifierMask = []
+        let prior = NSMenuItem.usesUserKeyEquivalents
+        NSMenuItem.usesUserKeyEquivalents = false
+        defer { NSMenuItem.usesUserKeyEquivalents = prior }
+        menu.addItem(item)
+        let observer = NotificationCenter.default.addObserver(forName: NSMenu.willSendActionNotification,
+                                                              object: menu, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                recorder.notifications += 1
+                recorder.eventType = NSApp.currentEvent?.type
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        NSApp.postEvent(functionKey(), atStart: true)
+        let press = try XCTUnwrap(NSApp.nextEvent(matching: .keyDown, until: Date().addingTimeInterval(1),
+                                                 inMode: .default, dequeue: true))
+        defer {
+            NSApp.postEvent(functionKey(type: .keyUp), atStart: true)
+            _ = NSApp.nextEvent(matching: .keyUp, until: Date().addingTimeInterval(1), inMode: .default, dequeue: true)
+        }
+        XCTAssertFalse(fix.runner.handleKeyEvent(press, in: window))
+        XCTAssertTrue(menu.performKeyEquivalent(with: press))
+        XCTAssertEqual(recorder.count, 1)
+        XCTAssertEqual(recorder.notifications, 1)
+        XCTAssertEqual(recorder.eventType, .keyDown)
+
+        let repeated = functionKey(repeating: true)
+        let consumedRepeat = fix.runner.handleKeyEvent(repeated, in: window)
+        if !consumedRepeat { _ = menu.performKeyEquivalent(with: repeated) }
+        XCTAssertTrue(consumedRepeat)
+        XCTAssertEqual(recorder.count, 1)
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(type: .keyUp), in: nil))
+
+        fix.runner.stop()
+        XCTAssertTrue(menu.performKeyEquivalent(with: press))
+        XCTAssertFalse(fix.runner.handleKeyEvent(repeated, in: window))
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(type: .keyUp), in: window))
+    }
+
+    func testModifiedMenuFunctionKeyOwnsReleaseAfterShiftChanges() throws {
+        let fix = try fixture(keymap: "map shift+f6 next_session\n")
+        let press = keyDown("\u{F709}", keyCode: 97, mods: [.shift, .function])
+        XCTAssertFalse(fix.runner.handleKeyEvent(press, in: window))
+        fix.runner.recordMenuKeyPress(press)
+        XCTAssertTrue(fix.runner.handleKeyEvent(keyDown("\u{F709}", keyCode: 97, mods: .function, repeating: true), in: nil))
+        XCTAssertTrue(fix.runner.handleKeyEvent(keyDown("\u{F709}", keyCode: 97, mods: .function, type: .keyUp), in: nil))
+    }
+
+    func testMenuFunctionKeyOwnershipRecoversAfterMissingRelease() throws {
+        let fix = try fixture(keymap: "map f5 next_session\n")
+        let press = functionKey()
+        XCTAssertFalse(fix.runner.handleKeyEvent(press, in: window))
+        fix.runner.recordMenuKeyPress(press)
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(repeating: true), in: nil))
+
+        // a modal can eat the release; the next press may belong to a different responder or keymap.
+        XCTAssertFalse(fix.runner.handleKeyEvent(press, in: nil))
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(repeating: true), in: nil))
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(type: .keyUp), in: nil))
+    }
+
+    func testMenuActionsIgnoreMouseNilNonFunctionAndReleaseEvents() throws {
+        let fix = try fixture(keymap: "map f5 next_session\n")
+        let mouse = try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseUp, location: .zero, modifierFlags: [],
+                                                    timestamp: 0, windowNumber: window.windowNumber,
+                                                    context: nil, eventNumber: 0, clickCount: 1, pressure: 0))
+        for event in [nil, mouse, keyDown("x", keyCode: 7, mods: []), functionKey(type: .keyUp), functionKey(repeating: true)] {
+            fix.runner.recordMenuKeyPress(event)
+        }
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(repeating: true), in: window))
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(type: .keyUp), in: window))
+        XCTAssertFalse(fix.runner.handleKeyEvent(keyDown("x", keyCode: 7, mods: [], type: .keyUp), in: window))
+    }
+
+    func testFunctionKeyConsumesRepeatAndReleaseWithoutRefiring() throws {
+        let fix = try fixture(keymap: "map cmd+s|f5 toggle_sidebar\n")
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(), in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(repeating: true), in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(type: .keyUp), in: window))
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(type: .keyUp), in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(), in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, fix.sidebarBefore)
+    }
+
+    func testShiftFunctionKeyCommandFiresOnceAndConsumesRepeatAndRelease() throws {
+        let marker = stateDir.appendingPathComponent("shift-f6")
+        let fix = try fixture(keymap: "command \"X\" shift+f6 printf x > '\(marker.path)'\n")
+        let usage = CustomCommandUsageStore(directory: stateDir)
+        let bare = keyDown("\u{F709}", keyCode: 97, mods: .function)
+        XCTAssertFalse(fix.runner.handleKeyEvent(bare, in: window))
+        XCTAssertNil(usage.load().counts["X"])
+
+        let press = keyDown("\u{F709}", keyCode: 97, mods: [.shift, .function])
+        XCTAssertTrue(fix.runner.handleKeyEvent(press, in: window))
+        wait { (try? String(contentsOf: marker, encoding: .utf8)) == "x" }
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "x")
+        XCTAssertEqual(usage.load().counts["X"], 1)
+
+        let repeated = keyDown("\u{F709}", keyCode: 97, mods: [.shift, .function], repeating: true)
+        XCTAssertTrue(fix.runner.handleKeyEvent(repeated, in: window))
+        // shift can be released before F6; ownership follows the physical key.
+        let release = keyDown("\u{F709}", keyCode: 97, mods: .function, type: .keyUp)
+        XCTAssertTrue(fix.runner.handleKeyEvent(release, in: window))
+        XCTAssertEqual(usage.load().counts["X"], 1)
+        XCTAssertFalse(fix.runner.handleKeyEvent(release, in: window))
+    }
+
+    func testFunctionKeyLeaderKeepsBothReleasesWhilePrefixHeld() throws {
+        let fix = try fixture(keymap: "map f5>x toggle_sidebar\n")
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(), in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(repeating: true), in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, fix.sidebarBefore)
+        XCTAssertTrue(fix.runner.handleKeyEvent(keyDown("x", keyCode: 7, mods: []), in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(type: .keyUp), in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(keyDown("x", keyCode: 7, mods: [], type: .keyUp), in: window))
+    }
+
+    func testConsumedFunctionKeySurvivesUnmatchedPressAndFocusChange() throws {
+        let fix = try fixture(keymap: "map cmd+s|f5 toggle_sidebar\n")
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(), in: window))
+        XCTAssertFalse(fix.runner.handleKeyEvent(keyDown("x", keyCode: 7, mods: []), in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(repeating: true, mods: [.shift, .function]), in: nil))
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(type: .keyUp, mods: .shift), in: nil))
+        XCTAssertFalse(fix.runner.handleKeyEvent(keyDown("x", keyCode: 7, mods: [], type: .keyUp), in: window))
+    }
+
+    func testFreshFunctionKeyPressAndStopClearStaleOwnership() throws {
+        let fix = try fixture(keymap: "map cmd+s|f5 toggle_sidebar\n")
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(), in: window))
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(), in: nil))
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(repeating: true), in: window))
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(type: .keyUp), in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(), in: window))
+        fix.runner.stop()
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(type: .keyUp), in: window))
+    }
+
+    func testUnboundFunctionKeyPassesThrough() throws {
+        let fix = try fixture()
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(), in: window))
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(repeating: true), in: window))
+        XCTAssertFalse(fix.runner.handleKeyEvent(functionKey(type: .keyUp), in: window))
+    }
+
+    func testFunctionKeyReleaseSurvivesLeaderTimeout() throws {
+        let fix = try fixture(keymap: "map f5>x toggle_sidebar\n")
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(), in: window))
+        RunLoop.current.run(until: Date().addingTimeInterval(1.7))
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(repeating: true), in: window))
+        XCTAssertFalse(fix.runner.handleKeyEvent(keyDown("x", keyCode: 7, mods: []), in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, fix.sidebarBefore)
+        XCTAssertTrue(fix.runner.handleKeyEvent(functionKey(type: .keyUp), in: window))
     }
 
     private var leader: NSEvent { keyDown("a", keyCode: 0, mods: [.control]) }
     private var sidebarTail: NSEvent { keyDown("s", keyCode: 1, mods: []) }
+    private var tailUp: NSEvent { keyDown("s", keyCode: 1, mods: [], type: .keyUp) }
 
     func testBuiltinSequenceAlternativeRunsTheActionAndIsConsumed() throws {
         let fix = try fixture()
@@ -111,6 +309,149 @@ final class CustomCommandRunnerTests: XCTestCase {
         XCTAssertTrue(fix.runner.handleKeyDown(leader, in: window), "ctrl+a should arm the leader")
         XCTAssertTrue(fix.runner.handleKeyDown(sidebarTail, in: window),
                       "the completing chord must be consumed, not passed to the terminal")
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+    }
+
+    func testRepeatingSequenceTailRepeatsUntilEscOrTimeout() throws {
+        let fix = try fixture(keymap: "map ctrl+a>s --repeat toggle_sidebar\n")
+        let escape = keyDown("\u{1B}", keyCode: 53, mods: [])
+
+        XCTAssertTrue(fix.runner.handleKeyDown(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyDown(sidebarTail, in: window))
+        XCTAssertTrue(fix.runner.handleKeyDown(sidebarTail, in: window), "the tail alone repeats inside the window")
+        XCTAssertEqual(fix.store.sidebarVisible, fix.sidebarBefore)
+        XCTAssertFalse(fix.runner.handleKeyDown(escape, in: window), "Esc closes the window but reaches the terminal")
+        XCTAssertFalse(fix.runner.handleKeyDown(sidebarTail, in: window))
+
+        XCTAssertTrue(fix.runner.handleKeyDown(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyDown(sidebarTail, in: window))
+        _ = fix.runner.handleKeyEvent(tailUp, in: window)
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.7))
+        XCTAssertFalse(fix.runner.handleKeyDown(sidebarTail, in: window), "the window times out after release")
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+    }
+
+    func testHeldRepeatTailAutorepeatsOnlyWhileTheWindowIsOpen() throws {
+        let fix = try fixture(keymap: "map ctrl+a>s --repeat toggle_sidebar\n")
+        let heldTail = keyDown("s", keyCode: 1, mods: [], repeating: true)
+        let heldLeader = keyDown("a", keyCode: 0, mods: [.control], repeating: true)
+
+        XCTAssertTrue(fix.runner.handleKeyEvent(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(heldTail, in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, fix.sidebarBefore, "autorepeat of the live tail fires")
+        XCTAssertTrue(fix.runner.handleKeyEvent(heldLeader, in: window), "other consumed autorepeat stays swallowed")
+        XCTAssertTrue(fix.runner.handleKeyEvent(heldTail, in: window), "and leaves the window open")
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+
+        XCTAssertFalse(fix.runner.handleKeyEvent(keyDown("\u{1B}", keyCode: 53, mods: []), in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(heldTail, in: window), "nothing leaks to the terminal once closed")
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+    }
+
+    func testHeldTailOutlastsTheRepeatTimeoutUntilReleased() throws {
+        let fix = try fixture(keymap: "map ctrl+a>s --repeat toggle_sidebar\n")
+        let heldTail = keyDown("s", keyCode: 1, mods: [], repeating: true)
+
+        XCTAssertTrue(fix.runner.handleKeyEvent(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.7))
+        XCTAssertTrue(fix.runner.handleKeyEvent(heldTail, in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, fix.sidebarBefore, "the first autorepeat after the key-repeat delay fires")
+
+        XCTAssertTrue(fix.runner.handleKeyEvent(tailUp, in: window))
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.7))
+        XCTAssertFalse(fix.runner.handleKeyEvent(sidebarTail, in: window), "release starts the timeout")
+    }
+
+    func testANewLeaderPressedWhileTheTailIsHeldKeepsItsOwnTimeout() throws {
+        let fix = try fixture(keymap: "map ctrl+a>s --repeat toggle_sidebar\n")
+
+        XCTAssertTrue(fix.runner.handleKeyEvent(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(tailUp, in: window))
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.7))
+        XCTAssertTrue(fix.runner.handleKeyEvent(sidebarTail, in: window), "the leader is still armed past repeatTimeout")
+        XCTAssertEqual(fix.store.sidebarVisible, fix.sidebarBefore)
+    }
+
+    func testDeactivationClosesTheWindowOfAHeldTail() throws {
+        let fix = try fixture(keymap: "map ctrl+a>s --repeat toggle_sidebar\n")
+
+        XCTAssertTrue(fix.runner.handleKeyEvent(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        fix.runner.closeRepeatWindow()
+        XCTAssertFalse(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+    }
+
+    // a tail released while a menu tracks never reaches the monitor, which left the window open with no timer.
+    func testMenuTrackingClosesTheWindowOfAHeldTail() throws {
+        let fix = try fixture(keymap: "map ctrl+a>s --repeat toggle_sidebar\n")
+
+        XCTAssertTrue(fix.runner.handleKeyEvent(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        NotificationCenter.default.post(name: NSMenu.didBeginTrackingNotification, object: NSMenu())
+        XCTAssertFalse(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+    }
+
+    // the quick terminal is key while agterm is inactive, so its focus loss posts no deactivation.
+    func testAWindowLosingKeyWhileTheAppIsInactiveClosesTheWindowOfAHeldTail() throws {
+        let fix = try fixture(keymap: "map ctrl+a>s --repeat toggle_sidebar\n")
+
+        XCTAssertTrue(fix.runner.handleKeyEvent(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        fix.runner.windowDidResignKey(appIsActive: false)
+        XCTAssertFalse(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+    }
+
+    func testAWindowLosingKeyInsideTheActiveAppKeepsTheRepeatWindow() throws {
+        let fix = try fixture(keymap: "map ctrl+a>s --repeat toggle_sidebar\n")
+
+        XCTAssertTrue(fix.runner.handleKeyEvent(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        fix.runner.windowDidResignKey(appIsActive: true)
+        XCTAssertTrue(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, fix.sidebarBefore)
+    }
+
+    func testMenuTrackingAndFocusLossLeaveAHalfTypedLeaderArmed() throws {
+        let fix = try fixture(keymap: "map ctrl+a>s --repeat toggle_sidebar\n")
+
+        XCTAssertTrue(fix.runner.handleKeyEvent(leader, in: window))
+        NotificationCenter.default.post(name: NSMenu.didBeginTrackingNotification, object: NSMenu())
+        fix.runner.windowDidResignKey(appIsActive: false)
+        XCTAssertTrue(fix.runner.handleKeyEvent(sidebarTail, in: window))
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+    }
+
+    func testAKeyInAnAuxiliaryWindowClosesTheRepeatWindow() throws {
+        let fix = try fixture(keymap: "map ctrl+a>s --repeat toggle_sidebar\n")
+        let aux = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
+                           styleMask: [.titled], backing: .buffered, defer: false)
+        aux.isReleasedWhenClosed = false
+
+        XCTAssertTrue(fix.runner.handleKeyDown(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyDown(sidebarTail, in: window))
+        XCTAssertFalse(fix.runner.handleKeyDown(sidebarTail, in: aux))
+        XCTAssertFalse(fix.runner.handleKeyDown(sidebarTail, in: window), "the tail reaches the terminal")
+        XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
+    }
+
+    func testAKeyTypedIntoATextFieldClosesTheRepeatWindow() throws {
+        let fix = try fixture(keymap: "map ctrl+a>s --repeat toggle_sidebar\n")
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 40))
+        window.contentView?.addSubview(text)
+
+        XCTAssertTrue(fix.runner.handleKeyDown(leader, in: window))
+        XCTAssertTrue(fix.runner.handleKeyDown(sidebarTail, in: window))
+        XCTAssertTrue(window.makeFirstResponder(text))
+        XCTAssertFalse(fix.runner.handleKeyDown(keyDown("\u{1B}", keyCode: 53, mods: []), in: window))
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        XCTAssertFalse(fix.runner.handleKeyDown(sidebarTail, in: window), "the tail reaches the terminal")
         XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
     }
 
@@ -138,6 +479,50 @@ final class CustomCommandRunnerTests: XCTestCase {
         XCTAssertTrue(fix.runner.handleKeyDown(sidebarTail, in: window),
                       "the chord is consumed either way; only the action is gated")
         XCTAssertEqual(fix.store.sidebarVisible, fix.sidebarBefore, "a pending picker must block the palette action")
+    }
+
+    /// An HTML page open in the active session, with first responder on a page view when `focused`.
+    private func openPage(_ fix: Fixture, focused: Bool) throws -> Session {
+        let session = try XCTUnwrap(fix.store.activeSession)
+        let page = HtmlOverlay(source: .file(path: "/tmp/agterm-runner-page.html", grantRoot: nil))
+        XCTAssertNil(fix.store.openHtmlOverlay(session.id, pane: nil, overlay: page, sizePercent: nil))
+        if focused {
+            let webView = HtmlOverlayWebView(frame: NSRect(x: 0, y: 0, width: 200, height: 100),
+                                             configuration: WKWebViewConfiguration())
+            window.contentView?.addSubview(webView)
+            XCTAssertTrue(window.makeFirstResponder(webView))
+        }
+        return session
+    }
+
+    private var commandW: NSEvent { keyDown("w", keyCode: 13, mods: [.command]) }
+
+    // regression: a page that cancels keydown swallowed ⌘W, leaving a chromeless page with no way to close
+    func testCloseChordClosesAFocusedPage() throws {
+        let fix = try fixture()
+        let session = try openPage(fix, focused: true)
+
+        XCTAssertTrue(fix.runner.handleKeyDown(commandW, in: window))
+        XCTAssertNil(session.htmlOverlay, "⌘W should close the page")
+        XCTAssertTrue(fix.store.workspaces.flatMap(\.sessions).contains { $0 === session }, "the session stays")
+    }
+
+    func testReboundCloseChordFollowsTheKeymapWhileAPageHasFocus() throws {
+        let fix = try fixture(keymap: "map cmd+shift+k close_session\n")
+        let session = try openPage(fix, focused: true)
+
+        XCTAssertFalse(fix.runner.handleKeyDown(commandW, in: window), "⌘W no longer closes, so the page keeps it")
+        XCTAssertNotNil(session.htmlOverlay)
+        XCTAssertTrue(fix.runner.handleKeyDown(keyDown("k", keyCode: 40, mods: [.command, .shift]), in: window))
+        XCTAssertNil(session.htmlOverlay, "the rebound chord should close the page")
+    }
+
+    func testCloseChordStaysWithTheMenuWithoutPageFocus() throws {
+        let fix = try fixture()
+        let session = try openPage(fix, focused: false)
+
+        XCTAssertFalse(fix.runner.handleKeyDown(commandW, in: window), "the menu carries ⌘W")
+        XCTAssertNotNil(session.htmlOverlay)
     }
 
     // Navigate ▸ Dashboard keeps its key equivalent live over the open grid, so its alternative must close the
@@ -261,6 +646,274 @@ final class CustomCommandRunnerTests: XCTestCase {
         XCTAssertEqual(fix.store.sidebarVisible, !fix.sidebarBefore)
     }
 
+    /// Records what the runner would put on screen for a failed command.
+    private final class HudRecorder: @unchecked Sendable {
+        struct Post {
+            let session: String
+            let spec: HudSpec
+            let pane: OverlayPane?
+            var message: String { spec.message }
+            var detail: String? { spec.detail }
+        }
+
+        var posts: [Post] = []
+        var refuse = false
+
+        var hud: FailureHud {
+            FailureHud(open: { [self] session, spec, pane in
+                posts.append(Post(session: session, spec: spec, pane: pane))
+                return refuse ? "refused by test" : nil
+            })
+        }
+    }
+
+    /// A runner wired to `recorder`, plus a session for its commands to fire in.
+    private func failureFixture(_ recorder: HudRecorder, useControlServer: Bool = false) throws -> (runner: CustomCommandRunner, session: Session) {
+        try write(keymap: CustomCommandRunnerTests.sidebarKeymap)
+        let settings = SettingsModel(library: library, settingsStore: SettingsStore(directory: stateDir))
+        settings.setConfigDirectory(configDir.path)
+        let actions = AppActions(library: library)
+        actions.settingsModel = settings
+        var hud = recorder.hud
+        if useControlServer {
+            let server = ControlServer(library: library, actions: actions, settingsModel: settings,
+                                       identity: AppIdentity(version: "9.9.9"),
+                                       socketPath: "/tmp/agterm-failure-\(UUID().uuidString.prefix(8)).sock")
+            failureServers.append(server)
+            hud = FailureHud(open: { sessionID, spec, pane in
+                _ = recorder.hud.open(sessionID, spec, pane)
+                let response = server.openCommandFailureHud(sessionID, spec: spec, pane: pane)
+                return response.ok ? nil : response.error ?? "refused without a reason"
+            })
+        }
+        let runner = CustomCommandRunner(library: library, settings: settings, actions: actions,
+                                         usage: CustomCommandUsageStore(directory: stateDir),
+                                         socketProvider: { "" }, failureHud: hud)
+        runner.start()
+        started.append(runner)
+        let store = try XCTUnwrap(library.activeStore)
+        let owner = try XCTUnwrap(store.currentWorkspaceID)
+        let session = try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        store.selectSession(session.id)
+        return (runner, session)
+    }
+
+    /// A directory that exists but cannot be entered, so the launch itself fails.
+    private func unenterableDirectory() throws -> String {
+        let directory = stateDir.appendingPathComponent("locked-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: directory.path)
+        addTeardownBlock {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
+        return directory.path
+    }
+
+    /// Spins the run loop until `body` is true or the deadline passes, since the spawn, its exit and the
+    /// stderr drain all land asynchronously.
+    private func wait(upTo seconds: TimeInterval = 5, until body: () -> Bool) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline, !body() {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+    }
+
+    func testAFailedCommandPostsThePanelWithItsLastStderrLine() throws {
+        let recorder = HudRecorder()
+        let fix = try failureFixture(recorder)
+        fix.runner.run(CustomCommand(name: "probe", command: "echo first >&2; echo boom >&2; exit 3",
+                                     shortcut: "ctrl+a>p", errorHud: true))
+
+        wait { !recorder.posts.isEmpty }
+
+        XCTAssertEqual(recorder.posts.count, 1)
+        XCTAssertEqual(recorder.posts.first?.session, fix.session.id.uuidString)
+        XCTAssertEqual(recorder.posts.first?.message, "probe: exit 3")
+        XCTAssertEqual(recorder.posts.first?.detail, "boom")
+        XCTAssertEqual(recorder.posts.first?.spec.position, .center)
+        XCTAssertEqual(recorder.posts.first?.spec.hideAfter, CustomCommandRunner.failureHudSeconds)
+        XCTAssertNil(recorder.posts.first?.pane)
+    }
+
+    // the second command only starts failing after the first has run to its last statement, so the post it
+    // produces bounds how long the successful one had to say something.
+    func testACommandThatSucceedsPostsNothingEvenWhenItWroteToStderr() throws {
+        let recorder = HudRecorder()
+        let fix = try failureFixture(recorder)
+        let marker = stateDir.appendingPathComponent("quiet-\(UUID().uuidString).done")
+        fix.runner.run(CustomCommand(name: "quiet", command: "echo noise >&2; : > \(marker.path); exit 0",
+                                     shortcut: "ctrl+a>p", errorHud: true))
+        fix.runner.run(CustomCommand(name: "loud",
+                                     command: "while [ ! -f \(marker.path) ]; do sleep 0.02; done; "
+                                         + "echo boom >&2; exit 2",
+                                     shortcut: "ctrl+a>l", errorHud: true))
+
+        wait { !recorder.posts.isEmpty }
+
+        XCTAssertEqual(recorder.posts.count, 1, "exit 0 is a success whatever it printed")
+        XCTAssertEqual(recorder.posts.first?.message, "loud: exit 2")
+    }
+
+    func testADescendantKeepsWritingToStderrAfterTheCommandExits() throws {
+        let recorder = HudRecorder()
+        let fix = try failureFixture(recorder)
+        let marker = stateDir.appendingPathComponent("late-\(UUID().uuidString).ok")
+        // the subshell outlives its parent holding the same stderr. Its marker is written only if that late
+        // write SUCCEEDED: a capture a background process can be killed by fails this test, not passes it.
+        fix.runner.run(CustomCommand(name: "orphan",
+                                     command: "( sleep 0.6; echo late >&2 && : > \(marker.path) ) & "
+                                         + "echo boom >&2; exit 5",
+                                     shortcut: "ctrl+a>p", errorHud: true))
+
+        wait { !recorder.posts.isEmpty }
+        XCTAssertEqual(recorder.posts.first?.message, "orphan: exit 5")
+        XCTAssertEqual(recorder.posts.first?.detail, "boom", "the report belongs to the command, not its child")
+
+        wait { FileManager.default.fileExists(atPath: marker.path) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path),
+                      "the descendant's write must reach a live pipe, not a closed one")
+        XCTAssertEqual(recorder.posts.count, 1, "a late write reports nothing of its own")
+    }
+
+    func testStderrPastThePipeBufferDoesNotWedgeTheCommandAndKeepsItsLastLine() throws {
+        let recorder = HudRecorder()
+        let fix = try failureFixture(recorder)
+        // 512 KiB is well past the 64 KiB pipe buffer: a capture that only read at exit would deadlock here.
+        fix.runner.run(CustomCommand(name: "flood",
+                                     command: "for i in $(seq 1 8192); do "
+                                         + "printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' >&2; "
+                                         + "done; echo 'final line' >&2; exit 1",
+                                     shortcut: "ctrl+a>p", errorHud: true))
+
+        wait(upTo: 20) { !recorder.posts.isEmpty }
+
+        XCTAssertEqual(recorder.posts.first?.detail, "final line")
+    }
+
+    func testACommandExitingWithMoreBufferedThanTheTailKeepsItsFinalLine() throws {
+        let recorder = HudRecorder()
+        let fix = try failureFixture(recorder)
+        // 48 KiB lands in the pipe and the command exits at once: a final drain budgeted at the 16 KiB tail
+        // would keep the oldest of it and lose the line below.
+        fix.runner.run(CustomCommand(name: "burst",
+                                     command: "head -c 49152 /dev/zero | tr '\\0' 'x' >&2; printf '\\n' >&2; "
+                                         + "echo 'final line' >&2; exit 7",
+                                     shortcut: "ctrl+a>b", errorHud: true))
+
+        wait(upTo: 20) { !recorder.posts.isEmpty }
+
+        XCTAssertEqual(recorder.posts.first?.message, "burst: exit 7")
+        XCTAssertEqual(recorder.posts.first?.detail, "final line")
+    }
+
+    func testARefusedPanelArmsNoAutoClose() throws {
+        let recorder = HudRecorder()
+        recorder.refuse = true
+        let fix = try failureFixture(recorder)
+        fix.runner.run(CustomCommand(name: "probe", command: "exit 4", shortcut: "ctrl+a>p", errorHud: true))
+
+        wait { !recorder.posts.isEmpty }
+
+        XCTAssertEqual(recorder.posts.count, 1, "a refusal still tries once")
+    }
+
+    func testOptedOutCommandUsesDevNullAndPostsNoPanel() throws {
+        let recorder = HudRecorder()
+        let fix = try failureFixture(recorder)
+        let marker = stateDir.appendingPathComponent("stderr-kind")
+        fix.runner.run(CustomCommand(name: "quiet", command: "if [ /dev/fd/2 -ef /dev/null ]; then "
+                                    + "echo null; else echo captured; fi > \(marker.path); exit 4", shortcut: ""))
+        fix.runner.run(CustomCommand(name: "barrier", command: "while [ ! -s \(marker.path) ]; do sleep 0.01; done; "
+                                    + "sleep 0.1; exit 1", shortcut: "", errorHud: true))
+
+        wait { !recorder.posts.isEmpty }
+
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "null\n")
+        XCTAssertEqual(recorder.posts.map(\.message), ["barrier: exit 1"])
+    }
+
+    func testSpawnFailurePostsOnlyWhenOptedIn() throws {
+        let recorder = HudRecorder()
+        let fix = try failureFixture(recorder)
+        fix.session.currentCwd = try unenterableDirectory()
+
+        fix.runner.run(CustomCommand(name: "quiet", command: "true", shortcut: ""))
+        XCTAssertTrue(recorder.posts.isEmpty)
+        fix.runner.run(CustomCommand(name: "loud", command: "true", shortcut: "", errorHud: true,
+                                     errorPosition: .topLeft, errorPane: .left))
+
+        XCTAssertEqual(recorder.posts.count, 1)
+        let message = try XCTUnwrap(recorder.posts.first?.message)
+        XCTAssertTrue(message.hasPrefix("loud: "), message)
+        XCTAssertGreaterThan(message.count, "loud: ".count)
+        XCTAssertNil(recorder.posts.first?.detail)
+        XCTAssertEqual(recorder.posts.first?.spec.position, .topLeft)
+        XCTAssertEqual(recorder.posts.first?.pane, .left)
+    }
+
+    func testFailurePanelUsesConfiguredPaneRegardlessOfFocus() throws {
+        let recorder = HudRecorder()
+        let fix = try failureFixture(recorder, useControlServer: true)
+        fix.session.hasSplit = true
+        fix.session.isSplit = true
+        fix.session.splitPaneIdentity = UUID()
+        fix.session.splitFocused = false
+
+        fix.runner.run(CustomCommand(name: "probe", command: "exit 3", shortcut: "", errorHud: true,
+                                     errorPosition: .bottomLeft, errorPane: .right))
+        wait { fix.session.hudActive }
+
+        XCTAssertEqual(fix.session.hudPaneIdentity, fix.session.splitPaneIdentity)
+        XCTAssertEqual(fix.session.hudSpec?.position, .bottomLeft)
+    }
+
+    func testHiddenConfiguredPaneFallsBackAtConfiguredPosition() throws {
+        let recorder = HudRecorder()
+        let fix = try failureFixture(recorder, useControlServer: true)
+        fix.session.hasSplit = true
+        fix.session.isSplit = false
+        fix.session.splitPaneIdentity = UUID()
+        fix.session.splitFocused = false
+
+        fix.runner.run(CustomCommand(name: "probe", command: "exit 3", shortcut: "", errorHud: true,
+                                     errorPosition: .topRight, errorPane: .right))
+        wait { fix.session.hudActive }
+
+        XCTAssertTrue(fix.session.hudActive)
+        XCTAssertNil(fix.session.hudPaneIdentity)
+        XCTAssertEqual(fix.session.hudSpec?.position, .topRight)
+    }
+
+    func testGoneConfiguredPaneFallsBackAtConfiguredPosition() throws {
+        let recorder = HudRecorder()
+        let fix = try failureFixture(recorder, useControlServer: true)
+
+        fix.runner.run(CustomCommand(name: "probe", command: "exit 3", shortcut: "", errorHud: true,
+                                     errorPosition: .bottomCenter, errorPane: .right))
+        wait { fix.session.hudActive }
+
+        XCTAssertTrue(fix.session.hudActive)
+        XCTAssertNil(fix.session.hudPaneIdentity)
+        XCTAssertEqual(fix.session.hudSpec?.position, .bottomCenter)
+    }
+
+    func testFailurePanelLeavesProgramOverlayInPlace() throws {
+        let recorder = HudRecorder()
+        let fix = try failureFixture(recorder, useControlServer: true)
+        let store = try XCTUnwrap(library.activeStore)
+        XCTAssertTrue(store.openOverlay(fix.session.id, command: "sleep 30"))
+        let generation = fix.session.overlaySlotGeneration
+
+        fix.runner.run(CustomCommand(name: "probe", command: "exit 3", shortcut: "", errorHud: true,
+                                     errorPane: .right))
+        wait { !recorder.posts.isEmpty }
+
+        XCTAssertTrue(fix.session.programOverlayActive)
+        XCTAssertFalse(fix.session.hudActive)
+        XCTAssertEqual(fix.session.overlaySlotGeneration, generation)
+        XCTAssertEqual(recorder.posts.count, 1)
+    }
+
     /// Runs `command` from `surface` and returns what it wrote, or nil if it never wrote anything. The spawn
     /// is a detached `/bin/sh`, so the file is the only channel back.
     private func fired(_ runner: CustomCommandRunner, from surface: GhosttySurfaceView,
@@ -326,13 +979,15 @@ final class CustomCommandRunnerTests: XCTestCase {
         let fix = try fixture()
         let owner = try XCTUnwrap(fix.store.currentWorkspaceID)
         let session = try XCTUnwrap(fix.store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
-        session.scratchSurface = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        let scratch = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory(), env: ["AGTERM_PANE_ID": "scratch-tok"])
+        session.scratchSurface = scratch
         session.scratchActive = true
+        XCTAssertEqual(try fired(fix.runner, from: scratch, writing: "\"$AGT_PANE $AGT_PANE_ID\""), "scratch scratch-tok")
 
         let sessionWide = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
         session.overlaySurface = sessionWide
         session.overlayActive = true
-        XCTAssertEqual(try fired(fix.runner, from: sessionWide, writing: "\"$AGT_PANE\""), "scratch")
+        XCTAssertEqual(try fired(fix.runner, from: sessionWide, writing: "\"$AGT_PANE $AGT_PANE_ID\""), "scratch scratch-tok")
 
         session.overlaySurface = nil
         session.overlayActive = false
@@ -356,6 +1011,132 @@ final class CustomCommandRunnerTests: XCTestCase {
         let written = try fired(fix.runner, from: stray, writing: "\"$AGT_PANE $AGT_SESSION_ID\"")
 
         XCTAssertEqual(written, "left \(session.id.uuidString)")
+    }
+
+    private func tokenedSplitSession(_ fix: Fixture) throws -> (session: Session, main: GhosttySurfaceView, split: GhosttySurfaceView) {
+        let owner = try XCTUnwrap(fix.store.currentWorkspaceID)
+        let session = try XCTUnwrap(fix.store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+        let main = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory(), env: ["AGTERM_PANE_ID": "main-tok"])
+        main.session = session
+        session.surface = main
+        let split = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory(), env: ["AGTERM_PANE_ID": "split-tok"])
+        split.session = session
+        session.splitSurface = split
+        session.hasSplit = true
+        session.isSplit = true
+        return (session, main, split)
+    }
+
+    // #602: the role names the slot, the token names the terminal, and only the token survives a swap.
+    func testAChordCarriesTheTokenOfTheTerminalItFiredInAcrossASwap() throws {
+        let fix = try fixture()
+        let (session, main, split) = try tokenedSplitSession(fix)
+        XCTAssertEqual(try fired(fix.runner, from: split, writing: "\"$AGT_PANE $AGT_PANE_ID\""), "right split-tok")
+        XCTAssertEqual(try fired(fix.runner, from: main, writing: "\"$AGT_PANE $AGT_PANE_ID\""), "left main-tok")
+
+        XCTAssertNil(fix.store.swapPanes(session.id))
+
+        XCTAssertEqual(try fired(fix.runner, from: split, writing: "\"$AGT_PANE $AGT_PANE_ID\""), "left split-tok")
+        XCTAssertEqual(try fired(fix.runner, from: main, writing: "\"$AGT_PANE $AGT_PANE_ID\""), "right main-tok")
+    }
+
+    func testAChordFromAPromotedSurvivorReportsLeftWithItsOwnToken() throws {
+        let fix = try fixture()
+        let (session, _, split) = try tokenedSplitSession(fix)
+
+        fix.store.closePrimaryPane(session.id)
+
+        XCTAssertTrue(session.surface === split)
+        XCTAssertEqual(try fired(fix.runner, from: split, writing: "\"$AGT_PANE $AGT_PANE_ID\""), "left split-tok")
+    }
+
+    func testAChordFiredInsideAPaneOverlayCarriesTheCoveredPanesToken() throws {
+        let fix = try fixture()
+        let (session, _, _) = try tokenedSplitSession(fix)
+        session.splitFocused = true
+        XCTAssertNil(fix.store.openPaneOverlay(session.id, pane: .left, command: "true"))
+        let overlay = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        session.setPaneOverlaySurface(overlay, pane: .left)
+        XCTAssertEqual(overlay.paneToken, "", "the overlay itself has no token to leak")
+
+        XCTAssertEqual(try fired(fix.runner, from: overlay, writing: "\"$AGT_PANE $AGT_PANE_ID\""), "left main-tok")
+    }
+
+    func testAPaletteRunWithAFocusedButUnrealizedSplitCarriesThePrimaryToken() throws {
+        let fix = try fixture()
+        let (session, _, _) = try tokenedSplitSession(fix)
+        fix.store.selectSession(session.id)
+        session.splitFocused = true
+        XCTAssertEqual(try firedFromPalette(fix.runner, writing: "\"$AGT_PANE $AGT_PANE_ID\""), "right split-tok")
+
+        session.splitSurface = nil
+        XCTAssertEqual(try firedFromPalette(fix.runner, writing: "\"$AGT_PANE $AGT_PANE_ID\""), "left main-tok")
+    }
+
+    private func firedFromPalette(_ runner: CustomCommandRunner, writing body: String) throws -> String? {
+        let probe = stateDir.appendingPathComponent("probe-\(UUID().uuidString).txt")
+        runner.run(CustomCommand(name: "probe", command: "printf '%s' \(body) > \(probe.path)", shortcut: ""))
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+            if let written = try? String(contentsOf: probe, encoding: .utf8), !written.isEmpty { return written }
+        }
+        return nil
+    }
+
+    private func controlServer(_ fix: Fixture) -> ControlServer {
+        fix.actions.customCommandRunner = fix.runner
+        let server = ControlServer(library: library, actions: fix.actions, settingsModel: fix.settings,
+                                   identity: AppIdentity(version: "9.9.9"),
+                                   socketPath: "/tmp/agterm-run-\(UUID().uuidString.prefix(8)).sock")
+        failureServers.append(server)
+        return server
+    }
+
+    func testKeymapRunStartsTheNamedCommandForTheAddressedSessionNotTheActiveOne() throws {
+        let probe = stateDir.appendingPathComponent("probe-\(UUID().uuidString).txt")
+        let fix = try fixture(keymap: "command \"Mark\" printf '%s' \"$AGT_SESSION_ID\" > \(probe.path)\n")
+        let owner = try XCTUnwrap(fix.store.currentWorkspaceID)
+        let background = try XCTUnwrap(fix.store.addSession(toWorkspace: owner, cwd: NSTemporaryDirectory(),
+                                                            select: false))
+        XCTAssertNotEqual(fix.store.selectedSessionID, background.id)
+
+        let response = controlServer(fix).runCustomCommand(name: "Mark", target: background.id.uuidString, window: nil)
+
+        XCTAssertEqual(response, ControlResponse(ok: true, result: ControlResult(id: background.id.uuidString)))
+        var written: String?
+        let deadline = Date().addingTimeInterval(5)
+        while written == nil, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+            if let text = try? String(contentsOf: probe, encoding: .utf8), !text.isEmpty { written = text }
+        }
+        XCTAssertEqual(written, background.id.uuidString)
+    }
+
+    func testKeymapRunRefusesAnUnknownNameAnUnknownSessionAndAMissingRunner() throws {
+        let fix = try fixture(keymap: "command \"Mark\" true\n")
+        let server = controlServer(fix)
+
+        XCTAssertEqual(server.runCustomCommand(name: "mark", target: nil, window: nil),
+                       ControlResponse(ok: false, error: "no custom command named mark"))
+        XCTAssertFalse(server.runCustomCommand(name: "Mark", target: UUID().uuidString, window: nil).ok)
+
+        fix.actions.customCommandRunner = nil
+        XCTAssertEqual(server.runCustomCommand(name: "Mark", target: nil, window: nil),
+                       ControlResponse(ok: false, error: "custom commands are not available"))
+    }
+
+    func testKeymapRunReportsACommandThatDidNotStart() throws {
+        let fix = try fixture(keymap: "command \"Mark\" true\n")
+        let session = try XCTUnwrap(fix.store.activeSession)
+        session.currentCwd = try unenterableDirectory()
+
+        let response = controlServer(fix).runCustomCommand(name: "Mark", target: nil, window: nil)
+
+        XCTAssertFalse(response.ok)
+        let error = try XCTUnwrap(response.error)
+        XCTAssertTrue(error.hasPrefix("Mark did not start: "), error)
+        XCTAssertGreaterThan(error.count, "Mark did not start: ".count)
     }
 
     func testScratchChordKeepsItsOwnerAfterSelectionChanges() throws {
@@ -553,6 +1334,29 @@ final class CustomCommandRunnerTests: XCTestCase {
         var fields = try XCTUnwrap(written).components(separatedBy: "|")
         fields[2] = URL(fileURLWithPath: fields[2]).resolvingSymlinksInPath().path
         return fields
+    }
+
+    // #738: a deleted session directory refused every custom command fired from that session.
+    func testALocalSessionWhoseDirectoryIsNotThereRunsTheCommandInHome() throws {
+        let file = stateDir.appendingPathComponent("plain.txt")
+        try Data().write(to: file)
+        let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
+
+        let fix = try fixture()
+        let owner = try XCTUnwrap(fix.store.currentWorkspaceID)
+
+        for reported in [stateDir.appendingPathComponent("deleted").path, file.path] {
+            let session = try XCTUnwrap(fix.store.addSession(toWorkspace: owner, cwd: NSHomeDirectory()))
+            session.currentCwd = reported
+            let surface = GhosttySurfaceView(workingDirectory: NSHomeDirectory())
+            surface.session = session
+            session.surface = surface
+
+            let written = try fired(fix.runner, from: surface, writing: "\"$AGT_SESSION_PWD|$PWD\"")
+            let fields = try XCTUnwrap(written).components(separatedBy: "|")
+            XCTAssertEqual(fields.first, reported)
+            XCTAssertEqual(fields.last.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }, home)
+        }
     }
 
     func testARemoteSessionWhoseReportedPathExistsLocallyRunsTheCommandThere() throws {

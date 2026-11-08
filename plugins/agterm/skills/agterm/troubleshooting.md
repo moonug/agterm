@@ -18,7 +18,7 @@ You are inside agterm (`AGTERM_ENABLED=1`). Use:
 - **A keybinding does not fire** — `agtermctl keymap list` shows the chord each action resolved to AND the
   key equivalents the menu bar is actually dispatching. If the action's `chord` looks right but no `menu`
   entry carries it (or a different item does), the keymap is fine and the menu is the problem: SwiftUI
-  rebuilds the menu only on the next app activation, so switch to another app and back, then relaunch if it
+  rebuilds the menu lazily (on activation or a key press), so switch to another app and back, then relaunch if it
   persists. Exceptions: `undo_close` (⌘Z) and `toggle_fullscreen` (⌃⌘F) are delivered by a key monitor
   rather than a menu item, so they never appear under `menu` and their absence there means nothing.
 - **Ghostty settings** - `agtermctl config reload` re-reads the ghostty config and prints the diagnostic
@@ -34,8 +34,10 @@ You are inside agterm (`AGTERM_ENABLED=1`). Use:
   `ssh-env` and `ssh-terminfo` for `shell-integration-features`. Ghostty implements them by replacing
   `ssh` with a wrapper calling a `ghostty` CLI absent from agterm's bundle, so agterm forces both off
   after reading the config and keeps every other flag. Setting either is by design a no-op, reports no
-  diagnostic, and is NOT a bug. For remote terminfo, install the entry manually with
-  `infocmp -x xterm-ghostty | ssh <host> 'tic -x -'`.
+  diagnostic, and is NOT a bug. For remote terminfo, install the entry once per host and account with
+  `agtermctl terminfo install <host>` (local-only, no socket; `-p`, `-i`, `-J`, `-F` pass through, other
+  connection settings belong in `~/.ssh/config`, and the execution settings are the installer's own). The symptom it fixes is `less`, `vim` or `apt` on the remote
+  warning that the terminal is not fully functional, because `TERM=xterm-ghostty` is unknown there.
 - **Logs** (unified logging, subsystem `com.umputun.agterm`):
   ```bash
   log show --predicate 'subsystem == "com.umputun.agterm"' --info --last 30m
@@ -59,8 +61,9 @@ also no-ops with no session selected or an overlay already open.
 
 Causes, in order: a parse error (see the diagnostics); the chord conflicts with a built-in or another
 custom command and was dropped to palette-only (it still runs from `⌃⇧P`, tagged `custom`); a reserved
-chord (`ctrl+tab`, `ctrl+1`/`ctrl+2`); a modifier-less key (rejected — a custom chord needs a
-modifier); it does not fire while a text field (inline rename, a palette, Settings) has keyboard focus,
+chord (`ctrl+tab`, `ctrl+1`/`ctrl+2`); a first chord without a modifier or function key
+(`f1` through `f20`); it does not fire while a text field (inline rename, a palette, Settings)
+has keyboard focus,
 though it DOES fire from a terminal pane or an empty window (every session closed); it runs in a non-interactive
 `/bin/sh -c` (no aliases/functions, a smaller `PATH` — use absolute paths or `$SHELL -lc '…'`); a
 non-zero exit posts a failure banner (meaning it DID fire and failed). Reload after edits:
@@ -109,9 +112,10 @@ Check these in order:
 
 - **Restart after selecting Live sessions.** The restore mode is fixed when agterm starts. Changing
   **Settings ▸ General ▸ Restore sessions** affects the next process, not sessions already open.
-- **Read the eligibility reason in Settings.** Live mode requires zsh as the macOS login shell and the
-  bundled zmx and zsh-integration resources. If the launch cannot use live mode, every pane starts as an
-  ordinary shell.
+- **Read the eligibility reason in Settings.** Live mode requires zsh or fish as the macOS login shell (or as the
+  absolute path in the ghostty `command` agterm loads, including an inherited global config and
+  `config-file` includes, last value winning, read only at launch) and the bundled zmx and shell-integration resources (`ZDOTDIR` for zsh, `XDG_DATA_DIRS` for fish). If the launch
+  cannot use live mode, every pane starts as an ordinary shell.
 - **Inspect actual backing with `tree --json`.** Primary and split surfaces report `backedByZmx`; the session
   field is true only when every existing primary or split is backed. The sidebar deliberately has no zmx
   indicator.
@@ -130,11 +134,15 @@ Check these in order:
   `foregroundCommand` in `windows/<id>.json` while agterm is STOPPED: the next launch moves it into memory
   and rewrites the file with nil, so a running app always shows null there.
 - **A tool asks for the microphone again after every update.** The pane was created before the session
-  host and reads `orphaned` in `agtermctl tree --json`, so macOS charges each tool version separately. Help ▸
+  host and reads `orphaned` in `agtermctl tree --json`, so macOS charges each tool version separately. Agterm ▸
   Reset Live Sessions… (or `agtermctl zmx reset --force`) ends those sessions' processes at the next launch
   and recreates them under the host; agterm quits and reopens itself, captured commands start again where
   possible, and the notification afterwards says how many sessions were covered. A session whose old process
   could not be confirmed gone gets no command restarted and the reset can be run again.
+- **After an update, an attached session still needs a key press, or a zmx change seems missing.** A live
+  session keeps the zmx it was created with through app updates. `agtermctl zmx list` marks such rows
+  `outdated`; Agterm ▸ Reset Live Sessions… (or `agtermctl zmx reset --force`) recreates them on the current
+  zmx, with the same cost as any reset: running work stops and agent conversations need resuming.
 - **Switching modes ends detached live processes.** Selecting Fresh shells or Re-run commands and restarting
   reaps the live daemons in this state directory. An unavailable launch that still requests Live sessions
   preserves its claimed daemons for a later eligible launch.
@@ -211,6 +219,20 @@ programs with that attribution. A dismissed prompt is never re-offered (`osascri
 "Not authorized to send Apple events"). The user changes the answer in System Settings ▸ Privacy & Security
 under the matching service, for example Automation ▸ agterm. This is macOS policy, not an agterm bug: do not file it.
 
+### "a permission is granted but a tool still cannot use it"
+
+A service shows agterm enabled in System Settings, yet a tool in a session is denied. One cause is a stale
+grant: macOS stores each grant with a code requirement, and a grant made while agterm was signed ad-hoc
+requires a bare code hash, so a rebuilt or reinstalled agterm no longer matches while the toggle still reads
+on. Confirm it before concluding anything: save the row's raw `csreq` blob from the system TCC.db to a
+file, the bytes rather than sqlite's printed output (`SELECT writefile('/tmp/ax.csreq', csreq) FROM access
+WHERE service='kTCCServiceAccessibility' AND client='com.umputun.agterm'`), then run
+`codesign --verify -R /tmp/ax.csreq /Applications/agterm.app`. Only `code failed to satisfy specified code
+requirement(s)` is the stale grant; an extraction, parsing, or signature error needs resolving first. The
+[stale-grant diagnosis](https://github.com/umputun/agterm/blob/master/docs/troubleshooting.md#an-accessibility-permission-you-granted-stops-working-after-an-update)
+in docs covers the `tccutil reset` and the re-grant. A confirmed stale requirement is a machine-state issue,
+not an agterm bug: do not file it. A denial with a requirement that does match needs a different diagnosis.
+
 ### "a command cannot read ~/Downloads, ~/Desktop or ~/Documents"
 
 macOS protects those folders, plus removable and network volumes, on its own: a separate mechanism from the
@@ -223,6 +245,12 @@ gives agterm Full Disk Access, which covers all of them at once. A dismissed pro
 not permitted` for the privacy denial, `Permission denied` for ordinary permission bits, and some `ls`
 replacements print the same wording for both. Needing the grant is macOS policy, not an agterm bug: do not
 file it.
+
+### "a dropped screenshot reaches a Live pane but cannot be read"
+
+The pane gets the thumbnail's `TemporaryItems/NSIRD_screencaptureui_*` path, but opening it fails with
+`Operation not permitted` and Claude Code drops the image silently. In the reported case Full Disk Access fixed
+it without a restart; see the [screenshot read diagnosis](https://github.com/umputun/agterm/blob/master/docs/troubleshooting.md#a-dropped-screenshot-reaches-a-live-pane-but-cannot-be-read).
 
 ### "agterm would like to access data from other apps, over and over"
 
@@ -237,8 +265,14 @@ prompt itself as an agterm bug.
 Install the hooks from Help ▸ Install Agent Status Hooks…. For shell-integrated agents, start a fresh shell
 so the installer-added `source` line takes effect. For Pi, restart it or run `/reload` so it loads
 `~/.pi/agent/extensions/agterm-status.ts`; the extension installs only after Pi has created `~/.pi/agent`.
-For OpenCode, restart it so it loads `~/.config/opencode/plugins/agterm-status.js`;
-the plugin installs only after OpenCode has created `~/.config/opencode`.
+For OpenCode, restart it to load `~/.config/opencode/plugins/agterm-status.js` (v1) or
+`~/.config/opencode/plugins/agterm-v2/tui.js` (v2).
+The installer detects the major via `opencode --version` in your interactive login shell; failed detection offers a manual choice.
+V1 uses `~/.config/opencode`. V2 uses the shell's `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then `~/.config/opencode`.
+The selected directory must already exist. An empty `OPENCODE_CONFIG_DIR` skips v2 with a warning. So does an unavailable shell configuration when `~/.config/opencode` exists; without that directory OpenCode is skipped as not installed.
+Re-run it after switching major versions: v2 removes the marked v1 plugin in its selected directory; v1 leaves the v2 directory alone.
+User-owned or unreadable v1 files are preserved and reported in the install result.
+The v2 CLI plugin follows the selected session and its descendants, excluding background tabs and headless runs.
 The installed wrapper resolves the bundled `agtermctl` itself; a bare development build instead needs
 `agtermctl` on `PATH`. Moving or replacing agterm.app invalidates the path the installer baked in — the
 wrapper then falls back to `agtermctl` on `PATH`, and with nothing there the glyph silently stops
@@ -260,6 +294,43 @@ lives in, it leaked. Fix a poisoned tmux server without restarting it:
 then restart the affected panes/processes (a respawn is enough; existing processes keep their
 inherited copy). Prevent it: start daemons and session managers with the variables scrubbed
 (`env -u AGTERM_SESSION_ID … <cmd>`, full list in SKILL.md), or from a shell outside agterm.
+
+By default, Codex 0.160.1 CLI sessions share a background app-server daemon, started by the first
+`codex` that needs it, and the same leak follows. The server launches hooks using its inherited
+environment, so every daemon-backed session reports to the session that started the server, or to none
+when the server started outside agterm or that session has closed. Diagnose: run
+`ps eww <pid> | tr ' ' '\n' | grep AGTERM_SESSION_ID` on the app-server process carrying
+`--managed-daemon`. Scrubbing prevents wrong-session updates but does not restore status reporting, and
+agterm has no automatic mapping from the hook payload's Codex session id to the pane displaying it.
+Fix: run `codex --no-daemon`, which keeps the session and its hooks in its own process; that running
+session is unavailable for control through the shared server from the Codex desktop or mobile app.
+To make that the default for plain `codex`, run `codex features disable daemon_auto_start` once, then
+`codex app-server daemon stop`; later plain launches start no shared daemon and report to their own
+session. Disabling auto-start alone still joins a daemon that is already running, and stopping it
+disconnects the CLI sessions attached to it. A daemon-backed conversation can stay locked after its TUI
+exits: if `codex --no-daemon resume <id>` shows "This conversation is open in another app", stop the
+shared daemon and press R to retry.
+
+### "Claude Code background sessions have no status"
+
+A session started with `claude --bg` runs under Claude Code's supervisor, which does not pass the
+launching pane's `AGTERM_*` variables, so its status hooks find no `AGTERM_SESSION_ID` and exit quietly.
+`--settings` carries over into a background session and its hooks inherit the `env` block, so pass the
+variables there. With the hooks installed (Help ▸ Install Agent Status Hooks…), launch from the pane that
+should show the status:
+
+```bash
+cbg() {
+  claude --bg --settings "$(jq -cn \
+    --arg s "$AGTERM_SESSION_ID" --arg k "$AGTERM_SOCKET" \
+    --arg p "$AGTERM_PANE" --arg i "$AGTERM_PANE_ID" \
+    '{env:{AGTERM_SESSION_ID:$s,AGTERM_SOCKET:$k,AGTERM_PANE:$p,AGTERM_PANE_ID:$i}}')" "$@"
+}
+cbg "your prompt"
+```
+
+The status stays with the launching pane; `claude attach` from another pane does not move it. Verified
+hook routing with Claude Code 2.1.311.
 
 ### "Claude Code's question/permission prompt is unresponsive after switching apps"
 
@@ -318,10 +389,15 @@ and only inside that program. Ghostty.app behaves the same. It is per-program, n
 that never enables mouse reporting keeps links working. Workaround: hold shift too (⌘⇧-hover, ⌘⇧-click).
 A program can claim shift via `XTSHIFTESCAPE`, so `mouse-shift-capture = never` in
 `~/.config/agterm/ghostty.conf` makes shift always win; `mouse-reporting = false` there turns reporting
-off for every program, trading in-program mouse support for always-on selection and links.
+off for every program, trading in-program mouse support for always-on selection. Links still need ⌘⇧
+there: link detection follows the program's mouse request, not that setting.
 
 ## Reporting: decide bug vs unsupported FIRST
 
+- A bug or a wanted change **in a cookbook recipe** whose Author line names someone other than @umputun →
+  a pull request against the recipe, never an issue; see
+  <https://github.com/umputun/agterm/blob/master/cookbook/CONTRIBUTING.md#bugs-and-improvements>. Bugs in
+  @umputun's recipes, and agterm bugs a recipe exposes, are reported as below.
 - A **supported** thing misbehaves (a documented command/feature does the wrong thing, a crash, a parse
   bug) → a GitHub **issue**.
 - The user wants something **not supported**, or it is a question / idea / "can it do X" → a GitHub

@@ -15,10 +15,124 @@ struct RemoteSessionTests {
         #expect(argv.count == 8)
     }
 
+    @Test func presentIsNonInteractiveAndRunsTheBridgeForThatSession() throws {
+        let argv = try RemoteSession.presentCommand(host: "buildbox", session: "0F1E2D3C")
+
+        #expect(argv.prefix(7) == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "buildbox"])
+        #expect(argv.count == 8)
+        #expect(argv[7].contains(RemoteSession.cliPathPrefix), "sshd's PATH does not reach an installed CLI")
+    }
+
+    @Test func presentRunsTheBridgeForExactlyThatSession() throws {
+        let fake = try FakeRemote()
+        defer { fake.cleanUp() }
+        try fake.installAgtermctl(exitCodes: [0])
+
+        let run = try fake.runRemote(RemoteSession.presentCommand(host: "buildbox", session: "s1;rm"))
+
+        #expect(run.status == 0)
+        #expect(try fake.calls() == [["zmx", "present", "s1;rm"]],
+                "a shell metacharacter in the id reaches the bridge as one argument and runs nothing")
+    }
+
+    @Test(arguments: ["", "s 1", "s1\u{1B}[31m"])
+    func presentRefusesASessionThatIsNotAPlainToken(_ session: String) {
+        #expect(throws: RemoteSession.InvocationError.invalidSession) {
+            try RemoteSession.presentCommand(host: "buildbox", session: session)
+        }
+    }
+
+    @Test func presentRefusesAHostileHost() {
+        #expect(throws: RemoteSession.InvocationError.invalidHost) {
+            try RemoteSession.presentCommand(host: "-oProxyCommand=touch /tmp/pwned", session: "s1")
+        }
+    }
+
+    @Test func runJobForcesAPtyAndReachesTheInstalledCli() throws {
+        let argv = try RemoteSession.runJobCommand(host: "buildbox", job: "job-1")
+
+        #expect(argv.prefix(7) == ["ssh", "-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "buildbox"])
+        #expect(argv.count == 8)
+        #expect(argv[7].contains(RemoteSession.cliPathPrefix))
+    }
+
+    @Test func runJobRunsTheHelperForExactlyThatJob() throws {
+        let fake = try FakeRemote()
+        defer { fake.cleanUp() }
+        try fake.installAgtermctl(exitCodes: [0])
+
+        let run = try fake.runRemote(RemoteSession.runJobCommand(host: "buildbox", job: "j1;rm"))
+
+        #expect(run.status == 0)
+        #expect(try fake.calls() == [["session", "overlay", "run-job", "j1;rm"]])
+    }
+
+    @Test(arguments: ["", "j 1", "j1\u{1B}[31m"])
+    func runJobRefusesAJobThatIsNotAPlainToken(_ job: String) {
+        #expect(throws: RemoteSession.InvocationError.invalidSession) {
+            try RemoteSession.runJobCommand(host: "buildbox", job: job)
+        }
+    }
+
+    @Test func pageServeUsesPlainStdioAndReachesTheInstalledCli() throws {
+        let argv = try RemoteSession.pageServeCommand(host: "buildbox", token: "tok-1")
+
+        #expect(argv.prefix(7) == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "buildbox"])
+        #expect(argv.count == 8)
+        #expect(argv[7].contains(RemoteSession.cliPathPrefix))
+    }
+
+    @Test func pageServeRunsTheHelperForExactlyThatToken() throws {
+        let fake = try FakeRemote()
+        defer { fake.cleanUp() }
+        try fake.installAgtermctl(exitCodes: [0])
+
+        let run = try fake.runRemote(RemoteSession.pageServeCommand(host: "buildbox", token: "t1;rm"))
+
+        #expect(run.status == 0)
+        #expect(try fake.calls() == [["session", "overlay", "page-serve", "t1;rm"]])
+    }
+
+    @Test(arguments: ["", "t 1", "t1\u{1B}[31m"])
+    func pageServeRefusesATokenThatIsNotAPlainToken(_ token: String) {
+        #expect(throws: RemoteSession.InvocationError.invalidSession) {
+            try RemoteSession.pageServeCommand(host: "buildbox", token: token)
+        }
+    }
+
+    @Test func pageServeRefusesAnInvalidHost() {
+        #expect(throws: (any Error).self) { try RemoteSession.pageServeCommand(host: "-oProxyCommand=x", token: "t1") }
+    }
+
     @Test func attachForcesAPtyAndNeverBoundsItsLifetime() throws {
         let argv = try RemoteSession.attachCommand(host: "buildbox", endpoint: endpoint, daemon: daemon)
-        #expect(argv.prefix(7) == ["ssh", "-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "buildbox"])
+        #expect(argv.prefix(9) == ["ssh", "-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                                   "-o", "LogLevel=ERROR", "buildbox"])
         #expect(!argv.contains { $0.hasPrefix("ServerAlive") })
+    }
+
+    @Test func attachPutsTheLeadWordsAheadOfTheExecutableAndOmitsThemByDefault() throws {
+        let lead = ZmxLeadAttachment(nonce: "abc123", claim: true)
+        let managed = try #require(try RemoteSession.attachCommand(host: "buildbox", endpoint: endpoint,
+                                                                   daemon: daemon, lead: lead).last)
+        let plain = try #require(try RemoteSession.attachCommand(host: "buildbox", endpoint: endpoint,
+                                                                 daemon: daemon).last)
+
+        let words = "'ZMX_MANAGED=abc123' 'ZMX_MANAGED_CLAIM=1' "
+        #expect(managed == plain.replacingOccurrences(of: "'" + endpoint.executable + "'",
+                                                       with: words + "'" + endpoint.executable + "'"))
+        #expect(!plain.contains("ZMX_MANAGED"))
+        let pane = try RemoteSession.attachPaneCommand(host: "buildbox", endpoint: endpoint, daemon: daemon,
+                                                       session: "work", pane: .left, lead: lead)
+        #expect(pane.contains("ZMX_MANAGED=abc123"))
+    }
+
+    @Test func theProbeOnlyAsksTheHostToAnswer() throws {
+        #expect(try RemoteSession.probeCommand(host: "buildbox")
+            == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "buildbox", "true"])
+        #expect(throws: RemoteSession.InvocationError.invalidHost) {
+            try RemoteSession.probeCommand(host: "-oProxyCommand=touch /tmp/pwned")
+        }
     }
 
     // MARK: - what the remote shell actually runs
@@ -33,6 +147,22 @@ struct RemoteSessionTests {
         #expect(run.status == 0)
         #expect(try fake.calls() == [["zmx", "tree", "--json"]],
                 "one command: the far side does the whole join and answers with one document")
+    }
+
+    @Test(arguments: ["/bin/sh", "/bin/zsh", "/bin/tcsh", "/opt/homebrew/bin/fish", "/usr/local/bin/fish"]
+        .filter(FileManager.default.isExecutableFile))
+    func controlReachesTheCliWithEveryArgumentIntactUnderAnyLoginShell(shell: String) throws {
+        let fake = try FakeRemote()
+        defer { fake.cleanUp() }
+        try fake.installAgtermctl(exitCodes: [0])
+        let arguments = ["session", "new", "--parent", "p1", "--command", "tail -f 'my log' a\\b \\\\ end\\",
+                         "--name", "it's", "--cwd", ""]
+
+        let run = try fake.runRemote(RemoteSession.controlCommand(host: "buildbox", arguments: arguments), shell: shell,
+                                     exporting: ["ZDOTDIR": fake.root.path])
+
+        #expect(run.status == 0)
+        #expect(try fake.calls() == [arguments + ["--json"]])
     }
 
     @Test func treeWidensPathWithEveryDocumentedInstallDirectory() throws {
@@ -141,6 +271,52 @@ struct RemoteSessionTests {
         #expect(try fake.calls().first?.first == "attach", "the diagnostic runs AFTER the attach")
     }
 
+    private static let keepAlive = ["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"]
+
+    @Test(arguments: zip(["serveraliveinterval 0", "serveraliveinterval 15", ""], [true, false, false]))
+    func keepAliveIsAddedOnlyWhenTheUsersConfigSetsNone(config: String, added: Bool) throws {
+        let fake = try FakeRemote()
+        defer { fake.cleanUp() }
+        try fake.installSSH(exitCode: 23, config: config)
+        let command = try RemoteSession.attachPaneCommand(host: "buildbox", endpoint: endpoint, daemon: daemon,
+                                                          session: "build", pane: .left)
+        let run = try fake.runShell(command)
+
+        let plain = Array(try RemoteSession.attachCommand(host: "buildbox", endpoint: endpoint, daemon: daemon).dropFirst())
+        let calls = try fake.sshCalls()
+        #expect(calls.count == 2)
+        #expect(calls.first == ["-G"] + plain, "the check sees the arguments the attach runs with, a Match block included")
+        let withKeepAlive = Array(plain.dropLast(2)) + Self.keepAlive + plain.suffix(2)
+        #expect(calls.last == (added ? withKeepAlive : plain), "a check that printed nothing adds nothing")
+        #expect(run.status == 23)
+    }
+
+    @Test func aReconnectingPaneAlsoGetsTheKeepAlive() throws {
+        let fake = try FakeRemote()
+        defer { fake.cleanUp() }
+        try fake.installSSH(exitCode: 23, config: "serveraliveinterval 0")
+        let lead = ZmxLeadAttachment(nonce: "n1", claim: false)
+        let command = try RemoteSession.attachPaneCommand(host: "buildbox", endpoint: endpoint, daemon: daemon,
+                                                          session: "build", pane: .left, lead: lead)
+        _ = try fake.runShell(command)
+
+        let plain = Array(try RemoteSession.attachCommand(host: "buildbox", endpoint: endpoint, daemon: daemon, lead: lead).dropFirst())
+        #expect(try fake.sshCalls().last == Array(plain.dropLast(2)) + Self.keepAlive + plain.suffix(2))
+    }
+
+    @Test func thePaneCommandSurvivesTheExecGhosttyRunsItUnder() throws {
+        let fake = try FakeRemote()
+        defer { fake.cleanUp() }
+        try fake.installSSH(exitCode: 23)
+        let command = try RemoteSession.attachPaneCommand(host: "buildbox", endpoint: endpoint, daemon: daemon,
+                                                          session: "build", pane: .left)
+        // libghostty on macOS runs a surface command as `bash -c "exec -l <command>"`
+        let run = try fake.runShell("exec -l " + command, shell: "/bin/bash")
+
+        #expect(run.stdout == "agterm: build (left) on buildbox disconnected, exit 23\n")
+        #expect(run.status == 23)
+    }
+
     @Test func thePaneCommandKeepsTheSshExitStatusRatherThanPrintfsZero() throws {
         let fake = try FakeRemote()
         defer { fake.cleanUp() }
@@ -169,6 +345,56 @@ struct RemoteSessionTests {
         _ = try fake.runShell(command)
 
         #expect(!FileManager.default.fileExists(atPath: marker), "the name is data, never shell syntax")
+    }
+
+    @Test func aLostConnectionSaysItIsReconnectingReportsItAndWaits() async throws {
+        let fake = try FakeRemote()
+        defer { fake.cleanUp() }
+        try fake.installSSH(exitCode: 255)
+        let command = try RemoteSession.attachPaneCommand(host: "buildbox", endpoint: endpoint, daemon: daemon,
+                                                          session: "build", pane: .left,
+                                                          lead: ZmxLeadAttachment(nonce: "n1", claim: true))
+
+        // the fake gives the wrapper a pipe, so stty fails silently there: the command text is what pins it
+        #expect(command.contains("stty -echo 2>/dev/null; cat >/dev/null"))
+        let run = try fake.startShell(command)
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(run.process.isRunning, "the pane holds until the app replaces it")
+        try run.input.fileHandleForWriting.close()
+        for await _ in run.exited {}
+        let text = String(decoding: run.output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+
+        #expect(text == "\u{1B}[0m\u{1B}[?1000l\u{1B}[?1002l\u{1B}[?1003l\u{1B}[?1006l\u{1B}[?1004l"
+            + "\u{1B}[?2004l\u{1B}[?2031l\u{1B}[?2048l\r\n"
+            + "\u{1B}[30;43m Connection to buildbox lost · reconnecting… · any key retries now \u{1B}[K\u{1B}[0m\n"
+            + "\u{1B}]2;agterm-remote;n1:lost\u{07}\u{1B}[?25l", "echo goes off with the cursor, so no lock glyph")
+        #expect(run.process.terminationStatus == 255)
+    }
+
+    @Test(arguments: [0, 1, 23] as [Int32])
+    func anyOtherExitKeepsTodaysLineAndStatus(_ code: Int32) throws {
+        let fake = try FakeRemote()
+        defer { fake.cleanUp() }
+        try fake.installSSH(exitCode: code)
+        let command = try RemoteSession.attachPaneCommand(host: "buildbox", endpoint: endpoint, daemon: daemon,
+                                                          session: "build", pane: .left,
+                                                          lead: ZmxLeadAttachment(nonce: "n1", claim: true))
+        let run = try fake.runShell(command)
+
+        #expect(run.stdout == "agterm: build (left) on buildbox disconnected, exit \(code)\n")
+        #expect(run.status == code)
+    }
+
+    @Test func withoutALeadNonceALostConnectionExitsAsBefore() throws {
+        let fake = try FakeRemote()
+        defer { fake.cleanUp() }
+        try fake.installSSH(exitCode: 255)
+        let command = try RemoteSession.attachPaneCommand(host: "buildbox", endpoint: endpoint, daemon: daemon,
+                                                          session: "build", pane: .left)
+        let run = try fake.runShell(command)
+
+        #expect(run.stdout == "agterm: build (left) on buildbox disconnected, exit 255\n")
+        #expect(run.status == 255)
     }
 
     // MARK: - validation
@@ -213,12 +439,14 @@ private struct FakeRemote {
     private let log: URL
     private let zmxDirLog: URL
     private let zmxEnvLog: URL
+    private let sshLog: URL
 
     init(directoryName: String = "fake-remote-\(UUID().uuidString)") throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(directoryName, isDirectory: true)
         log = root.appendingPathComponent("calls.log")
         zmxDirLog = root.appendingPathComponent("zmxdir.log")
         zmxEnvLog = root.appendingPathComponent("zmxenv.log")
+        sshLog = root.appendingPathComponent("ssh.log")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         // the command under test appends the REAL install directories to PATH, so a test that forgets
         // `installAgtermctl` would otherwise resolve the machine's own CLI and drive the live terminal.
@@ -247,13 +475,22 @@ private struct FakeRemote {
     }
 
     /// Stands in for ssh by running its LAST argument through a shell, which is what the real one does
-    /// with the remote command.
-    func installSSH(exitCode: Int32? = nil) throws {
+    /// with the remote command. `-G` prints `config`, or nothing, and exits 0 like a real ssh dumping its
+    /// effective config; it never reaches the remote command.
+    func installSSH(exitCode: Int32? = nil, config: String? = nil) throws {
         let body = exitCode.map { "exit \($0)" } ?? #"/bin/sh -c "$last""#
+        let dump = "if [ \"$1\" = -G ]; then printf '%s\\n' '\(config ?? "")'; exit 0; fi"
         try write(name: "ssh", script: """
+        \(recordArguments(in: sshLog))
         for a in "$@"; do last=$a; done
+        \(dump)
         \(body)
         """)
+    }
+
+    /// Every ssh call's arguments, one call per element, so a test can tell four words from one.
+    func sshCalls() throws -> [[String]] {
+        try Self.calls(in: sshLog)
     }
 
     func installZmx() throws -> String {
@@ -269,10 +506,12 @@ private struct FakeRemote {
 
     /// One line per argument, so an argument containing spaces stays one argument. `"$*"` would flatten
     /// the guard script into words and let a broken argv pass.
-    private var recordArguments: String {
+    private var recordArguments: String { recordArguments(in: log) }
+
+    private func recordArguments(in file: URL) -> String {
         """
-        for a in "$@"; do printf '%s\\n' "$a" >> '\(log.path)'; done
-        printf '%s\\n' '\(Self.callSeparator)' >> '\(log.path)'
+        for a in "$@"; do printf '%s\\n' "$a" >> '\(file.path)'; done
+        printf '%s\\n' '\(Self.callSeparator)' >> '\(file.path)'
         """
     }
 
@@ -289,6 +528,25 @@ private struct FakeRemote {
     /// appends, so these never resolve the machine's own agtermctl and drive the live terminal.
     func runShell(_ remote: String, shell: String = "/bin/sh",
                   exporting extra: [String: String] = [:]) throws -> (status: Int32, stdout: String) {
+        let run = try startShell(remote, shell: shell, exporting: extra)
+        try run.input.fileHandleForWriting.close()
+        let data = run.output.fileHandleForReading.readDataToEndOfFile()
+        run.process.waitUntilExit()
+        return (run.process.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+
+    struct ShellRun {
+        let process: Process
+        let input: Pipe
+        let output: Pipe
+        /// Finishes when the shell ends: `waitUntilExit` from a thread other than the launching one can
+        /// miss the exit and hang.
+        let exited: AsyncStream<Void>
+    }
+
+    /// Starts `remote` with stdin on a pipe, for a command that waits on its terminal.
+    func startShell(_ remote: String, shell: String = "/bin/sh",
+                    exporting extra: [String: String] = [:]) throws -> ShellRun {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: shell)
         process.arguments = ["-c", remote]
@@ -296,17 +554,22 @@ private struct FakeRemote {
         environment["PATH"] = root.path + ":" + (environment["PATH"] ?? "/usr/bin:/bin")
         environment.merge(extra) { _, new in new }
         process.environment = environment
-        let pipe = Pipe()
-        process.standardOutput = pipe
+        let input = Pipe(), output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
         process.standardError = Pipe()
+        let (exited, exit) = AsyncStream<Void>.makeStream()
+        process.terminationHandler = { _ in exit.finish() }
         try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+        return ShellRun(process: process, input: input, output: output, exited: exited)
     }
 
     func calls() throws -> [[String]] {
-        guard let text = try? String(contentsOf: log, encoding: .utf8) else { return [] }
+        try Self.calls(in: log)
+    }
+
+    private static func calls(in file: URL) throws -> [[String]] {
+        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return [] }
         var calls: [[String]] = []
         var current: [String] = []
         for line in text.split(separator: "\n", omittingEmptySubsequences: false).dropLast() {

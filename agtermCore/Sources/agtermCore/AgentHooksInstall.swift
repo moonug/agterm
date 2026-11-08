@@ -13,7 +13,7 @@ public enum AgentHooksInstall {
     /// terminal-output knowledge stays in this hook resource, outside agterm's runtime.
     public static let codexWrapperName = "agterm-codex-status.sh"
 
-    /// Claude-specific adapter the four Claude hooks invoke instead of the generic wrapper: a worker agent
+    /// Claude-specific adapter the Claude hooks invoke instead of the generic wrapper: a worker agent
     /// spawned from inside a session inherits the spawner's `AGTERM_*` environment, so its hooks would repaint
     /// the SPAWNER's row. The adapter answers that ownership question from process topology and delegates,
     /// keeping the Claude-specific knowledge in the hook resource the way the Codex adapter does.
@@ -27,13 +27,74 @@ public enum AgentHooksInstall {
     /// extension, preserving a user-authored integration.
     public static let piExtensionMarker = "// agterm-pi-status-extension"
 
-    /// The bundled OpenCode plugin's path relative to the agent-status package, and its destination filename.
-    public static let opencodePluginRelativePath = "opencode/agterm-status.js"
-    static let opencodePluginName = "agterm-status.js"
+    /// The bundled v1 plugin's path relative to the agent-status package.
+    public static let opencodePluginRelativePath = OpenCode.relativePath(version: .v1)
+    /// Ownership sentinel identifying an agterm-managed OpenCode v1 plugin.
+    public static let opencodePluginMarker = OpenCode.marker(version: .v1)
 
-    /// Ownership sentinel in the bundled OpenCode plugin, same policy as `piExtensionMarker`. Named `*Plugin*`
-    /// (not `*Extension*`) because OpenCode's host term is plugin — a deliberate divergence from `piExtension*`.
-    public static let opencodePluginMarker = "// agterm-opencode-status-plugin"
+    /// Versioned paths and ownership policy for OpenCode's auto-discovered status plugins.
+    public enum OpenCode {
+        /// Supported OpenCode major versions, each with its own plugin entrypoint.
+        public enum Version: String, CaseIterable, Sendable {
+            case v1, v2
+
+            /// Parses a supported semantic version, optionally prefixed with `opencode ` or `v`.
+            public init?(versionOutput: String) {
+                var output = versionOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+                let prefix = "opencode "
+                if output.hasPrefix(prefix) { output.removeFirst(prefix.count) }
+                let pattern = #"^v?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"#
+                guard output.range(of: pattern, options: .regularExpression) != nil else { return nil }
+                let version = output.hasPrefix("v") ? String(output.dropFirst()) : output
+                switch version.split(separator: ".").first {
+                case "1": self = .v1
+                case "2": self = .v2
+                default: return nil
+                }
+            }
+        }
+
+        /// Plugin path relative to the bundled agent-status package for the selected version.
+        public static func relativePath(version: Version) -> String {
+            "opencode/" + pluginName(for: version)
+        }
+
+        /// Ownership sentinel for the selected plugin version.
+        public static func marker(version: Version) -> String {
+            version == .v1 ? "// agterm-opencode-status-plugin" : "// agterm-opencode-v2-status-plugin"
+        }
+
+        /// Plugin destination in an explicitly resolved configuration directory.
+        public static func pluginPath(configurationDirectory: String, version: Version) -> String {
+            configurationDirectory + "/plugins/" + pluginName(for: version)
+        }
+
+        /// Uses override/XDG precedence; normalizes against `workingDirectory` only when supplied.
+        public static func configurationDirectory(home: String, opencodeConfigDirectory: String? = nil,
+                                                  xdgConfigHome: String? = nil, workingDirectory: String? = nil) -> String? {
+            let path: String
+            if let opencodeConfigDirectory {
+                guard !opencodeConfigDirectory.isEmpty else { return nil }
+                path = opencodeConfigDirectory
+            } else {
+                let base = xdgConfigHome.flatMap { $0.isEmpty ? nil : $0 } ?? home + "/.config"
+                path = base + "/opencode"
+            }
+            guard let workingDirectory else { return path }
+            let absolute = path.hasPrefix("/") ? path : workingDirectory + "/" + path
+            return URL(fileURLWithPath: absolute).standardizedFileURL.path
+        }
+
+        /// Allows absent destinations or those marked for the selected version, protecting unreadable files.
+        public static func mayOverwrite(fileExists: Bool, existingContents: String?, version: Version) -> Bool {
+            guard fileExists else { return true }
+            return existingContents?.contains(marker(version: version)) == true
+        }
+
+        private static func pluginName(for version: Version) -> String {
+            version == .v1 ? "agterm-status.js" : "agterm-v2/tui.js"
+        }
+    }
 
     /// The shell integration scripts sourced from the user's rc files / config.fish, relative to the script
     /// directory.
@@ -52,12 +113,16 @@ public enum AgentHooksInstall {
     /// `UserPromptSubmit` and `PostToolUse` both set `active` — the latter after every tool run, so the status
     /// returns to `active` when work RESUMES after a `blocked` permission prompt: Claude Code has no
     /// "permission answered" event, and the gated tool's `PreToolUse` fired BEFORE `blocked` was set, so its
-    /// `PostToolUse` is the first hook afterwards. `Notification` alone carries the `permission_prompt` matcher,
-    /// and only `Stop`→`completed` passes `--auto-reset` (it clears on visit); the rest stay keep-state.
+    /// `PostToolUse` is the first hook afterwards. `PermissionRequest` sets `blocked` as the prompt opens.
+    /// `Notification[permission_prompt]` fires only once the prompt has waited about six seconds with no
+    /// keystroke, and stays for the sandboxed network prompt, which `PermissionRequest` does not cover.
+    /// `Notification` alone carries a matcher, and only `Stop`→`completed` passes `--auto-reset` (it clears
+    /// on visit); the rest stay keep-state.
     static let claudeHooks: [(event: String, matcher: String?, state: String)] = [
         ("UserPromptSubmit", nil, "active --blink"),
         ("PostToolUse", nil, "active --blink"),
         ("Stop", nil, "completed --auto-reset"),
+        ("PermissionRequest", nil, "blocked"),
         ("Notification", "permission_prompt", "blocked"),
     ]
 
@@ -89,27 +154,21 @@ public enum AgentHooksInstall {
         return existingContents.contains(piExtensionMarker)
     }
 
-    /// The destination directory for OpenCode's auto-discovered global plugins.
-    static func opencodePluginDirectory(home: String) -> String {
-        home + "/.config/opencode/plugins"
+    /// Installed OpenCode plugin path beneath the supplied home; `version` defaults to `.v1`.
+    public static func opencodePluginPath(home: String, version: OpenCode.Version = .v1) -> String {
+        OpenCode.pluginPath(configurationDirectory: home + "/.config/opencode", version: version)
     }
 
-    public static func opencodePluginPath(home: String) -> String {
-        opencodePluginDirectory(home: home) + "/" + opencodePluginName
-    }
-
-    /// Whether the OpenCode plugin destination is safe to replace; same ownership policy as Pi.
-    public static func mayOverwriteOpenCodePlugin(fileExists: Bool, existingContents: String?) -> Bool {
-        guard fileExists else { return true }
-        guard let existingContents else { return false }
-        return existingContents.contains(opencodePluginMarker)
+    /// Allows absent or marked plugins, protecting unreadable files; `version` defaults to `.v1`.
+    public static func mayOverwriteOpenCodePlugin(fileExists: Bool, existingContents: String?, version: OpenCode.Version = .v1) -> Bool {
+        OpenCode.mayOverwrite(fileExists: fileExists, existingContents: existingContents, version: version)
     }
 
     /// Thrown by `mergeClaudeSettings` when the existing `settings.json` is non-empty but not a valid JSON
     /// object: the installer refuses to overwrite a hand-maintained file it cannot safely parse.
     public enum MergeError: Error { case malformedExistingSettings }
 
-    /// merge the four agent-status hooks into an existing Claude Code `settings.json`.
+    /// merge the agent-status hooks into an existing Claude Code `settings.json`.
     ///
     /// `existing` is the current contents (nil/empty = start from a fresh object). Returns the new JSON and
     /// whether it differs; idempotent — hooks already present (detected by the adapter command) return the
@@ -463,7 +522,7 @@ public enum AgentHooksInstall {
     // absent/empty/whitespace-only → fresh empty object; a non-empty file that is not a valid JSON object →
     // throw rather than silently discard the user's file.
     // a wrong-TYPED value is not an absent one: `as?` plus an empty default would read it as missing and then
-    // write over it, deleting the key the merge could not understand. Only the four events this merge writes
+    // write over it, deleting the key the merge could not understand. Only the events this merge writes
     // are checked; an unrelated event of any shape is never read and round-trips.
     private static func claudeHooksObject(_ root: [String: Any]) throws -> [String: Any] {
         guard let value = root["hooks"] else { return [:] }

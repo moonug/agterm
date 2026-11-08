@@ -17,9 +17,10 @@ extension NSView {
 
 /// Bridges to the AppKit `NSSplitView` under SwiftUI's `HSplitView`/`VSplitView` to (1) persist and restore the split
 /// divider ratio — no public SwiftUI API exposes the divider position — (2) clip the split's divider out
-/// of the titlebar strip, (3) paint the divider's own resize cursor, which nothing else writes, and
-/// (4) restore an even split on a divider double-click. Attached as a `.background` on the primary pane so
-/// its `NSView` lives inside the split's view tree without becoming a third arranged pane.
+/// of the titlebar strip, (3) paint the divider's resize cursor and keep a hidden split's AppKit one off screen,
+/// (4) restore an even split on a divider double-click, and (5) color the divider. Attached as a
+/// `.background` on the primary pane so its `NSView` lives inside the split's view tree without becoming
+/// a third arranged pane.
 ///
 /// (1) Once the split has a real axis extent it restores `session.splitRatio` via `setPosition`, seeding
 /// `splitRatioDefault` when none is stored. The fraction is of the pane area BELOW the titlebar band, which is
@@ -42,9 +43,14 @@ extension NSView {
 /// (4) A drag can't land exactly on 50/50, and `NSSplitView`'s own double-click gesture only collapses a
 /// pane through the delegate SwiftUI owns, so the reset is recognized from a shared mouse monitor instead.
 /// It sees the second click after the first one's divider-drag tracking loop ends, leaving dragging intact.
+///
+/// (5) `NSSplitView.dividerColor` is read-only and SwiftUI owns the split's class, so a sublayer of the
+/// split's own layer covers the divider gap instead. Living in that layer, it is hidden with a background
+/// session's split and clipped by (2)'s mask exactly as AppKit's divider is.
 struct SplitRatioAccessor: NSViewRepresentable {
     let session: Session
     let titlebarHeight: CGFloat
+    let dividerColor: NSColor
     let suspended: Bool
     /// On screen and uncovered: the deck's `visible` minus any overlay or scratch over the panes. Gates (3)
     /// and (4) — a background session's split is still laid out at the full frame with its tracking area
@@ -57,6 +63,7 @@ struct SplitRatioAccessor: NSViewRepresentable {
         let view = SplitProbeView(session: session)
         view.onPersist = onPersist
         view.titlebarHeight = titlebarHeight
+        view.dividerColor = dividerColor
         view.suspended = suspended
         view.deckVisible = deckVisible
         return view
@@ -64,6 +71,7 @@ struct SplitRatioAccessor: NSViewRepresentable {
     func updateNSView(_ nsView: SplitProbeView, context _: Context) {
         nsView.onPersist = onPersist
         nsView.titlebarHeight = titlebarHeight // re-clip on a toolbar-mode change (changes titlebarHeight)
+        nsView.dividerColor = dividerColor
         nsView.suspended = suspended
         nsView.deckVisible = deckVisible
     }
@@ -73,7 +81,8 @@ struct SplitRatioAccessor: NSViewRepresentable {
         var onPersist: (() -> Void)?
         /// Top strip (in points) to clip the split's divider out of; updated on a toolbar-mode change.
         var titlebarHeight: CGFloat = 0 { didSet { if titlebarHeight != oldValue { updateDividerClip() } } }
-        var deckVisible: Bool = true
+        var dividerColor: NSColor = .separatorColor { didSet { if dividerColor != oldValue { updateDividerStrip() } } }
+        var deckVisible: Bool = true { didSet { if deckVisible != oldValue { updateNativeDividerCursor() } } }
         var suspended: Bool = false {
             didSet {
                 guard suspended != oldValue else { return }
@@ -91,10 +100,13 @@ struct SplitRatioAccessor: NSViewRepresentable {
         nonisolated(unsafe) private var saveWorkItem: DispatchWorkItem?
         private weak var splitView: NSSplitView?
         private var dividerClipMask: CALayer?
+        private var dividerStrip: CALayer?
         private var dividerTracking: NSTrackingArea?
         private var restored = false
-        /// The split's top safe-area inset when the ratio was last applied; a change re-arms `restored`.
+        /// The split's top safe-area inset and axis length when the ratio was last applied; a change in
+        /// either re-arms `restored`.
         private var restoredSafeAreaTop: CGFloat = 0
+        private var restoredAxisLength: CGFloat = 0
         /// Primary-pane extent at the previous in-band press, nil when that press missed the band.
         private var lastPressPrimaryExtent: CGFloat?
         /// A press was swallowed and its release is still to come.
@@ -106,7 +118,9 @@ struct SplitRatioAccessor: NSViewRepresentable {
         private var dividerPressed = false
 
         /// A divider drag is live right now: that press, with the button still down.
-        private var dividerDragging: Bool { dividerPressed && NSEvent.pressedMouseButtons & 1 != 0 }
+        private var dividerDragging: Bool { dividerPressed && primaryButtonDown() }
+        /// The physical primary button, system-wide; replaceable because a real click elsewhere answers it too.
+        var primaryButtonDown: () -> Bool = { NSEvent.pressedMouseButtons & 1 != 0 }
 
         init(session: Session) {
             self.session = session
@@ -133,42 +147,49 @@ struct SplitRatioAccessor: NSViewRepresentable {
             Self.addClaimant(self)
             updateDividerClip() // keep the titlebar-strip clip sized to the current split bounds
             restoreDivider()
+            updateDividerStrip()
         }
 
-        /// Apply the stored ratio once the split has a real extent, and again whenever the safe-area inset
-        /// changed under it. A background split first lays out at a stale 1pt inset; when the real one arrives
-        /// the divider has to be re-applied, or the top pane keeps the stale position and overruns the
-        /// titlebar, and the next window resize falls back to SwiftUI's own even split of the content space
-        /// (#539).
+        /// Apply the stored ratio once the split has a real extent, and again whenever the safe-area inset or
+        /// the axis length changed under it. A background split first lays out at a stale 1pt inset; when the
+        /// real one arrives the divider has to be re-applied, or the top pane keeps the stale position and
+        /// overruns the titlebar, and the next window resize falls back to SwiftUI's own even split of the
+        /// content space (#539). SwiftUI also redistributes a resize by its own rule: one shrink below the
+        /// second pane's extent leaves the primary pane at zero (#691).
         private func restoreDivider() {
             guard !suspended, let split = splitView else { return }
-            let safeAreaTop = split.safeAreaInsets.top
-            if restored, safeAreaTop != restoredSafeAreaTop { restored = false }
+            if restored, geometryChanged(in: split) { restored = false }
             guard !restored else { return }
             guard axisLength(of: split) > 1 else { return } // wait for a real extent
             // a never-set ratio is seeded rather than left to the mount, which is uneven in content space
             let ratio = session.splitRatio ?? AppStore.splitRatioDefault
             // marked applied BEFORE the move: `setPosition` posts `didResizeSubviews` synchronously, and
-            // `rearmOnInsetChange` would otherwise re-arm off the very inset this pass is applying.
+            // `rearmOnGeometryChange` would otherwise re-arm off the very geometry this pass is applying.
             restored = true
-            restoredSafeAreaTop = safeAreaTop
+            restoredSafeAreaTop = split.safeAreaInsets.top
+            restoredAxisLength = axisLength(of: split)
             split.setPosition(dividerPosition(for: ratio, in: split), ofDividerAt: 0)
             session.splitRatio = ratio
         }
 
-        /// Catch the inset change from the split's own resize notification, because macOS 27 never re-enters
-        /// `layout()` on the reveal path where a restored background split becomes the visible one (#539).
+        private func geometryChanged(in split: NSSplitView) -> Bool {
+            split.safeAreaInsets.top != restoredSafeAreaTop || axisLength(of: split) != restoredAxisLength
+        }
+
+        /// Catch the geometry change from the split's own resize notification, because macOS 27 never
+        /// re-enters `layout()` on the reveal path where a restored background split becomes the visible one
+        /// (#539).
         ///
         /// The re-apply is deferred a runloop turn rather than done here: that reveal delivers two
         /// notifications, and the second puts the divider back where the first found it, so moving it
-        /// synchronously at the first is reverted with `restoredSafeAreaTop` already up to date and nothing
+        /// synchronously at the first is reverted with the recorded geometry already up to date and nothing
         /// left to re-arm.
-        private func rearmOnInsetChange() {
+        private func rearmOnGeometryChange() {
             guard !suspended, restored, let split = splitView else { return }
-            guard split.safeAreaInsets.top != restoredSafeAreaTop else { return }
-            // an inset change mid-drag would drop the drag at `capture()`'s `restored` gate and snap the
-            // divider to the stored ratio a turn later, under the user's grip. Skipping leaves
-            // `restoredSafeAreaTop` stale, which costs nothing: it still differs, so a later pass re-arms.
+            guard geometryChanged(in: split) else { return }
+            // a change mid-drag would drop the drag at `capture()`'s `restored` gate and snap the divider to
+            // the stored ratio a turn later, under the user's grip. Skipping leaves the recorded geometry
+            // stale, which costs nothing: it still differs, so a later pass re-arms.
             guard !dividerDragging else { return }
             restored = false
             DispatchQueue.main.async { [weak self] in self?.restoreDivider() }
@@ -180,6 +201,7 @@ struct SplitRatioAccessor: NSViewRepresentable {
             if splitView !== enclosing { detach() }
             guard splitView == nil, let split = enclosing else { return }
             splitView = split
+            updateNativeDividerCursor()
             resizeObserver = NotificationCenter.default.addObserver(
                 forName: NSSplitView.didResizeSubviewsNotification, object: split, queue: .main) { [weak self] _ in
                 // the observer fires on the main queue; assume the main actor to call the @MainActor
@@ -187,8 +209,9 @@ struct SplitRatioAccessor: NSViewRepresentable {
                 MainActor.assumeIsolated {
                     // before `capture()`, whose `restored` gate then skips the pass whose divider this
                     // re-arm is about to re-apply, rather than reading the frame it is about to replace.
-                    self?.rearmOnInsetChange()
+                    self?.rearmOnGeometryChange()
                     self?.capture()
+                    self?.updateDividerStrip()
                 }
             }
             // `session.resize` stores a new fraction on the session and posts this (object-scoped to the
@@ -209,6 +232,9 @@ struct SplitRatioAccessor: NSViewRepresentable {
             applyObserver = nil
             if let split = splitView, dividerClipMask != nil { split.layer?.mask = nil }
             dividerClipMask = nil
+            dividerStrip?.removeFromSuperlayer()
+            dividerStrip = nil
+            if let splitView { SplitCursorRects.setSuppressed(false, for: splitView) }
             splitView = nil
             restored = false
         }
@@ -255,9 +281,14 @@ struct SplitRatioAccessor: NSViewRepresentable {
             dividerTracking = area
         }
 
-        /// Paint ↔ over the divider. Nothing else does once a second session is mounted: the pane declines the
-        /// band (`ownsPointer`) and AppKit's own divider cursor never fires there, leaving the arrow. Per move
-        /// plus one deferred re-assert, as the cursor section of `.claude/rules/libghostty.md` requires.
+        /// An off-screen split's AppKit divider rect paints ↔ over the session on screen; see `SplitCursorRects`.
+        private func updateNativeDividerCursor() {
+            guard let splitView else { return }
+            SplitCursorRects.setSuppressed(!deckVisible, for: splitView)
+        }
+
+        /// Paint ↔ over the divider, which the pane declines (`ownsPointer`). Per move plus one deferred
+        /// re-assert, as the cursor section of `.claude/rules/libghostty.md` requires.
         override func mouseMoved(with event: NSEvent) { paintDividerCursor(at: event.locationInWindow) }
         override func cursorUpdate(with event: NSEvent) { paintDividerCursor(at: event.locationInWindow) }
 
@@ -399,6 +430,29 @@ struct SplitRatioAccessor: NSViewRepresentable {
                 dividerClipMask = mask
             }
             split.layer?.mask = mask // re-assert (SwiftUI may rebuild the split's layer)
+        }
+
+        /// Cover the gap between the two arranged panes with `dividerColor`. The split is flipped and so is
+        /// its layer's geometry, so the gap in view coordinates is the strip's frame on either axis. AppKit
+        /// draws its own divider as a later sibling, an `NSSplitDividerView` layer or a divider layer at
+        /// `zPosition` 5000 depending on the split's mode, so the strip sits one above the highest sibling.
+        private func updateDividerStrip() {
+            guard let split = splitView, split.arrangedSubviews.count == 2 else { return }
+            split.wantsLayer = true
+            guard let host = split.layer else { return }
+            let first = split.arrangedSubviews[0].frame, second = split.arrangedSubviews[1].frame
+            let frame = split.isVertical
+                ? CGRect(x: first.maxX, y: 0, width: max(0, second.minX - first.maxX), height: split.bounds.height)
+                : CGRect(x: 0, y: first.maxY, width: split.bounds.width, height: max(0, second.minY - first.maxY))
+            let strip = dividerStrip ?? CALayer()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true) // no implicit animation chasing a drag
+            strip.zPosition = (host.sublayers ?? []).filter { $0 !== strip }.map(\.zPosition).max().map { $0 + 1 } ?? 0
+            strip.frame = frame
+            strip.backgroundColor = dividerColor.cgColor
+            CATransaction.commit()
+            dividerStrip = strip
+            if strip.superlayer !== host { host.addSublayer(strip) } // re-assert, as the clip mask does
         }
 
         /// Record the dragged primary-pane fraction onto the session. A resize notification outside a drag

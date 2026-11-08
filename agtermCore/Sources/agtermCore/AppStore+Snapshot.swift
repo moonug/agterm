@@ -17,12 +17,14 @@ extension AppStore {
         let focusIDs = workspaces.map(\.id).filter(focusedWorkspaceIDs.contains)
         let persistable = Set(workspaceSnapshots.flatMap(\.sessions).map(\.id))
         let recency = sessionRecency.items.filter(persistable.contains)
+        let flaggedIDs = orderedFlaggedSessions.map(\.id).filter(persistable.contains)
         return Snapshot(selectedSessionID: persistedSelection(among: persistable, recency: recency),
                         workspaces: workspaceSnapshots,
                         sidebarWidth: sidebarWidth, sidebarVisible: sidebarVisible, sidebarMode: sidebarMode,
                         focusedWorkspaceIDs: focusIDs.isEmpty ? nil : focusIDs,
                         focusEnabled: focusEnabled ? true : nil,
-                        sessionRecency: recency)
+                        sessionRecency: recency,
+                        flaggedOrder: flaggedIDs.isEmpty ? nil : flaggedIDs)
     }
 
     /// The selection to write. A remote session is not in the snapshot, so naming it would restore an empty
@@ -35,7 +37,14 @@ extension AppStore {
     }
 
     func sessionSnapshot(_ session: Session) -> SessionSnapshot {
-        SessionSnapshot(id: session.id, paneIdentity: session.paneIdentity,
+        // a page owns no pane, so it writes no identity a daemon claim or inventory could read
+        if let page = session.pageSnapshot {
+            return SessionSnapshot(id: session.id, customName: session.customName, cwd: session.currentCwd ?? session.initialCwd,
+                                   flagged: session.flagged, context: session.context,
+                                   lastSelectedAt: session.lastSelectedAt?.timeIntervalSince1970, tint: session.tint,
+                                   parentID: session.parentID, collapsed: session.isExpanded ? nil : true, page: page)
+        }
+        return SessionSnapshot(id: session.id, paneIdentity: session.paneIdentity,
                         splitPaneIdentity: session.hasSplit ? session.splitPaneIdentity : nil,
                         customName: session.customName, cwd: session.currentCwd ?? session.initialCwd,
                         isSplit: session.isSplit, hasSplit: session.hasSplit ? true : nil,
@@ -49,9 +58,13 @@ extension AppStore {
                         splitInitialCommand: session.splitInitialCommand,
                         splitCommandWait: session.splitCommandWait ? true : nil,
                         backgroundWatermark: session.backgroundWatermark,
+                        paneBackgrounds: session.paneBackgrounds.persisted,
                         restoreCommand: session.restoreCommand,
                         splitRestoreCommand: session.splitRestoreCommand,
-                        context: session.context)
+                        context: session.context,
+                        lastSelectedAt: session.lastSelectedAt?.timeIntervalSince1970,
+                        tint: session.tint, parentID: session.parentID,
+                        collapsed: session.isExpanded ? nil : true)
     }
 
     /// The single workspace-to-disk producer, used by the launch snapshot and by a closed workspace's
@@ -60,7 +73,7 @@ extension AppStore {
     func workspaceSnapshot(_ workspace: Workspace) -> WorkspaceSnapshot {
         WorkspaceSnapshot(id: workspace.id, name: workspace.name,
                           sessions: workspace.sessions.filter(\.isPersistable).map(sessionSnapshot),
-                          collapsed: workspace.isExpanded ? nil : true)
+                          collapsed: workspace.isExpanded ? nil : true, tint: workspace.tint)
     }
 
     /// Rebuilds one session from its snapshot. `launchRestore` marks an APP-BOOTSTRAP restore, the only path
@@ -76,6 +89,7 @@ extension AppStore {
     /// A hidden split keeps its identity and restore state so showing it reattaches the surviving daemon;
     /// focus is intentionally not persisted and therefore returns to the primary pane.
     func session(from snapshot: SessionSnapshot, launchRestore: Bool = false) -> Session {
+        if snapshot.page != nil { return pageSession(from: snapshot) }
         let hasSplit = (snapshot.isSplit ?? false) || (snapshot.hasSplit ?? false)
         let session = Session(id: snapshot.id, initialCwd: snapshot.cwd, customName: snapshot.customName,
                               paneIdentity: snapshot.paneIdentity ?? UUID(),
@@ -88,12 +102,18 @@ extension AppStore {
         session.splitRatio = snapshot.splitRatio.map { min(AppStore.splitRatioMax, max(AppStore.splitRatioMin, $0)) }
         session.flagged = snapshot.flagged ?? false
         session.context = snapshot.context
+        session.tint = snapshot.tint
+        session.parentID = snapshot.parentID
+        session.isExpanded = !(snapshot.collapsed ?? false)
+        session.lastSelectedAt = snapshot.lastSelectedAt.map(Date.init(timeIntervalSince1970:))
         session.initialCommand = snapshot.initialCommand
         session.commandWait = snapshot.commandWait ?? false
         session.splitInitialCommand = hasSplit ? snapshot.splitInitialCommand : nil
         session.splitCommandWait = hasSplit ? (snapshot.splitCommandWait ?? false) : false
         session.wasRestored = true
         session.backgroundWatermark = snapshot.backgroundWatermark
+        session.paneBackgrounds = PaneBackgrounds(left: snapshot.paneBackgrounds?.left,
+                                                  right: hasSplit ? snapshot.paneBackgrounds?.right : nil)
         session.restoreCommand = snapshot.restoreCommand
         session.splitRestoreCommand = hasSplit ? snapshot.splitRestoreCommand : nil
         if launchRestore {
@@ -110,8 +130,92 @@ extension AppStore {
         return session
     }
 
+    // the page itself opens once the row is in the tree, through `openRestoredPages`
+    private func pageSession(from snapshot: SessionSnapshot) -> Session {
+        let session = Session(id: snapshot.id, initialCwd: snapshot.cwd, customName: snapshot.customName, content: .page)
+        session.flagged = snapshot.flagged ?? false
+        session.context = snapshot.context
+        session.tint = snapshot.tint
+        session.parentID = snapshot.parentID
+        session.isExpanded = !(snapshot.collapsed ?? false)
+        session.lastSelectedAt = snapshot.lastSelectedAt.map(Date.init(timeIntervalSince1970:))
+        session.wasRestored = true
+        return session
+    }
+
+    /// openRestoredPages opens the saved page of every restored page row of `snapshots` now in the tree, in any
+    /// restart mode. Nothing checks the source first: a missing file or a failed load leaves the row with its
+    /// page in the failed state and its reload.
+    func openRestoredPages(_ snapshots: [SessionSnapshot]) {
+        for snapshot in snapshots {
+            guard let page = snapshot.page, let session = session(withID: snapshot.id), session.content == .page,
+                  session.htmlOverlay == nil else { continue }
+            _ = openHtmlOverlay(session.id, pane: nil, overlay: page.makeOverlay(), sizePercent: nil,
+                                backgroundColor: page.backgroundColor)
+        }
+    }
+
     func workspace(from snapshot: WorkspaceSnapshot) -> Workspace {
-        Workspace(id: snapshot.id, name: snapshot.name, sessions: snapshot.sessions.map { session(from: $0) },
-                  isExpanded: !(snapshot.collapsed ?? false))
+        Workspace(id: snapshot.id, name: snapshot.name,
+                  sessions: Self.regroupedCompanions(snapshot.sessions.map { session(from: $0) }),
+                  isExpanded: !(snapshot.collapsed ?? false), tint: snapshot.tint)
+    }
+
+    /// Rebuilds the tree from a snapshot: fresh `Session`s (surfaces and shells spawn lazily on first
+    /// display) keyed by the persisted ids so the restored `selectedSessionID` still resolves, replacing the
+    /// current state wholesale. A persisted selection pointing at a session that no longer exists is cleared.
+    /// Deliberately does NOT call `save()` — it loads what was just read from disk; the closing
+    /// `reselectIfSelectionHidden` is the exception, since repairing a stranded selection is worth writing.
+    /// `launchRestore` marks an APP-BOOTSTRAP restore, the only thing that arms anything executable — a
+    /// persisted `session.restore` override and the captured `foregroundCommand`/`splitForegroundCommand`.
+    /// It defaults to false because reopening a closed window mid-process reloads its store through here,
+    /// and that RUNTIME caller must not execute anything.
+    public func restore(from snapshot: Snapshot, launchRestore: Bool = false) {
+        // to the end: the closing repair of a hidden selection is part of the reload too
+        restoringSelection = true
+        defer { restoringSelection = false }
+        freshWorkspaceID = nil // live create-time state, never restored from disk
+        // fold duplicate workspace ids into the first occurrence and keep only the first snapshot of a
+        // repeated session id, else the rest stay unreachable past the first match and get re-saved.
+        var seenSessionIDs: Set<UUID> = []
+        workspaces = snapshot.workspaces.reduce(into: [Workspace]()) { restored, workspaceSnapshot in
+            let sessions = workspaceSnapshot.sessions
+                .filter { seenSessionIDs.insert($0.id).inserted }
+                .map { session(from: $0, launchRestore: launchRestore) }
+            if let existing = restored.firstIndex(where: { $0.id == workspaceSnapshot.id }) {
+                restored[existing].sessions.append(contentsOf: sessions)
+                return
+            }
+            // absent/nil collapsed → expanded (back-compat with snapshots written before the field existed).
+            restored.append(Workspace(id: workspaceSnapshot.id, name: workspaceSnapshot.name, sessions: sessions,
+                                      isExpanded: !(workspaceSnapshot.collapsed ?? false),
+                                      tint: workspaceSnapshot.tint))
+        }
+        for index in workspaces.indices {
+            workspaces[index].sessions = Self.regroupedCompanions(workspaces[index].sessions)
+        }
+        openRestoredPages(snapshot.workspaces.flatMap(\.sessions))
+        // clamp on restore (not just nil-default) so a corrupt or hand-edited snapshot can't drive an
+        // out-of-range frame width; the drag and `sidebar.width` clamp to the same bounds.
+        sidebarWidth = AppStore.clampSidebarWidth(snapshot.sidebarWidth ?? AppStore.sidebarWidthDefault)
+        sidebarVisible = snapshot.sidebarVisible ?? true
+        sidebarMode = snapshot.sidebarMode ?? .tree
+        restoreFlaggedOrder(snapshot.flaggedOrder)
+        restoreFocus(from: snapshot)
+        if let id = snapshot.selectedSessionID, session(withID: id) == nil {
+            selectedSessionID = nil
+        } else {
+            selectedSessionID = snapshot.selectedSessionID
+        }
+        replaceSidebarSelection(with: selectedSessionID)
+        // re-seed the Ctrl-Tab order from the persisted list (dropping ids not in the restored tree); the
+        // restored selection floats to the front, keeping the "previous session" slot truthful.
+        let restoredIDs = Set(workspaces.flatMap(\.sessions).map(\.id))
+        sessionRecency = RecencyStack(items: (snapshot.sessionRecency ?? []).filter { restoredIDs.contains($0) })
+        recordRecency()
+        // LAST, after the recency stack is re-seeded: the pick is MRU, so earlier finds an empty stack.
+        reselectIfSelectionHidden()
+        // a reload is not a pane selection either
+        paneFocusBaseline = selectedPaneIdentities()
     }
 }

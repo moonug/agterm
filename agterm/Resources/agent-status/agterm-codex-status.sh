@@ -27,12 +27,14 @@ report_status() {
 }
 
 assistant_message_contains_question() {
-  local message prose question
+  local message prose question quoted_mark
   message=$(/usr/bin/plutil -extract last_assistant_message raw -o - - 2>/dev/null) || return 1
+  # a ? that opens quoted text ("? for shortcuts") ends no word, yet its opener would pass as one
+  quoted_mark=$'s/(^|[[:space:]])([“‘"\'([*_]+)\\?/\\1\\2/g'
   # a span becomes a word rather than nothing so "run `make test`?" keeps its ? attached
   prose=$(printf '%s\n' "$message" \
     | /usr/bin/awk '/^[[:space:]]*```/ { fenced = !fenced; next } !fenced' \
-    | /usr/bin/sed 's/`[^`]*`/code/g')
+    | /usr/bin/sed -E -e 's/`[^`]*`/code/g' -e "$quoted_mark")
   # bash 3.2 cannot parse this bracket set inline in [[ ]]
   question=$'[^[:space:]]\\?[]"\')*_!’”]*([[:space:]]|$)'
   [[ "$prose" =~ $question ]]
@@ -72,9 +74,9 @@ watch_for_blocker() {
   local token=${1:-} token_file=${2:-}
   [ -n "$token" ] && [ -n "$token_file" ] || return 0
 
-  local max_checks=${AGTERM_CODEX_WATCH_MAX_CHECKS:-21600}
-  local interval=${AGTERM_CODEX_WATCH_INTERVAL:-0.5}
-  case "$max_checks" in ''|*[!0-9]*) max_checks=21600 ;; esac
+  local max_checks=${AGTERM_CODEX_WATCH_MAX_CHECKS:-5400}
+  local interval=${AGTERM_CODEX_WATCH_INTERVAL:-2}
+  case "$max_checks" in ''|*[!0-9]*) max_checks=5400 ;; esac
 
   local checks=0 prompt_was_visible=0 current_token screen footer
   while [ "$checks" -lt "$max_checks" ]; do
@@ -114,6 +116,16 @@ if [ "$action" = "__watch-blocked" ]; then
   watch_for_blocker "${1:-}" "${2:-}"
   exit 0
 fi
+
+case "$action" in
+  session-start|user-prompt-submit|pre-tool-use|post-tool-use)
+    # codex's memory consolidation thread reaches these hooks but no user Stop handler, so its
+    # events would leave the pane active and replace the foreground watcher. it is ephemeral, so its
+    # transcript_path is null, which plutil types as "(any)". foreground ephemeral sessions lose
+    # these updates too.
+    [ "$(/usr/bin/plutil -type transcript_path - 2>/dev/null)" = "(any)" ] && exit 0
+    ;;
+esac
 
 case "$action" in
   session-start)

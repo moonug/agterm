@@ -142,6 +142,37 @@ struct ControlDispatcherPickTests {
         #expect(actions.calls.isEmpty)
     }
 
+    @Test(arguments: [
+        (ControlPickItem(id: "a", label: "A", status: "busy"), "invalid pick item status (idle|active|completed|blocked)"),
+        (ControlPickItem(id: "a", label: "A", status: "blocked", statusColor: "red"), "invalid pick item color (expected #rrggbb)"),
+        (ControlPickItem(id: "a", label: "A", status: "active", statusShape: "hexagon"),
+         "invalid pick item shape (circle|square|triangle|triangle-down|play|diamond|capsule|seal|star|bolt|bell)"),
+    ])
+    func openRejectsAnInvalidItemStatusWithoutCallingHost(item: ControlPickItem, error: String) async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(cmd: .pickOpen, args: ControlArgs(items: [item])))
+
+        #expect(response == ControlResponse(ok: false, error: error))
+        #expect(actions.calls.isEmpty)
+    }
+
+    @Test func openPassesItemStatusThrough() async throws {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        let items = [ControlPickItem(id: "one", label: "One", status: "completed", statusColor: "#00aa00", statusShape: "star"),
+                     ControlPickItem(id: "two", label: "Two", status: "idle")]
+
+        _ = await dispatcher.dispatch(ControlRequest(cmd: .pickOpen, args: ControlArgs(items: items)))
+
+        guard case let .pickOpen(pick, _, _) = try #require(actions.calls.first) else {
+            Issue.record("expected pick.open host call")
+            return
+        }
+        #expect(pick.items == items)
+    }
+
     @Test func resultAndCancelRejectMissingTargetWithoutCallingHost() async {
         let actions = MockControlActions()
         let dispatcher = ControlDispatcher(actions: actions)
@@ -210,6 +241,44 @@ struct ControlDispatcherPickTests {
         }
         #expect(withQuery.query == "current name")
         #expect(withoutQuery.query == nil)
+    }
+
+    @Test func openPassesSelectionThroughAndLeavesItNilWhenOmitted() async throws {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        let items = [ControlPickItem(id: "one", label: "One"), ControlPickItem(id: "two", label: "Two")]
+
+        _ = await dispatcher.dispatch(ControlRequest(cmd: .pickOpen, args: ControlArgs(items: items, selection: "two")))
+        _ = await dispatcher.dispatch(ControlRequest(cmd: .pickOpen, args: ControlArgs(items: items)))
+
+        #expect(actions.calls.count == 2)
+        guard case let .pickOpen(seeded, _, _) = try #require(actions.calls.first),
+              case let .pickOpen(omitted, _, _) = try #require(actions.calls.last) else {
+            Issue.record("expected two pick.open host calls")
+            return
+        }
+        #expect(seeded.selection == "two")
+        #expect(omitted.selection == nil)
+    }
+
+    @Test func openRejectsASelectionNamingNoItemWithoutCallingHost() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        let items = [ControlPickItem(id: "one", label: "One")]
+
+        let unknown = await dispatcher.dispatch(ControlRequest(
+            cmd: .pickOpen,
+            args: ControlArgs(items: items, selection: "two")
+        ))
+        let itemless = await dispatcher.dispatch(ControlRequest(
+            cmd: .pickOpen,
+            args: ControlArgs(items: [], allowCustom: true, selection: "one")
+        ))
+
+        let expected = ControlResponse(ok: false, error: "pick select must name an item id")
+        #expect(unknown == expected)
+        #expect(itemless == expected, "a text prompt has no rows to open on")
+        #expect(actions.calls.isEmpty)
     }
 
     @Test func resultRoutesTargetAndReturnsNestedPickResponse() async {

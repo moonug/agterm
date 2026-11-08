@@ -34,6 +34,8 @@ extension AppActions {
               window.firstResponder is NSText else { return }
         if let editor = window.firstResponder as? NSTextView, let field = editor.delegate as? NSTextField,
            (field.delegate as? SidebarRenameController)?.isEditing == true { return }
+        let catchers = AskKeyCatcher.KeyCatcherView.sessionCatchers.objectEnumerator()?.allObjects as? [AskKeyCatcher.KeyCatcherView]
+        if catchers?.contains(where: { $0.holds(window.firstResponder) }) == true { return }
         window.makeFirstResponder(nil)
     }
 
@@ -53,16 +55,24 @@ extension AppActions {
     func escapePendingAsk(for windowID: WindowInfo.ID?) -> Bool {
         guard let controller = PickRegistry.shared.controller(for: windowID),
               controller.pendingAsk != nil else { return false }
+        let window = NSApp.windows.first { WindowRegistry.shared.windowID(for: $0) == windowID }
+        if let responder = window?.firstResponder, AskEditorBox.isAskEditor(responder), composing(responder) { return true }
         controller.escapeAsk()
         return true
     }
 
-    /// Dismisses only the session dialog currently eligible to receive keys.
+    /// Dismisses only the session dialog currently eligible to receive keys. A dialog whose editor is mid
+    /// composition keeps the chord without closing, so the close ladder never reaches the session behind it.
     func escapePendingSessionAsk() -> Bool {
         guard let session = store?.activeSession, let ask = session.askPending,
               let catcher = AskKeyCatcher.KeyCatcherView.sessionCatchers.object(forKey: session.id as NSUUID),
               catcher.canFocus else { return false }
+        if let responder = catcher.window?.firstResponder, catcher.holds(responder), composing(responder) { return true }
         return session.resolveAsk(id: ask.id, ControlAskResult(result: .escaped))
+    }
+
+    private func composing(_ responder: NSResponder?) -> Bool {
+        (responder as? NSTextView)?.hasMarkedText() == true
     }
 
     /// Whether terminal zoom is active in the window OWNING this session — the right gate for the
@@ -123,6 +133,8 @@ extension AppActions {
         // a no-op unless the status needs attention: the scratch-hide / split-focus side effects must never
         // fire on plain navigation to a still-active session, or one merely showing its keep-alive scratch.
         guard indicator.status.needsAttention else { focusActiveSession(); return }
+        // a mirrored status for a pane with no counterpart here names no pane to reveal
+        guard session.remotePresentation?.statusOwnerUnknown != true else { focusActiveSession(); return }
         let pane = indicator.statusPane
         // a shown scratch masks a non-scratch block; overlays are deliberately left alone.
         if pane != .scratch, session.scratchActive { store?.toggleScratch(session.id) }
@@ -139,16 +151,31 @@ extension AppActions {
         }
     }
 
-    /// Front and focus the window a recent-closed reopen restored into. The id is published here rather
-    /// than left to the key-window report, which `focusActiveSession` would otherwise outrun; publishing it
-    /// also has to save and post, because `WindowAccessor.reportFrontmost` gates both on the id having
-    /// changed and this assignment already made it equal.
-    func revealRestoredWindow(_ id: WindowInfo.ID) {
-        if library.frontmostWindowID != id {
-            library.frontmostWindowID = id
-            library.saveIndex()
-            NotificationCenter.default.post(name: .agtermWindowFrontmostChanged, object: nil)
+    /// Whether an attention row can be acted on right now: its window open and not under a cover, its
+    /// session still there. Asked at render and again at the pick, since a row outlives all three.
+    func canSelectAttention(windowID: WindowInfo.ID, sessionID: UUID) -> Bool {
+        uiActionsEnabled(for: windowID) && library.store(for: windowID)?.session(withID: sessionID) != nil
+    }
+
+    /// Select a row of the cross-window attention list and reveal its pane, raising its window first when it
+    /// is not the active one so `store` resolves there. A raise that fails (the window still attaching)
+    /// drops the pick as a window step does.
+    func selectAttention(windowID: WindowInfo.ID, sessionID: UUID) {
+        guard canSelectAttention(windowID: windowID, sessionID: sessionID),
+              let target = library.store(for: windowID) else { return }
+        if windowID != library.activeWindowID {
+            guard WindowRegistry.shared.raise(windowID) else { return }
+            takeFrontmost(windowID)
         }
+        target.noteUserActivity()
+        let indicator = target.selectSession(sessionID)
+        revealActiveBlockedPane(captured: indicator)
+    }
+
+    /// revealRestoredWindow fronts the window a recent-closed reopen restored into. It publishes the id
+    /// itself, since `focusActiveSession` would outrun the key-window report.
+    func revealRestoredWindow(_ id: WindowInfo.ID) {
+        takeFrontmost(id)
         _ = WindowRegistry.shared.raise(id)
         focusActiveSession()
     }
@@ -168,7 +195,8 @@ extension AppActions {
         if palette?.mode != nil { return }
         if pickActive(for: library.activeWindowID) { return }
         if quickTerminal.holdsKey { return }
-        if let view = store?.activeSession?.topmostSurface as? GhosttySurfaceView, let window = view.window {
+        let pageCovers = store?.activeSession.map { HtmlOverlayRegistry.shared.focusCover(of: $0) } ?? false
+        if !pageCovers, let view = store?.activeSession?.topmostSurface as? GhosttySurfaceView, let window = view.window {
             guard !view.deferFocusToAsk() else { return }
             window.makeFirstResponder(view)
         }
@@ -222,7 +250,10 @@ extension AppActions {
         // the quick-terminal panel owns focus above EVERY window, not just this session's; its own hide
         // restores the session.
         if quickTerminal.holdsKey { return }
-        if let view = session.focusTarget(wantSplit: wantSplit) as? GhosttySurfaceView, let window = view.window {
+        let pane: OverlayPane = wantSplit ? .right : .left
+        let pageMayCover = session.coverOverlayVisible || (session.paneOverlayVisible(pane) && session.paneOverlayIsHtml(pane))
+        let pageCovers = pageMayCover && HtmlOverlayRegistry.shared.focusCover(of: session)
+        if !pageCovers, let view = session.focusTarget(wantSplit: wantSplit) as? GhosttySurfaceView, let window = view.window {
             guard !view.deferFocusToAsk() else { return }
             window.makeFirstResponder(view)
         }

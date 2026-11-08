@@ -46,7 +46,7 @@ extension WindowContentView {
                 } label: {
                     Image(systemName: "arrow.down.right.and.arrow.up.left")
                 }
-                .help("Exit Terminal Zoom")
+                .toolTip("Exit Terminal Zoom", isShown: titlebarTipsShown)
                 .accessibilityLabel("Exit Terminal Zoom")
                 .accessibilityIdentifier("terminal-zoom-exit")
                 .padding(.trailing, 14)
@@ -144,10 +144,12 @@ extension WindowContentView {
             TerminalView(session: session, surfaceKeyPath: \.surface, makeSurface: makeSurface,
                          isActive: true, deckVisible: true, reportsFocusChange: false)
                 .id("\(primarySurfaceID(session))-zoom-\(hostToken)")
+                .overlay { PaneLeadCover(session: session, pane: .left, background: terminalColor, foreground: chromeText) }
         case .split:
             TerminalView(session: session, surfaceKeyPath: \.splitSurface, makeSurface: makeSplitSurface,
                          isActive: true, deckVisible: true, reportsFocusChange: false)
                 .id("\(session.id.uuidString)-zoom-split-\(hostToken)")
+                .overlay { PaneLeadCover(session: session, pane: .right, background: terminalColor, foreground: chromeText) }
         case .scratch:
             TerminalView(session: session, surfaceKeyPath: \.scratchSurface, makeSurface: makeScratchSurface,
                          isActive: true, deckVisible: true, reportsFocusChange: false)

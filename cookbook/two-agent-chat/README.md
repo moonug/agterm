@@ -2,7 +2,11 @@
 
 Let Claude Code and Codex hold a conversation with each other in one agterm split.
 
+Author: [@umputun](https://github.com/umputun)
+
 *A simplified version of the setup I run myself, cut down to the part worth publishing. Tested for real, with two agents talking to each other through it, but this is a first version and it will be updated as it gets used.*
+
+*[two-agent-mailbox-chat](../two-agent-mailbox-chat/) does the same job through agterm's pane mailboxes instead of typing into the composer, and is the recommended replacement.*
 
 ## What it does
 
@@ -23,7 +27,7 @@ agterm 0.24.0 or later, which added `surface cursor`. The recipe refuses to type
 1. Copy `peer-chat.py` somewhere on your `PATH`, keeping the executable bit.
 2. Copy `SKILL-claude.md` to `~/.claude/skills/peer-chat/SKILL.md` and `SKILL-codex.md` to `~/.codex/skills/peer-chat/SKILL.md`. Both loaders require the installed file to be named exactly `SKILL.md`, so the suffix here only says which agent the file is for. Each one tells its own agent how to send, how to recognise an incoming message, and what it may not do to the other pane.
 3. Keep `peer-chat.py` on your `PATH`: both skills invoke it as a bare command and name no path. If you install it somewhere off `PATH` instead, prefix the command lines in both copies with its full path.
-4. If you start either agent through a wrapper script instead of as `claude` or `codex`, put that wrapper's name in the same file, as the `--target-command` value the agent should pass when sending to it. Without this the first send refuses, saying the target pane is not running the expected command.
+4. If you start either agent through a wrapper script instead of as `claude` or `codex`, put that wrapper's name in the same file, as the `--target-command` value the agent should pass when sending to it. Without this the first send refuses, saying the target pane is not running the expected command. If you also arrange the split the other way round, the sender must recognise its own wrapper on the target's usual side: set `PEER_CHAT_CLAUDE_COMMAND` or `PEER_CHAT_CODEX_COMMAND` to the wrapper's name in that agent's environment, for Codex through `shell_environment_policy.set` as in step 6. `--target-command` cannot do this, since it names the target.
 5. To let Codex reserve and send file-backed messages without separate approvals, add these two entries to `~/.codex/rules/default.rules`, creating the file if needed and using the command name or path from step 1:
 
    ```python
@@ -37,7 +41,7 @@ If your `agtermctl` is not on `PATH` under that name, set `AGTERMCTL` to its ful
 
 ## Usage
 
-Open a split in the session you want to use, then start one agent in each pane yourself: Claude Code on the left, Codex on the right. Neither the script nor the skills start an agent, by design.
+Open a split in the session you want to use, then start one agent in each pane yourself: Claude Code in one and Codex in the other, either way round. Neither the script nor the skills start an agent, by design.
 
 Ask either agent to talk to the other, and it sends through the script:
 
@@ -47,7 +51,7 @@ your message as one paragraph
 MSG
 ```
 
-`--to claude` sends the other way. `--session` names a session explicitly; without it the script uses `AGTERM_SESSION_ID` when the caller has one, and otherwise looks for a single session whose target pane is running the expected agent. An explicit session is found across open windows, while `--window` constrains the lookup. The resolved window id stays pinned for the full send.
+`--to claude` sends the other way. Either agent can sit in either pane. The script looks for the target on its usual side first, Claude Code on the left and Codex on the right, and takes the other side only when the usual one runs the other agent, since anything else there could be the sender. Agents are recognised by name in the command lines agterm reports. When the usual side names both, as a launch prompt that mentions the other agent does, it gives way only if the program it runs is plainly the other agent, and otherwise keeps the send as before. In a Claude Code and Codex pair, a launch command that still misleads the script makes the send fail its prompt check after the retries instead of typing. `--session` names a session explicitly; without it the script uses `AGTERM_SESSION_ID` when the caller has one, and otherwise looks for a single session whose target pane is running the expected agent. An explicit session is found across open windows, while `--window` constrains the lookup. The resolved window id stays pinned for the full send.
 
 Claude Code normally sends to Codex with Return, the key Codex uses for steering an active turn. Codex can still queue it when its current state cannot accept a steer. Add `--queue` only for an informational note that can wait until the turn ends:
 
@@ -79,13 +83,15 @@ your message as one paragraph
 MSG
 ```
 
-A path works as well as a bare name; only the last component is compared. `PEER_CHAT_CLAUDE_COMMAND` and `PEER_CHAT_CODEX_COMMAND` do the same thing through the environment, for an agent that cannot easily add a flag. Only the pane being sent to is checked, so a wrapped Claude Code can still send to a plain Codex without any of this.
+A path works as well as a bare name; only the last component is compared. `PEER_CHAT_CLAUDE_COMMAND` and `PEER_CHAT_CODEX_COMMAND` do the same thing through the environment, for an agent that cannot easily add a flag. In the usual layout only the pane being sent to is checked, so a wrapped Claude Code can still send to a plain Codex without any of this. A reversed split also needs the sender's own wrapper name, as *Setup* step 4 describes.
 
 On success it prints `{"sent": N}` and exits 0. Any refusal or failure exits 1 with the reason on stderr, and an interrupt exits 130.
 
 ## How it works
 
 The message is typed into the other pane's composer through `agtermctl session type --stdin`, which treats a newline as Return. The script collapses the message to one paragraph and packs words into UTF-8-safe events. Each body event ends with a short marker absent from the message, and the complete event stays within 197 bytes. A live boundary test accepted a 1,627-byte event and began losing 1,022-byte windows at 1,663 bytes; the smaller cap also keeps one event visible in a narrow Claude composer. After every event the script waits for the marked composer to settle, checks the newly visible tail against that event and an overlap from the preceding text, backspaces the marker, and confirms its removal. The comparison permits a source space to become a terminal wrap, so it still works after the opening text has scrolled out of view. If a clipped periodic tail could represent either complete input or a truncated current event, the script refuses the send. The final unmarked body must stay settled for 500 ms before the script sends the submit key separately and confirms that the body cleared.
+
+Codex 0.162.1 draws an `↑` in the right margin of the first visible composer row when earlier rows have scrolled out of view. The screen read-back includes that decoration, so body verification and cleanup also try the row without its final arrow. That reading is accepted only for the first of multiple Codex rows and only when the remaining text matches after a hidden source prefix. The literal reading remains available for arrows in the message.
 
 Before the body request, the script confirms that the target pane runs the expected agent and contains a recognisable composer. `agtermctl surface cursor` must report the caret at column 2. Codex also requires its `Ask Codex to do anything` placeholder because a full-width draft can wrap its caret onto a reserved empty row at column 2. Claude's composer content is not checked before typing: its free-form prompt suggestions look like drafts in plain screen text. Cleanup and post-submit acceptance retain their known-empty content checks: a blank Claude prompt, either shipped queue hint, the `Try "..."` startup suggestion, or Codex's placeholder. It checks the target process once more immediately before each write. The agterm window is fixed before these checks, so changing the frontmost window during a send cannot redirect or strand later pieces. A changed placeholder can still block Codex before typing or prevent either agent from confirming cleanup or submission until the recipe is updated.
 
@@ -97,7 +103,7 @@ Messages carry a label, `Chat from Claude:` or `Chat from Codex:`, which lets th
 
 When the conversation reaches shared files, the agent whose pane received your initiating request is the sole writer for that whole worktree until the task ends or you directly reassign the role using the procedure below. The peer stays read-only there and may inspect, review, or pass a proposed patch through a mode-0600 file reserved with `mktemp /tmp/peer-chat-patch.XXXXXX`; the writer works only from its private verified copy, and each agent deletes its own file by its exact path, never a glob, before reporting an outcome or resuming after an interruption. Peer messages never transfer write authority. This fixed role prevents concurrent edits within one peer-chat task while still letting both agents work on the change.
 
-Sending requires exactly one of `--stdin` and `--message-file NAME`. Both keep the message text out of the process list and protect its punctuation from the shell. `--prepare-message NAME` creates the named file with mode 0600 in a per-user directory with mode 0700. A file-backed send resolves and checks the target session before opening the file. It accepts only a reserved basename and rejects links and non-regular files before removing the directory entry. Files accessible to other users and bodies over 64 KiB are rejected after the entry is removed.
+Sending requires exactly one of `--stdin` and `--message-file NAME`. Both keep the message text out of the process list and protect its punctuation from the shell. `--prepare-message NAME` creates the named file with mode 0600 in a per-user directory with mode 0700. A file-backed send resolves and checks the target session before opening the file. It accepts only a reserved basename and rejects links and non-regular files before claiming the file by renaming it to a per-process name, so a second send of the same name finds nothing. Files accessible to other users and bodies over 64 KiB are rejected after the claim and deleted.
 
 The recipe deliberately does not start agents. Deciding that a pane is safe to type a startup command into means guessing from what the pane has drawn, and agterm reports no foreground process for both an idle shell and a program that hides its argv. Every prompt looks different, so that guess is wrong on somebody's machine, and being wrong means typing a command into whatever holds focus.
 
@@ -113,9 +119,13 @@ The recipe deliberately does not start agents. Deciding that a pane is safe to t
 
 **A busy composer is waited out, but only for about forty seconds.** If the other pane fails its pre-write checks, the script retries five times at ten-second intervals, printing each attempt to stderr, then gives up with exit 1 and types nothing. A pane left sitting on a dialog therefore costs about forty seconds before the send fails instead of blocking forever.
 
-**A multi-row Codex shortcut overlay is treated as busy.** The parser ignores one trailing status row. It does not strip a whole indented region because shortcut rows and modal choices have the same shape; the send therefore retries and refuses until a multi-row overlay closes.
+**Codex footer rows are recognised by position alone.** The parser ignores one trailing footer row, or two when a blank row separates them from the composer, as with a status line above the shortcut hint; the lower of those two may sit further right when typing hides the hint and leaves only a right-aligned notice such as `⚠ 1 warning · f2 to view`. It never strips a longer indented region, because shortcut rows and modal choices have the same shape, so a layout with more trailing rows is treated as busy and the send retries and refuses until it changes.
 
 **Highly repetitive input can be refused after the opening scrolls away.** A rendered suffix such as a long run of one character can align with both the complete message and one missing part of the current event. The script stops and cleans up when it cannot distinguish those states.
+
+**A message to Claude is capped at about 10,000 characters and cannot end in a backslash.** Past that length Claude Code rewrites the draft into its first and last 500 characters around a `[...Truncated text #1 +0 lines...]` marker, which the read-back cannot check against the source or clean up. A trailing `\` followed by Return becomes a line break instead of a submit. The script refuses both before typing anything and consumes a `--message-file` message that it refuses, so shorten or reword it and send it again.
+
+**Scroll-indicator recognition is limited to Codex's top `↑`.** Other rows and the bottom `↓` are compared literally. Plain screen text cannot distinguish a margin indicator from an identical extra arrow typed at that position; the source comparison constrains recognition but cannot prove which one was drawn.
 
 **Rendered text cannot prove every source character.** Agterm exposes the terminal's plain screen text, which omits an ASCII space consumed at a visual line wrap. A correctly wrapped space and a missing space at that exact boundary therefore look identical to the script. The 197-byte event cap avoids the reproduced oversized-event loss, but the read-back is not a byte-level receipt from the agent's editor.
 
@@ -125,7 +135,9 @@ The recipe deliberately does not start agents. Deciding that a pane is safe to t
 
 The two directions are not symmetric. Codex exposes both steering Return and queued Tab, while Claude Code exposes only its normal Return submission and manages busy input itself. Use `--queue` only for a Codex-bound note that needs no action during the current turn.
 
-It assumes Claude Code on the left and Codex on the right. Each agent's pane is fixed in the script's profiles, so a split arranged the other way sends every message to the wrong pane. A session with no split is refused outright, before any pane is read: without that check a send to the left pane would still pass after the right one had closed, which is no longer a two-agent layout at all.
+The target pane is chosen once per send, from agterm's view of which pane runs the agent named by `--to`, and every later read and write goes to that pane alone. If the agents swap panes during a send, the next check refuses instead of following the agent to the other side. A session with no split is refused outright, before any pane is read: without that check a send would still pass after the other pane had closed, which is no longer a two-agent layout at all.
+
+The other side is taken only when the usual one runs the other agent under its own command, so a wrapped peer on the usual side needs `PEER_CHAT_CLAUDE_COMMAND` or `PEER_CHAT_CODEX_COMMAND` for a reversed split to be recognised. Two agents of the same kind are not a supported pair: agterm addresses a pane by its position, and with the same agent on both sides the script sends to the usual side and has no way to tell a swapped split from the original.
 
 **Codex cannot see which pane it is in unless you tell it at launch.** It strips `AGTERM_SESSION_ID` from every tool subprocess, and nothing inside its sandbox recovers the value: reading a parent process is blocked outright. Without the launch injection in *Setup*, the script falls back to matching the git checkout, and every worktree of one repository maps to the same checkout, so two sessions open on the same repository are indistinguishable and the send refuses. That refusal is the correct outcome, not a bug, but it is why the injection is worth doing once in your Codex launcher instead of remembering per session.
 
@@ -135,4 +147,4 @@ An agent whose launcher leaves no stable name in the pane's command line cannot 
 
 A reply is not promised. An agent's model can decline to answer a message that arrived perfectly well, and nothing on either side reports that. If an exchange goes quiet, read the other pane instead of waiting.
 
-No transcript is kept. A one-shot message file remains untouched until the target session resolves. Once its identity, ownership and link checks pass, its directory entry is removed before mode, size and body validation, so those validation failures and every later send failure consume it. A prepared file that never reaches that point remains in the private spool. The conversation lives in the two panes and is gone when the session ends.
+No transcript is kept. A one-shot message file remains untouched until the target session resolves. A send the target refuses before anything is typed, or one interrupted at that stage, returns the file to its name and says so, and the same command resends it. Every other failure consumes it: a body rejected as empty or holding a control character fails every resend, and after typing starts part of the message may already be in the peer's composer. A send killed outright after claiming the file leaves it in the private spool under its claim name, which `--message-file` does not accept. The conversation lives in the two panes and is gone when the session ends.

@@ -31,15 +31,19 @@ extension GhosttySurfaceView {
 
     /// Reduce an `NSEvent` to the host-free `InterruptKeystroke` classifier — Escape or a bare Ctrl-C.
     private func classifyKeystroke(_ event: NSEvent) -> StatusKeystroke {
+        InterruptKeystroke.classify(keyCode: event.keyCode,
+                                    character: event.charactersIgnoringModifiers,
+                                    modifiers: keyModifiers(event))
+    }
+
+    private func keyModifiers(_ event: NSEvent) -> KeyModifiers {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         var modifiers: KeyModifiers = []
         if flags.contains(.control) { modifiers.insert(.control) }
         if flags.contains(.command) { modifiers.insert(.command) }
         if flags.contains(.option) { modifiers.insert(.option) }
         if flags.contains(.shift) { modifiers.insert(.shift) }
-        return InterruptKeystroke.classify(keyCode: event.keyCode,
-                                           character: event.charactersIgnoringModifiers,
-                                           modifiers: modifiers)
+        return modifiers
     }
 
     override func keyDown(with event: NSEvent) {
@@ -47,6 +51,8 @@ extension GhosttySurfaceView {
             super.keyDown(with: event)
             return
         }
+        // a covered pane takes no input: its first press asks for the lead instead
+        guard !PaneLead.consumes(event, in: self) else { return }
         // every keystroke is user activity: reset the auto-follow idle timer UNCONDITIONALLY, not gated on
         // the status-clear below, else typing in an idle session yanks the user to a blocked one mid-type.
         onUserInput?()
@@ -122,17 +128,28 @@ extension GhosttySurfaceView {
     override func doCommand(by _: Selector) {}
 
     override func keyUp(with event: NSEvent) {
-        guard let surface else { return }
+        guard let surface, !PaneLead.consumes(event, in: self) else { return }
         var ke = buildKeyEvent(from: event, action: GHOSTTY_ACTION_RELEASE)
         ke.text = nil
         _ = ghostty_surface_key(surface, ke)
     }
 
     override func flagsChanged(with event: NSEvent) {
-        guard let surface else { return }
+        guard let surface, !leadCovered else { return }
         var ke = buildKeyEvent(from: event, action: isFlagPress(event) ? GHOSTTY_ACTION_PRESS : GHOSTTY_ACTION_RELEASE)
         ke.text = nil
         _ = ghostty_surface_key(surface, ke)
+        guard clickIntent(event) != .normal, NSEvent.pressedMouseButtons == 0,
+              let point = lastReportedMousePoint, point.x >= 0, point.y >= 0 else { return }
+        refreshLinkHover(at: point, with: event)
+    }
+
+    // reset libghostty's pixel and cell hover caches before applying normalized modifiers.
+    private func refreshLinkHover(at point: NSPoint, with event: NSEvent) {
+        guard let surface else { return }
+        let mods = linkMods(event)
+        ghostty_surface_mouse_pos(surface, -1, -1, mods)
+        ghostty_surface_mouse_pos(surface, point.x, point.y, mods)
     }
 
     // MARK: - Mouse
@@ -144,39 +161,98 @@ extension GhosttySurfaceView {
 
     /// Push the pointer position to libghostty and remember it in `lastReportedMousePoint`. Every
     /// position-reporting handler routes through here so `scrollWheel` can skip a redundant `mouse_pos`.
-    private func reportMousePos(from event: NSEvent) {
+    private func reportMousePos(from event: NSEvent, mods forwarded: ghostty_input_mods_e? = nil) {
         guard let surface else { return }
         let pt = mousePoint(from: event)
-        ghostty_surface_mouse_pos(surface, pt.x, pt.y, mods(event))
+        ghostty_surface_mouse_pos(surface, pt.x, pt.y, forwarded ?? linkMods(event))
         lastReportedMousePoint = pt
     }
 
-    /// ⌘+click opens the link under the cursor via the `link-rules.conf` regex rules (wezterm-style
-    /// hyperlink click). The press is consumed ONLY when a regex actually matches — OSC-8 links and a
-    /// TUI's own `onMouseUp` (e.g. OpenCode's Link component) still need the press when agterm has nothing
-    /// to open. Unmodded click is unchanged: focus grab + forwarded to ghostty for the OSC-8 path.
+    private func clickIntent(_ event: NSEvent) -> LinkPolicy.ClickIntent {
+        guard let surface else { return .normal }
+        return LinkPolicy.clickIntent(modifiers: keyModifiers(event), mode: LinkOpener.shared.mode(),
+                                      origin: linkClickOrigin, mouseCaptured: ghostty_surface_mouse_captured(surface))
+    }
+
+    /// linkMods is what libghostty hears for a hover, a press or an unmoved release: a link matches only on ⌘
+    /// alone, so a browser chord drops Shift and a reveal chord drops Option. Shift stays in a captured reveal
+    /// chord, the bypass libghostty itself decides on.
+    func linkMods(_ event: NSEvent) -> ghostty_input_mods_e {
+        let raw = mods(event)
+        switch clickIntent(event) {
+        case .normal: return raw
+        case .browser:
+            return ghostty_input_mods_e(rawValue: raw.rawValue & ~(GHOSTTY_MODS_SHIFT.rawValue | GHOSTTY_MODS_SHIFT_RIGHT.rawValue))
+        case .reveal:
+            return ghostty_input_mods_e(rawValue: raw.rawValue & ~(GHOSTTY_MODS_ALT.rawValue | GHOSTTY_MODS_ALT_RIGHT.rawValue))
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard !deferMouseToAsk(with: event) else { return }
         guard let surface else { return }
         window?.makeFirstResponder(self)
         updateGhosttyFocus()
+        linkPressDragged = false
         reportMousePos(from: event)
-        if event.modifierFlags.contains(.command), openLinkAtMouseCursor() != nil {
+        // a plain ⌘ press first tries the local `link-rules.conf` regexes and is consumed only when one
+        // matches; every other chord, including ⌘⇧/⌘⌥ and an unmatched plain ⌘, stays libghostty's.
+        if keyModifiers(event) == [.command], openLinkAtMouseCursor() != nil {
             cmdClickArmed = true
             return
         }
-        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods(event))
+        // a pane without key focus never saw the chord's flagsChanged, and libghostty drops an
+        // unmoved press position.
+        if clickIntent(event) != .normal { refreshLinkHover(at: mousePoint(from: event), with: event) }
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, linkMods(event))
     }
 
     override func mouseUp(with event: NSEvent) {
         guard !askBlocksFocus else { return }
         guard let surface else { return }
+        // a consumed regex press never reached libghostty, so keep its release out of the gesture too
+        if cmdClickArmed {
+            cmdClickArmed = false
+            reportMousePos(from: event)
+            return
+        }
+        // with the button still down libghostty redraws a drag from these mods, so a dragged reveal chord keeps
+        // its ⌥ and the rectangle; Shift sets no shape, so a browser chord stays normalized and opens as before
+        let chord = clickIntent(event)
+        let keepsAlt = chord == .reveal && linkPressDragged
+        linkPressDragged = false
+        let forwarded = keepsAlt ? mods(event) : linkMods(event)
+        reportMousePos(from: event, mods: forwarded)
+        let intent = keepsAlt ? .normal : chord
+        releaseIntent.withLock { $0 = intent }
+        defer { releaseIntent.withLock { $0 = .normal } }
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, forwarded)
+    }
+
+    /// Forwards the ⌘-click or ⌘⌥-click `HudLinkClick` claims for a HUD panel, so libghostty opens the link
+    /// under it, or reveals its file. It moves no focus.
+    func passiveClick(_ state: ghostty_input_mouse_state_e, with event: NSEvent) {
+        guard let surface else { return }
         reportMousePos(from: event)
-        // skip the ghostty release when a ⌘+click press was intercepted — without its paired press
-        // ghostty treats the release as a no-op anyway, but skipping keeps the gesture strictly ours.
-        defer { cmdClickArmed = false }
-        guard !cmdClickArmed else { return }
-        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, mods(event))
+        let intent = state == GHOSTTY_MOUSE_RELEASE ? clickIntent(event) : .normal
+        releaseIntent.withLock { $0 = intent }
+        defer { releaseIntent.withLock { $0 = .normal } }
+        _ = ghostty_surface_mouse_button(surface, state, GHOSTTY_MOUSE_LEFT, linkMods(event))
+    }
+
+    /// Tells a HUD panel where the pointer is while `HudLinkClick` sees ⌘ held over it, or with nil that it
+    /// is gone, so libghostty resolves the link under it and asks for the pointing hand.
+    func passivePointer(at windowPoint: NSPoint?, with event: NSEvent) {
+        guard let surface else { return }
+        guard let windowPoint else {
+            ghostty_surface_mouse_pos(surface, -1, -1, GHOSTTY_MODS_NONE)
+            lastReportedMousePoint = NSPoint(x: -1, y: -1)
+            return
+        }
+        let local = convert(windowPoint, from: nil)
+        let point = NSPoint(x: local.x, y: bounds.height - local.y)
+        ghostty_surface_mouse_pos(surface, point.x, point.y, linkMods(event))
+        lastReportedMousePoint = point
     }
 
     // forward right-/middle-button press/release so libghostty's mouse bindings fire (right-click-action),
@@ -208,7 +284,13 @@ extension GhosttySurfaceView {
         _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_MIDDLE, mods(event))
     }
 
-    override func mouseDragged(with event: NSEvent) { mouseMoved(with: event) }
+    /// A drag keeps ⌥: libghostty recomputes a rectangle selection from the live mods on every drag update.
+    override func mouseDragged(with event: NSEvent) {
+        linkPressDragged = true
+        reportMousePos(from: event, mods: mods(event))
+        guard deckVisible, ownsPointer(at: event.locationInWindow) else { return }
+        Self.nsCursor(for: mouseShape).set()
+    }
     override func rightMouseDragged(with event: NSEvent) { mouseMoved(with: event) }
     override func otherMouseDragged(with event: NSEvent) { mouseMoved(with: event) }
 
@@ -464,6 +546,23 @@ extension GhosttySurfaceView: @preconcurrency NSTextInputClient {
         committingComposition = false
     }
 
+    /// The text of a live composition, empty when none. For input that does NOT go through this surface:
+    /// `commitOrDiscardComposition` commits by `insertText`, which a managed pane's daemon may be dropping,
+    /// so that caller sends this text itself and then calls `discardComposition`.
+    var pendingComposition: String { hasMarkedText() ? _markedText : "" }
+
+    /// Ends a composition whose text a caller delivered another way, without inserting it here.
+    func discardComposition() {
+        guard hasMarkedText() else { return }
+        _markedRange = NSRange(location: NSNotFound, length: 0)
+        _markedText = ""
+        if let surface { ghostty_surface_preedit(surface, nil, 0) }
+        guard window?.firstResponder === self else { return }
+        committingComposition = true
+        inputContext?.discardMarkedText()
+        committingComposition = false
+    }
+
     func attributedSubstring(forProposedRange _: NSRange, actualRange _: NSRangePointer?) -> NSAttributedString? {
         nil
     }
@@ -496,6 +595,8 @@ extension GhosttySurfaceView: @preconcurrency NSTextInputClient {
     func applyMouseShape(_ shape: ghostty_action_mouse_shape_e) {
         guard shape != mouseShape else { return }
         mouseShape = shape
+        // a HUD panel is never `deckVisible`; it paints the shape only while `HudLinkClick` hovers it
+        if HudLinkClick.hovered === self { Self.nsCursor(for: shape).set() }
         if deckVisible, pointerInside, ownsPointer() { Self.nsCursor(for: shape).set() }
     }
 
@@ -546,14 +647,30 @@ extension GhosttySurfaceView: @preconcurrency NSTextInputClient {
         }
     }
 
-    /// Acts on a clicked terminal link (`GHOSTTY_ACTION_OPEN_URL`); the scheme/host decision lives in the
-    /// host-free `LinkPolicy`. A `file://` link is REVEALED in Finder, never opened — reveal executes nothing.
-    func openLink(_ raw: String) {
-        switch LinkPolicy.disposition(for: raw) {
-        case let .open(url): NSWorkspace.shared.open(url)
-        case let .reveal(url): NSWorkspace.shared.activateFileViewerSelecting([url])
-        case .ignore: return
-        }
+    /// openLink acts on a clicked terminal link (`GHOSTTY_ACTION_OPEN_URL`); what happens to it is the host-free
+    /// `LinkPolicy`'s decision.
+    func openLink(_ raw: String, intent: LinkPolicy.ClickIntent) {
+        LinkOpener.shared.follow(raw, from: linkClickOrigin, pane: linkClickPane, cwd: linkClickCwd, intent: intent)
+    }
+
+    /// linkClickPane is the identity of the pane this surface shows, nil for a surface no session pane owns.
+    var linkClickPane: UUID? {
+        session.flatMap { isSplitPane ? $0.splitPaneIdentity : $0.paneIdentity }
+    }
+
+    /// The directory a relative link names a file in: this pane's reported cwd. Nil for the scratch, quick and
+    /// overlay terminals, whose own directory the app does not track, so a relative link there stays ignored.
+    var linkClickCwd: String? {
+        session.map { isSplitPane ? $0.cwd(for: .right) : $0.effectiveCwd }
+    }
+
+    /// Which kind of surface a clicked link came from, read off the ownership each factory already sets.
+    /// HUD first: its surface sits in the session's overlay slot like a program's.
+    var linkClickOrigin: LinkPolicy.ClickOrigin {
+        if hudBodyFile != nil { return .hud }
+        if let session { return session.remoteHost == nil ? .pane(session.id) : .remotePane(session.id) }
+        if let owner = watermarkSession { return .scratch(owner.id) }
+        return focusSession == nil ? .quick : .programOverlay
     }
 }
 

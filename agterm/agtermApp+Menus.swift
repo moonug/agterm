@@ -3,17 +3,15 @@ import AppKit
 import SwiftUI
 
 extension agtermApp {
-    /// The active SwiftUI shortcut for a built-in action: the user's `map` override, else the shipped
-    /// default; nil only for a keyless action. `keymap` is `@Observable`, but SwiftUI defers its menu
-    /// rebuild to the next app activation, so a reload leaves live key equivalents stale until then — ⌘W is
-    /// asserted from AppKit instead, by `AppDelegate.applyCloseSessionChord`.
+    /// shortcut returns the resolved menu binding for a built-in action; `AppDelegate.applyStockMenuChords`
+    /// reconciles stock collisions.
     private func shortcut(for action: BuiltinAction) -> KeyboardShortcut? {
         settingsModel.keymap.equivalent(for: action).map(Self.toShortcut)
     }
 
     /// Map a host-free `Chord` to a SwiftUI `KeyboardShortcut` — the menu-side mirror of the runner's
     /// `NSEvent`→`Chord` mapping. The base key is a printable `Character` or a named key; modifiers map 1:1.
-    private static func toShortcut(_ chord: Chord) -> KeyboardShortcut {
+    static func toShortcut(_ chord: Chord) -> KeyboardShortcut {
         let key: KeyEquivalent
         switch chord.key {
         case "tab": key = .tab
@@ -24,7 +22,13 @@ extension agtermApp {
         case "right": key = .rightArrow
         case "up": key = .upArrow
         case "down": key = .downArrow
-        default: key = KeyEquivalent(Character(chord.key))
+        default:
+            if bindableFunctionKeys.contains(chord.key), let number = Int(chord.key.dropFirst()),
+               let scalar = UnicodeScalar(0xF703 + number) {
+                key = KeyEquivalent(Character(scalar))
+            } else {
+                key = KeyEquivalent(Character(chord.key))
+            }
         }
         var modifiers: EventModifiers = []
         if chord.mods.contains(.control) { modifiers.insert(.control) }
@@ -49,6 +53,13 @@ extension agtermApp {
     var appCommands: some Commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About Agterm") { showAboutPanel() }
+            }
+            // the reset quits and reopens the app, so it shares Quit's group rather than sitting in Help beside
+            // the installers.
+            CommandGroup(before: .appTermination) {
+                if liveReset.menuVisible {
+                    Button { liveReset.runFromMenu() } label: { Label("Reset Live Sessions…", systemImage: "arrow.counterclockwise") }
+                }
             }
             // drop SwiftUI's stock Undo/Redo: agterm registers no NSUndoManager, and the ⌘Z they advertise
             // is owned by File ▸ Reopen Closed Item (`BuiltinAction.undoClose`), whose menu precedes Edit
@@ -112,6 +123,9 @@ extension agtermApp {
                 Button("Open Directory…") { actions.openDirectory() }
                     .keyboardShortcut(shortcut(for: .openDirectory))
                     .disabled(!PaletteCommand.openDirectory.isEnabled(in: context))
+                Button("Attach Remote…") { actions.attachRemote() }
+                    .keyboardShortcut(shortcut(for: .attachRemote))
+                    .disabled(!PaletteCommand.attachRemote.isEnabled(in: context))
                 Menu("Open Recent") {
                     let recentSessions = library.recentClosedItems.filter { $0.kind == .session }
                     let recentWorkspaces = library.recentClosedItems.filter { $0.kind == .workspace }
@@ -146,6 +160,17 @@ extension agtermApp {
                 Button("Duplicate Session") { actions.duplicateActiveSession() }
                     .keyboardShortcut(shortcut(for: .duplicateSession))
                     .disabled(!PaletteCommand.duplicateSession.isEnabled(in: context))
+                Divider()
+                Button("New Companion") { actions.newCompanionOfActiveSession() }
+                    .keyboardShortcut(shortcut(for: .newCompanion))
+                    .disabled(!PaletteCommand.newCompanion.isEnabled(in: context))
+                Button("Duplicate as Companion") { actions.duplicateActiveSessionAsCompanion() }
+                    .keyboardShortcut(shortcut(for: .duplicateCompanion))
+                    .disabled(!PaletteCommand.duplicateCompanion.isEnabled(in: context))
+                Button("Convert to Companion") { actions.convertActiveSessionToCompanion() }
+                    .keyboardShortcut(shortcut(for: .convertCompanion))
+                    .disabled(!PaletteCommand.convertCompanion.isEnabled(in: context))
+                Divider()
                 Button("Reveal in Finder") { actions.revealActiveSessionInFinder() }
                     .disabled(!actions.canRevealActiveSessionInFinder)
                 Button("Close Session") {
@@ -184,6 +209,10 @@ extension agtermApp {
                 // re-read keymap.conf and apply — menu shortcuts, runner and palette rebuild. keyless.
                 Button { actions.reloadKeymap() } label: { Label("Reload Keymap", systemImage: "keyboard") }
                     .disabled(!PaletteCommand.reloadKeymap.isEnabled(in: context))
+                Button { actions.editHooks() } label: { Label("Edit Hooks…", systemImage: "pencil.and.list.clipboard") }
+                    .disabled(!PaletteCommand.editHooks.isEnabled(in: context))
+                Button { actions.reloadHooks() } label: { Label("Reload Hooks", systemImage: "bolt.horizontal") }
+                    .disabled(!PaletteCommand.reloadHooks.isEnabled(in: context))
                 // open the agterm-scoped ghostty.conf in $EDITOR in a 95% overlay; reloads on editor exit.
                 Button { actions.editGhosttyConfig() } label: { Label("Edit ghostty.conf…", systemImage: "slider.horizontal.3") }
                     .disabled(!PaletteCommand.editGhosttyConfig.isEnabled(in: context))
@@ -220,7 +249,7 @@ extension agtermApp {
                 .keyboardShortcut(shortcut(for: .toggleSidebar))
                 .disabled(!PaletteCommand.toggleSidebar.isEnabled(in: context))
                 // expand every workspace / collapse all but the active one. plain keyless items, disabled
-                // outside tree mode, where there are no workspace rows; control sidebar.expand/collapse.
+                // under the flat flagged list, where there are no workspace rows; control sidebar.expand/collapse.
                 Button { actions.expandAllWorkspaces() } label: { Label("Expand Workspaces", systemImage: "chevron.down") }
                     .disabled(!PaletteCommand.expandWorkspaces.isEnabled(in: context))
                 Button { actions.collapseOtherWorkspaces() } label: { Label("Collapse Workspaces", systemImage: "chevron.right") }
@@ -234,7 +263,7 @@ extension agtermApp {
                 }
                 .keyboardShortcut(shortcut(for: .toggleWorkspaceCollapse))
                 .disabled(!PaletteCommand.toggleWorkspaceCollapse.isEnabled(in: context))
-                // flip the sidebar between the workspace tree and the flat flagged working-set list. one
+                // flip the sidebar between the workspace tree and the flagged working-set view. one
                 // 2-state item, keyless by default (rebindable via toggle_flagged_view); control sidebar.mode.
                 // Disabled with nothing to show (tree mode + no flags), live in flagged mode so it can
                 // always switch back to the tree.
@@ -252,6 +281,11 @@ extension agtermApp {
                 .disabled(!PaletteCommand.toggleFlag.isEnabled(in: context))
                 Button { actions.clearFlags() } label: { Label("Clear Flagged", systemImage: "flag.slash") }
                     .disabled(!PaletteCommand.clearFlagged.isEnabled(in: context))
+                Button { actions.openFlaggedEditor() } label: {
+                    Label("Edit Flagged Sessions…", systemImage: "flag")
+                }
+                .keyboardShortcut(shortcut(for: .editFlaggedSessions))
+                .disabled(!PaletteCommand.editFlaggedSessions.isEnabled(in: context))
                 // collapse the tree to the current workspace's subtree (or unfocus when already focused).
                 // keyless, rebindable via focus_workspace; control workspace.focus. the label tracks the toggle.
                 let focusStore = library.activeStore
@@ -280,6 +314,11 @@ extension agtermApp {
                 // plain (non-BuiltinAction) clear, like Clear Flagged; the bottom-bar toggle is primary.
                 Button { actions.clearFocus() } label: { Label("Clear Focus", systemImage: "scope") }
                     .disabled(!PaletteCommand.clearFocus.isEnabled(in: context))
+                Button { actions.openFocusEditor() } label: {
+                    Label("Edit Focused Workspaces…", systemImage: "square.grid.2x2")
+                }
+                .keyboardShortcut(shortcut(for: .editFocusedWorkspaces))
+                .disabled(!PaletteCommand.editFocusedWorkspaces.isEnabled(in: context))
                 Button { actions.toggleSplit() } label: {
                     Label("Toggle Vertical Split", systemImage: "rectangle.split.2x1")
                 }
@@ -301,6 +340,13 @@ extension agtermApp {
                 }
                 .keyboardShortcut(shortcut(for: .toggleScratch))
                 .disabled(!PaletteCommand.toggleScratch.isEnabled(in: context))
+                let overlaySession = library.activeStore?.activeSession
+                let overlaysShown = overlaySession?.anyOverlayShown(nil) ?? true
+                Button { actions.toggleOverlays() } label: {
+                    Label(overlaysShown ? "Hide Overlays" : "Show Overlays", systemImage: "rectangle.on.rectangle")
+                }
+                .keyboardShortcut(shortcut(for: .toggleOverlay))
+                .disabled(!PaletteCommand.toggleOverlay.isEnabled(in: context))
                 // search the focused terminal's scrollback. data-driven shortcut (⌘F default), no hardcoded
                 // literal; the bar's open/close toggle lives in onSearchStart.
                 Button { actions.toggleSearch() } label: { Label("Find…", systemImage: "magnifyingglass") }
@@ -363,7 +409,8 @@ extension agtermApp {
                 Button { actions.selectNextSession() } label: { Label("Next Session", systemImage: "chevron.down") }
                     .keyboardShortcut(shortcut(for: .nextSession))
                     .disabled(!PaletteCommand.nextSession.isEnabled(in: context))
-                // step only through sessions needing attention (blocked/completed glyphs), wrapping.
+                // step only through sessions needing attention (blocked/completed glyphs, plus active when the
+                // Navigation setting includes it), wrapping.
                 Button { actions.selectPreviousAttentionSession() } label: { Label("Previous Attention Session", systemImage: "chevron.up.circle") }
                     .keyboardShortcut(shortcut(for: .previousAttentionSession))
                     .disabled(!PaletteCommand.previousAttentionSession.isEnabled(in: context))
@@ -377,8 +424,8 @@ extension agtermApp {
                     .keyboardShortcut(shortcut(for: .lastSession))
                     .disabled(!PaletteCommand.lastSession.isEnabled(in: context))
                 // step between WORKSPACES, landing on each one's first session. keyless, rebindable via
-                // previous_workspace/next_workspace; control workspace.go. tree mode only, like the
-                // expansion items in View — flagged mode renders no workspace rows to step through.
+                // previous_workspace/next_workspace; control workspace.go. ordinary tree only, narrower than
+                // the expansion items in View: `AppStore.canStepWorkspaces` owns why.
                 Button { actions.selectPreviousWorkspace() } label: {
                     Label("Previous Workspace", systemImage: "chevron.up.2")
                 }
@@ -389,6 +436,20 @@ extension agtermApp {
                 }
                 .keyboardShortcut(shortcut(for: .nextWorkspace))
                 .disabled(!PaletteCommand.nextWorkspace.isEnabled(in: context))
+                // step between OPEN windows, wrapping and raising each in turn — a CLOSED entry is not a
+                // candidate, File > Open Window being the surface that opens one. keyless, rebindable via
+                // previous_window/next_window; control window.go. horizontal chevrons, since the vertical
+                // ones are taken by the two levels inside a window.
+                Button { actions.selectPreviousWindow() } label: {
+                    Label("Previous Window", systemImage: "chevron.left.2")
+                }
+                .keyboardShortcut(shortcut(for: .previousWindow))
+                .disabled(!PaletteCommand.previousWindow.isEnabled(in: context))
+                Button { actions.selectNextWindow() } label: {
+                    Label("Next Window", systemImage: "chevron.right.2")
+                }
+                .keyboardShortcut(shortcut(for: .nextWindow))
+                .disabled(!PaletteCommand.nextWindow.isEnabled(in: context))
                 Divider()
                 let topBottom = library.activeStore?.activeSession?.splitAxis == .topBottom
                 Button { actions.focusPane(.main) } label: {
@@ -414,10 +475,6 @@ extension agtermApp {
                 Button("Install Command Line Tool…") { CLIInstaller.run() }
                 Button("Install Agent Status Hooks…") { AgentHooksInstaller.run() }
                 Button("Install Agent Skill…") { SkillInstaller.run() }
-                if liveReset.menuVisible {
-                    Divider()
-                    Button("Reset Live Sessions…") { liveReset.runFromMenu() }
-                }
             }
     }
 

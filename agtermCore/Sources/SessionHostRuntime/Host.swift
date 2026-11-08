@@ -12,6 +12,7 @@ enum HostChildState {
 protocol HostChild: AnyObject {
     var pid: Int32 { get }
     var hasExited: Bool { get }
+    var stopReason: String? { get }
     func poll() -> HostChildState
     func terminate(grace: TimeInterval) throws
 }
@@ -32,23 +33,28 @@ public final class Host {
         var ensureTimeout: TimeInterval = 10
         var pollInterval: TimeInterval = 0.1
         var terminationGrace: TimeInterval = 0.25
+        var upkeepInterval: TimeInterval = 3600
     }
 
     private let configuration: Configuration
     private let backend: any HostBackend
     private let now: () -> TimeInterval
     private let pause: (TimeInterval) -> Void
+    private let upkeepNow: () -> TimeInterval
+    private var nextUpkeep: TimeInterval?
     private var pendingChildren: [any HostChild] = []
     private(set) var shouldStop = false
 
     init(configuration: Configuration, backend: any HostBackend,
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         pause: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }) throws {
+         pause: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+         upkeepNow: @escaping () -> TimeInterval = Host.timeIncludingSleep) throws {
         _ = try SessionHost.paths(socketDirectory: configuration.socketDirectory)
         self.configuration = configuration
         self.backend = backend
         self.now = now
         self.pause = pause
+        self.upkeepNow = upkeepNow
     }
 
     public static func run(socketDirectory: String) throws {
@@ -76,7 +82,10 @@ public final class Host {
                 }
                 return .ok(.init(state: .existing, leaderPid: pid))
             }
-        } catch { return failure(.before, "daemon inventory could not be read") }
+        } catch {
+            Self.log("daemon inventory failed for \(request.name): \(error)")
+            return failure(.before, "daemon inventory could not be read")
+        }
         guard now() < deadline else { return failure(.before, "deadline expired before creation") }
 
         let child: any HostChild
@@ -110,7 +119,10 @@ public final class Host {
 
     private func awaitLeader(name: String, child: any HostChild, deadline: TimeInterval) -> SessionHost.Response {
         while now() < deadline {
-            guard case .running = child.poll() else { return failure(.started, "attach client exited or failed before readiness") }
+            guard case .running = child.poll() else {
+                Self.log("attach client \(child.pid) for \(name) stopped before readiness: \(child.stopReason ?? "unknown")")
+                return failure(.started, "attach client exited or failed before readiness")
+            }
             do {
                 let matches = try backend.list(deadline: deadline).filter { $0.name == name }
                 if matches.count == 1, matches[0].clients != nil, let pid = matches[0].leaderPID, backend.isAlive(pid),
@@ -142,9 +154,24 @@ public final class Host {
         }
     }
 
+    /// Refreshes the endpoint's files on the first call and once per `upkeepInterval` after it.
+    func maintain(_ endpoint: HostEndpoint, log: Int32) {
+        let time = upkeepNow()
+        if let nextUpkeep, time < nextUpkeep { return }
+        nextUpkeep = time + configuration.upkeepInterval
+        endpoint.keepFilesCurrent(log: log)
+    }
+
+    // `now` counts awake time only, which would let a Mac that sleeps most of the day skip upkeep
+    // for longer than the cleaner waits.
+    static func timeIncludingSleep() -> TimeInterval {
+        TimeInterval(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1_000_000_000
+    }
+
     private func serve(_ endpoint: HostEndpoint) throws {
         while !shouldStop {
             maintainChildren()
+            maintain(endpoint, log: STDERR_FILENO)
             var ready = pollfd(fd: endpoint.listener, events: Int16(POLLIN), revents: 0)
             let result = poll(&ready, 1, 100)
             if result == 0 || (result < 0 && errno == EINTR) { continue }

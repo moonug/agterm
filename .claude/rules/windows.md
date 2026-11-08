@@ -43,6 +43,15 @@ session drag are out of scope.
 - State lives under `AGTERM_STATE_DIR` or Application Support: `windows.json` plus
   `windows/<uuid>.json`. Legacy `workspaces.json` remains dormant after migration. `PersistenceStore.fileName`
   defaults to `workspaces.json`; index and window mutations save only their own files.
+- A failed `windows.json` write sets `WindowLibrary.indexUnsaved`, which the tree reports and which
+  clears only on an index write that lands. While it stands, each snapshot save that lands retries the
+  index (`AppStore.snapshotDidSave`), and the exit flush writes it through `saveAllChecked`, ahead of
+  arming a Live reset. It does not recover a crash with no later write: a valid index that names no
+  entry for a window still short-circuits bootstrap past the orphan scan, which stays index-loss only
+  because scanning after a clean load can resurrect a window whose snapshot removal failed.
+- A failed `windows/<id>.json` write sets that store's `AppStore.snapshotUnsaved`, reported by its
+  window's tree and cleared by the next snapshot write that lands. The failure logs through `NSLog`:
+  `agtermCore` imports no `os`, since the agterm-linux fork builds it on Linux.
 - Bootstrap never throws. Load a valid index; otherwise recover every UUID-named per-window file before
   considering legacy migration or an empty seed. Recovered files are appended before `loadStore`, named
   `window N`, all opened, and the first made frontmost. Missing/corrupt window snapshots open with a
@@ -64,9 +73,10 @@ session drag are out of scope.
   [[settings]] for that contract.
 - `AppActions`, commands, palette construction, `ControlServer`, `SettingsModel`, and `SessionSwitcher`
   resolve through observable `WindowLibrary.activeStore`: frontmost open store, then first open store.
-- On termination, set `isTerminating` before windows close, then `saveAllOpen` and `saveIndex`. This preserves
-  live cwd changes, which structural saves may not capture. Selection and font use a roughly 0.3-second
-  `Debouncer`; structural mutations save synchronously and cancel pending saves.
+- On termination, set `isTerminating` before windows close, then `saveAllChecked` writes every open
+  store and the index. This preserves live cwd changes, which structural saves may not capture.
+  Selection and font use a roughly 0.3-second `Debouncer`; structural mutations save synchronously and
+  cancel pending saves.
 - Quit uses `applicationShouldTerminate` and a warning alert with host-free `openCounts` and
   `QuitPrompt.message`, which takes the launch decision's active restore mode:
   Live drops the shell clause and promises no reattachment.
@@ -78,6 +88,7 @@ session drag are out of scope.
   The reason is an attribute, not a param, despite `AERegistry.h` calling it a parameter: loginwindow
   writes it with `AEPutAttributePtr`. Never switch that read to `paramDescriptor`.
   The GUI-only prompt is keep-in-sync exempt and manually verified.
+- The window-close sheet takes its text from `QuitPrompt.windowCloseMessage` under the same mode rule.
 - A confirmed Live sessions reset (`LiveResetCoordinator.pending`) skips the quit alert, since its own
   dialog or `zmx.reset --force` was the confirmation. `AppDelegate.exitFlush` fixes the order: capture,
   finalize pending closes, then the CHECKED save; only a fully saved snapshot arms the marker and the
@@ -147,10 +158,12 @@ session drag are out of scope.
 - `window.zoom` uses `NSWindow.zoom`: visible-frame maximize, not native fullscreen. The control toggle
   requires an open window. Read back `isZoomed` on `window.list`.
 - `WindowControlArea` handles titlebar dragging and double-click because SwiftUI titlebar views do not
-  receive native handling. Set `mouseDownCanMoveWindow = false`; double-click reads live
-  `AppleActionOnDoubleClick`: Zoom/Fill zooms, Minimize miniaturizes, Do Nothing does nothing, and an absent
-  key defaults to Zoom. `AGTERM_UITEST_DOUBLECLICK_ACTION` overrides via environment because launch
-  arguments hit FB11763863. Decorative titlebar regions disable hit testing; buttons remain above them.
+  receive native handling. Keep `mouseDownCanMoveWindow = false` and the hit-testable background shape;
+  the flag alone does not exclude the header from the window server's title-bar drag region (#856).
+  Double-click reads live `AppleActionOnDoubleClick`: Zoom/Fill zooms, Minimize miniaturizes,
+  Do Nothing does nothing, and an absent key defaults to Zoom.
+  `AGTERM_UITEST_DOUBLECLICK_ACTION` overrides via environment because launch arguments hit FB11763863.
+  Decorative titlebar regions disable hit testing; buttons remain above them.
 - `window.fullscreen` uses `toggleFullScreen`, a distinct native Space. GUI surfaces are the palette,
   `BuiltinAction.toggleFullscreen` with Ctrl-Command-F through the key monitor, AppKit's own injected
   View menu item, and the green button. Control resolves an open ID; read back the `.fullScreen` style mask.
@@ -203,7 +216,18 @@ session drag are out of scope.
 - The host answers one client at a time.
   A connected client waits up to 30 seconds for its turn before falling back to a bare attach,
   so a long enough queue of creations still yields an `app` pane.
+- After a confirmed or uncertain creation, a `session new --command` pane (`client NAME --ends-pane`)
+  attaches with a "session is gone" guard in place of its payload (`Client.attachArgv`): a command that
+  ended during the handoff ends the pane instead of leaving a login shell, and its output is lost
+  (`docs/backlog/fast-live-command-loses-output-in-host-handoff.md`). A replay, a restart and a plain shell
+  attach bare, which recreates their shell.
 - Fresh shells and Re-run never stop a live host.
+- The host's files live under `/tmp`, where macOS deletes a regular file after three days untouched
+  (`/usr/libexec/tmp_cleaner`; sockets stay). The host touches its lock, log and pidfile at start and
+  hourly, on a clock that counts sleep, and publishes the pidfile again when it is missing or does not
+  hold the host's pid.
+  A deleted lock or log cannot be brought back, and a host started by an older build does none of this
+  until it is replaced.
 
 ## Attachment and cache
 
@@ -219,13 +243,24 @@ session drag are out of scope.
 
 ## Control catalog
 
-- Commands are `window.new`, `window.list`, `window.select`, `window.close`, `window.rename`,
+- Commands are `window.new`, `window.list`, `window.select`, `window.go`, `window.close`, `window.rename`,
   `window.delete`, `window.resize`, `window.move`, `window.zoom`, `window.fullscreen`, and
   `window.minimize`. Keep their protocol cases, dispatch/actions, CLI mappings, and tests synchronized
   per the repository-wide control contract.
 - `window.list` returns ID/name/open/active plus open-store auto-follow/sidebar state and live
   geometry/fullscreen/zoom/minimize. Closed-window live fields are omitted. Geometry is top-left,
   display-relative, y-down, matching move/resize.
+- `window.go --to next|prev` steps the OPEN windows in library order, wrapping, through host-free
+  `WindowLibrary.navigateWindow`, which the `previous_window`/`next_window` built-ins share. A CLOSED entry
+  is not a candidate: `window.select` is the verb that opens one, and a step that silently opened a window
+  would make the wrap length depend on the library rather than on what is on screen. It takes no target and
+  no `--window`, being app-global, and errors `no other open window to navigate to` below two open windows.
+  BOTH it and the GUI twins raise through `WindowRegistry.raise`, never `AppActions.openWindow`: that hub
+  falls back to `enqueueClaim` plus a fresh scene when a raise fails, and the failure case for a step is an
+  OPEN window still attaching, so one store would get two scenes. `enqueueClaim` dedups only PENDING claims,
+  so a popped claim does not protect it. Control refuses out loud; the GUI drops the step. Both then publish
+  frontmost themselves — `WindowAccessor.reportFrontmost` rides `didBecomeKey`, which never arrives while the
+  app is inactive, the state a step from the quick terminal raises in. Read back `window.list`'s `active`.
 - Delete enforces at least one library entry without GUI confirmation. `window.select` raises or opens.
   Window ID resolution accepts active, exact ID, unique prefix, ambiguity, and not found; most library
   commands can address closed entries.

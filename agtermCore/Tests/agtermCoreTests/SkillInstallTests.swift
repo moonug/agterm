@@ -32,6 +32,9 @@ struct SkillInstallTests {
         #expect(reference.contains("event cursor expired"))
         #expect(examples.contains("agtermctl events --json"))
         #expect(skill.contains("minimize <id> [on|off|toggle]"))
+        #expect(skill.contains("`session overlay hide|show|toggle [--pane left|right]`"))
+        #expect(reference.contains("`session overlay hide|show|toggle [--pane left|right] [--target] [--window W]`"))
+        #expect(skill.contains("`hiddenOverlays`"))
         #expect(reference.contains("`window minimize <id> [on|off|toggle]`"))
         #expect(examples.contains("agtermctl window minimize"))
         #expect(skill.contains("focus [on|off|toggle|add]"))
@@ -68,6 +71,22 @@ struct SkillInstallTests {
             #expect(FileManager.default.fileExists(atPath: skill.appendingPathComponent(file).path),
                     "missing \(file) in \(pluginRoot)/\(skillLeaf)")
         }
+    }
+
+    // #631: pi warns when the bundled description exceeds 1024 characters
+    @Test func bundledSkillDescriptionFitsTheSpecLimit() throws {
+        let skill = try String(contentsOf: repository.appendingPathComponent("plugins/agterm/skills/agterm/SKILL.md"),
+                               encoding: .utf8)
+        let lines = skill.components(separatedBy: "\n")
+        #expect(lines.first == "---")
+        let frontmatter = lines.dropFirst().prefix { $0 != "---" }
+        let header = try #require(frontmatter.firstIndex(of: "description: >"), "description is no longer a folded block")
+        let block = frontmatter[(header + 1)...].prefix { $0.hasPrefix(" ") || $0.trimmingCharacters(in: .whitespaces).isEmpty }
+        #expect(!block.isEmpty)
+        #expect(block.allSatisfy { $0.hasPrefix("  ") && !$0.dropFirst(2).isEmpty && !$0.dropFirst(2).hasPrefix(" ") },
+                "description block holds a blank or unevenly indented line")
+        let description = block.map { $0.dropFirst(2) }.joined(separator: " ") + "\n"
+        #expect(description.utf16.count <= 1024, "description is \(description.utf16.count) characters")
     }
 
     @Test func marketplacesPointAtThePluginRootAndAgreeOnVersion() throws {

@@ -15,7 +15,9 @@ What it does:
 - **Workspaces.** Sessions are grouped under named workspaces like "work" and "personal", which keeps a screen of concurrent sessions organized. You reach a session by name, by recency, or from the keyboard.
 - **Control API and CLI.** A bundled tool, `agtermctl`, drives almost everything over a local socket: create sessions, type into them, run a program in an overlay and read its exit status, move and resize windows, or post a notification tied to a specific session. A script or an agent can set up and drive its own layout, and send you a notification from the session it was working in.
 - **Splits, scratch, and overlays.** Split a session into two shells side by side or top and bottom, open a scratch terminal over it, or run a program in a full or floating overlay without disturbing the shell underneath.
-- **Three restore modes.** Restore the saved layout with fresh shells, start the commands that were captured at quit, or keep the actual primary and split processes alive with zmx. Live sessions are global, require zsh as the macOS login shell, and take effect after restarting agterm.
+- **Companions.** Keep a log tail, a watcher, a second shell, or an HTML page pinned under a session in the sidebar: companions move, fold, and close with it. Duplicate as Companion copies a session's split layout and starts another copy of each pane's program. They work on sessions attached from another Mac too. An HTML page can also be a session of its own, holding companions and coming back after a relaunch.
+- **Live sessions.** Quit, update, or relaunch agterm while the processes in primary and split panes keep running, an agent mid-turn included. The next launch reattaches to them with their text and TUI state. It is one of three restore modes in Settings ▸ General ▸ Restore sessions, next to fresh shells and re-running the commands captured at quit. Live mode takes effect after restarting agterm and requires zsh or fish as the macOS login shell, or as the absolute path in the ghostty `command` agterm loads.
+- **Remote sessions.** Open a session running on another Mac as a row in this sidebar, split and companions included, from File ▸ Attach Remote… or with `agtermctl zmx attach --companions`. Its status, notifications, HUD, and title-bar context follow it to this Mac, and its panes take this Mac's size. The other Mac runs agterm in Live sessions mode and is reached over key-based ssh. The menu item lists the Macs named in `remotes.conf`; [Remote sessions](https://agterm.com/docs#remote-sessions) covers the setup.
 - **Agent skill.** An installable skill (Help ▸ Install Agent Skill…) teaches Claude Code or Codex the control model and the `agtermctl` commands, so an agent running inside agterm can build its own layout, run overlays, manage windows, and show images inline without you explaining the API.
 - **Agent status.** A coding agent reports its state (active, blocked, or completed) onto its session's row, so you can see which of many running agents needs you. Status hooks for Claude Code, Codex, Pi, OpenCode, and other agents install from Help ▸ Install Agent Status Hooks….
 
@@ -54,6 +56,7 @@ A split session, two panes side by side on different color themes:
 - **Workspace.** A named group of sessions for one project or context.
 - **Session.** One running shell with a name, a working directory, and its own scrollback. It is the row you see in the sidebar, and it keeps running while you work in another one.
 - **Split and scratch.** A session can split into two shells side by side or top and bottom, both sharing the one sidebar row, and it can open a scratch terminal over itself for a quick aside.
+- **Companion.** A session pinned under another one, listed and folded with it in the sidebar, and closed with it. A running session can become one later: Convert to Companion nests it under a fresh shell in its place.
 - **Overlay.** One program running in a temporary terminal over a session. It disappears when the program exits and leaves the shell underneath unchanged.
 
 ## Install
@@ -98,6 +101,7 @@ sid=$(agtermctl session new --workspace "$ws" --cwd "$PWD" --no-select)
 agtermctl session split on --axis horizontal --target "$sid" # add a top-and-bottom shell
 agtermctl session type $'pwd\n' --target "$sid"           # drive a session you are not looking at
 agtermctl session text --target "$sid" --lines 10         # read its terminal back
+agtermctl msg send "build done" --to "$sid:bottom"        # leave a message in the bottom shell's mailbox
 agtermctl session status blocked --target "$sid"          # set the sidebar status glyph
 printf '%s\n' staging production | agtermctl pick --prompt "Deploy where?"   # open the native picker
 agtermctl ask "Deploy now?" --button yes=Deploy --button no=Not\ yet --default no  # ask a question, get the button
@@ -116,11 +120,7 @@ The same interface covers windows, splits, overlays, dashboards, HUDs, notificat
 - [CONTRIBUTING.md](CONTRIBUTING.md) covers building from source.
 - [ARCHITECTURE.md](ARCHITECTURE.md) describes the internals: the module split, surface ownership, and the libghostty C boundary.
 
-Sessions come back on the next launch with their directory, font size, and split state. **Settings ▸ General ▸ Restore sessions** chooses fresh shells, re-run commands, or live sessions. Live mode wraps every primary and split pane; scratch, overlay, and quick terminals remain temporary. A clean quit leaves each live process running and captures the foreground command as a fallback. The next launch reattaches when the daemon survived. If the daemon is missing after an orderly machine restart, zmx creates it with the captured command; the pane remains live and later launches reattach normally.
-
-The fallback has three exclusions. A pane in a window closed before quit has no capture and starts a fresh shell if its daemon is missing. A hard power loss or force quit never reaches capture. A command refused by `restore-denylist.conf`, carrying a control character, or captured with invalid UTF-8 also starts a fresh shell. SIGTERM leaves live daemons running but skips the clean-quit capture path. `agtermctl zmx list` shows every daemon and the pane that claims it, `agtermctl zmx prune` clears the detached ones no pane claims, and `agtermctl restore mode` reads or sets the policy without opening Settings. Switching away from Live sessions and restarting ends the detached live processes. A launch that still requests Live sessions but cannot use it preserves them for a later eligible launch.
-
-Live restore keeps the running process, usable text and TUI state, and normal terminal colors. The reconstructed screen does not retain inline images, earlier OSC 133 prompt markers, program-changed palette entries, or hyperlink metadata already attached to cells. New output after reattach behaves normally.
+Restore modes and the limits of live restore are covered in [Restore & persistence](https://agterm.com/docs#restore), and attaching another Mac's sessions in [Remote sessions](https://agterm.com/docs#remote-sessions).
 
 Log locations and the common problems are in [docs/troubleshooting.md](docs/troubleshooting.md). Report bugs in [Issues](https://github.com/umputun/agterm/issues), ask questions in [Discussions](https://github.com/umputun/agterm/discussions).
 

@@ -56,17 +56,18 @@ extension ControlServer {
         case .cancelled:
             return ControlResponse(ok: false, error: "zmx.reset was cancelled")
         case .confirmed(let selection):
-            let status = ControlLiveResetStatus(sessions: selection.sessionCount, panes: selection.targets.count, pending: true)
-            return ControlResponse(ok: true, result: ControlResult(text: LiveReset.dialogText(sessionCount: selection.sessionCount).body,
-                                                                    liveReset: status))
+            let outdated = selection.outdatedSessionCount
+            let status = ControlLiveResetStatus(sessions: selection.sessionCount, panes: selection.targets.count, pending: true,
+                                                outdated: outdated > 0 ? outdated : nil)
+            let text = LiveReset.dialogText(sessionCount: selection.sessionCount, outdatedSessions: outdated).body
+            return ControlResponse(ok: true, result: ControlResult(text: text, liveReset: status))
         }
     }
 
-    /// The panes Help ▸ Reset Live Sessions… would reset: every claim, open or saved, whose daemon leader
-    /// is orphaned or attributed to this app. Nil when the listing failed, which refuses the action.
+    /// liveResetSelection covers open and saved panes; nil when the listing failed, which refuses the action.
     func liveResetSelection() -> LiveReset.Selection? {
         guard let zmxClient, let records = zmxClient.sessionRecords() else { return nil }
-        return LiveReset.select(claims: library.paneClaims(), records: records,
+        return LiveReset.select(claims: library.paneClaims(), records: records, outdatedBefore: zmxOutdatedBefore,
                                 classify: liveAttributionProbe.classifier(endpoint: zmxClient.endpoint))
     }
 
@@ -84,9 +85,20 @@ extension ControlServer {
         let walk = library.paneClaims()
         let result = ZmxInventory.join(observed: observed, claims: walk.claims,
                                        inventoryComplete: walk.complete)
-        let inventory = ControlZmxInventory(restore: restoreStatus(), result: result,
-                                            endpoint: client.endpoint, liveReset: liveResetReadback())
+        let inventory = ControlZmxInventory(restore: restoreStatus(), result: result, endpoint: client.endpoint,
+                                            liveReset: liveResetReadback(), outdatedBefore: zmxOutdatedBefore)
         return ControlResponse(ok: true, result: ControlResult(zmx: inventory))
+    }
+
+    /// readZmxScreen answers `zmx.screen` at the daemon's last leader's grid; it attaches nothing.
+    func readZmxScreen(name: String, fullBuffer: Bool, lines: Int?) -> ControlResponse {
+        guard let client = zmxClient else {
+            return ControlResponse(ok: false, error: ControlZmxError.unavailable)
+        }
+        guard let screen = client.screen(name: name, all: fullBuffer) else {
+            return ControlResponse(ok: false, error: "could not read the zmx screen of \(name)")
+        }
+        return ControlResponse(ok: true, result: ControlResult(text: lines.map(screen.lastLines) ?? screen.text))
     }
 }
 
@@ -97,6 +109,10 @@ extension ControlServer {
     /// own windows and answers with a single document. Nothing is composed across two remote calls, so
     /// there is no framing and no window where the far side's topology can move between reads.
     func remoteTree(host: String?) async -> ControlResponse {
+        await remoteTree(host: host, deadline: Self.remoteTreeDeadline)
+    }
+
+    func remoteTree(host: String?, deadline: TimeInterval) async -> ControlResponse {
         guard let host else { return localAttachableSessions() }
         let argv: [String]
         do {
@@ -106,7 +122,7 @@ extension ControlServer {
             // carrying control characters, which agtermctl would print to a terminal after JSON decoding
             return ControlResponse(ok: false, error: "invalid host")
         }
-        let result = await remoteRunner.run(argv, deadline: Self.remoteTreeDeadline)
+        let result = await remoteRunner.run(argv, deadline: deadline)
         guard result.status == 0 else {
             // stdout first: the remote's agtermctl prints a not-ok response there and exits nonzero, so
             // its own sentence never reaches stderr. ssh's own failures do. An ok-looking payload from a
@@ -119,8 +135,7 @@ extension ControlServer {
             let remote = try RemoteTreeMerger.decode(stdout: result.stdout)
             // the far side cannot know which name reached it, so the destination we were given is stamped
             // here rather than self-reported there
-            let stamped = ControlRemoteTree(host: host, endpoint: remote.endpoint, sessions: remote.sessions)
-            return ControlResponse(ok: true, result: ControlResult(remote: stamped))
+            return ControlResponse(ok: true, result: ControlResult(remote: remote.stamped(host: host)))
         } catch let error as RemoteTreeMerger.MergeError {
             return ControlResponse(ok: false, error: error.message)
         } catch {
@@ -143,7 +158,8 @@ extension ControlServer {
                                             result: ZmxInventory.join(observed: observed,
                                                                       claims: walk.claims,
                                                                       inventoryComplete: walk.complete),
-                                            endpoint: client.endpoint, liveReset: liveResetReadback())
+                                            endpoint: client.endpoint, liveReset: liveResetReadback(),
+                                            outdatedBefore: zmxOutdatedBefore)
         // a live store IS the open-window test, the same one `openCounts` uses: a closed window has no
         // store, and its panes are not attachable from here anyway
         let windows = library.windows.compactMap { entry in
@@ -179,6 +195,36 @@ extension ControlServer {
         guard let remote = tree.sessions.first(where: { $0.id == session }) else {
             return ControlResponse(ok: false, error: "no attachable session \(session) on \(host)")
         }
+        let store: AppStore
+        switch resolveOpenWindow(window) {
+        case .failure(let response): return response
+        case .success(let (_, resolved)): store = resolved
+        }
+        if remote.content == "page" { return await attachRemotePageRow(remote, tree: tree, host: host, in: store) }
+        // a companion joins its parent's group when exactly one row here shows that parent, else it stands alone
+        let parents = remote.parent == nil ? [] : attachedParentRows(of: remote, tree: tree, host: host, in: store)
+        if parents.count == 1, let parent = parents.first, let workspace = store.workspace(forSession: parent.id)?.id {
+            return attach(remote, from: tree, host: host,
+                          placement: RemotePlacement(store: store, workspace: workspace, parent: parent.id))
+        }
+        guard let workspace = store.currentWorkspaceID else {
+            return ControlResponse(ok: false, error: "no window to attach into")
+        }
+        return attach(remote, from: tree, host: host, placement: RemotePlacement(store: store, workspace: workspace))
+    }
+
+    /// RemotePlacement is where an attached row goes: a workspace, or under `parent`, a remote row of the same host.
+    struct RemotePlacement {
+        let store: AppStore
+        let workspace: UUID
+        var parent: UUID?
+        var select = true
+    }
+
+    /// attach creates the local row for `remote`, one session of `tree`, and binds its panes. Everything that can
+    /// fail is checked before the model is touched.
+    func attach(_ remote: ControlRemoteSession, from tree: ControlRemoteTree, host: String,
+                placement: RemotePlacement) -> ControlResponse {
         // by role, never by position: a payload with two lefts or no left must fail rather than quietly
         // become one pane, or the wrong one
         let byRole = Dictionary(remote.panes.map { (ZmxPaneRole(controlName: $0.pane), $0.daemon) },
@@ -189,28 +235,26 @@ extension ControlServer {
         let right = byRole[.right]
         let primary: String
         let split: String?
+        // attaching is the user asking for the session HERE, so every pane claims the lead at once
+        let leads = (left: ZmxLeadAttachment(claim: true), right: ZmxLeadAttachment(claim: true))
         do {
-            primary = try paneCommand(host: host, tree: tree, daemon: left, name: remote.name, pane: .left)
+            primary = try RemoteSession.attachPaneCommand(host: host, endpoint: tree.endpoint, daemon: left,
+                                                          session: remote.name, pane: .left, lead: leads.left)
             split = try right.map {
-                try paneCommand(host: host, tree: tree, daemon: $0, name: remote.name, pane: .right)
+                try RemoteSession.attachPaneCommand(host: host, endpoint: tree.endpoint, daemon: $0,
+                                                    session: remote.name, pane: .right, lead: leads.right)
             }
         } catch {
             return ControlResponse(ok: false, error: "\(host) reported a session agterm cannot address")
         }
-        let store: AppStore
-        switch resolveOpenWindow(window) {
-        case .failure(let response): return response
-        case .success(let (_, resolved)): store = resolved
-        }
-        guard let workspace = store.currentWorkspaceID else {
-            return ControlResponse(ok: false, error: "no window to attach into")
-        }
+        let store = placement.store
         // the LOCAL working directory, not the remote one: libghostty chdirs the ssh process here, and a
         // path that exists on the far side may not exist on this Mac. The attached shell reports its real
         // cwd through the terminal stream anyway.
-        guard let created = store.addSession(toWorkspace: workspace, cwd: NSHomeDirectory(),
+        guard let created = store.addSession(toWorkspace: placement.workspace, cwd: NSHomeDirectory(),
                                              command: primary, name: remote.name, wait: true,
-                                             remoteHost: host) else {
+                                             select: placement.select, remoteHost: host,
+                                             parentID: placement.parent) else {
             return ControlResponse(ok: false, error: "could not create the session")
         }
         if let split {
@@ -219,16 +263,22 @@ extension ControlServer {
             store.setSplitVisibility(created.id, shown: true,
                                      axis: remote.splitAxis.flatMap(SplitAxis.init(rawValue:)) ?? .leftRight)
         }
+        var daemons = [created.paneIdentity: left]
+        ZmxLeadBook.shared.begin(leads.left, pane: created.paneIdentity)
+        if let right, let local = created.splitPaneIdentity {
+            daemons[local] = right
+            ZmxLeadBook.shared.begin(leads.right, pane: local)
+        }
+        let origin = RemoteBinding.Origin(host: host, endpoint: tree.endpoint, sessionName: remote.name)
+        store.bindRemote(RemoteBinding(remoteSessionID: remote.id, daemonsByLocalPane: daemons,
+                                       presentationVersion: tree.presentation, origin: origin),
+                         forSession: created.id)
+        // the row's created event fired inside `addSession`, before the binding existed
+        startRemotePresentation(for: created)
         // a FIXED target, never `focusActiveSession`: it follows `splitFocused`, which the new split's deck
         // re-render can clear from under it through `onFocusChange`.
-        actions.focusSplitPane(created, wantSplit: created.splitFocused)
-        return ControlResponse(ok: true, result: ControlResult(id: created.id.uuidString))
-    }
-
-    private func paneCommand(host: String, tree: ControlRemoteTree, daemon: String, name: String,
-                             pane: ZmxPaneRole) throws -> String {
-        try RemoteSession.attachPaneCommand(host: host, endpoint: tree.endpoint, daemon: daemon,
-                                            session: name, pane: pane)
+        if placement.select { actions.focusSplitPane(created, wantSplit: created.splitFocused) }
+        return ControlResponse(ok: true, result: ControlResult(id: created.id.uuidString, parent: placement.parent?.uuidString))
     }
 
     /// Kill the daemons the inventory shows as unclaimed and detached.

@@ -25,21 +25,30 @@ extension AppActions {
             canRemoveWorkspace: activeStore?.canRemoveWorkspace == true,
             hasFlaggedSessions: activeStore?.flaggedSessions.isEmpty == false,
             sidebarShowsWorkspaceTree: activeStore?.sidebarMode == .tree,
+            sidebarShowsWorkspaceRows: activeStore?.rendersWorkspaceRows(flaggedLayout: GhosttyApp.shared.flaggedViewLayout) == true,
             sidebarShowsFlaggedOnly: activeStore?.sidebarMode == .flagged,
             activeSessionFlagged: activeStore?.activeSession?.flagged == true,
             hasMarkedWorkspaces: activeStore?.focusedWorkspaceIDs.isEmpty == false,
             activeWorkspaceMarked: activeStore?.isCurrentWorkspaceFocusMember == true,
             activeWorkspaceCollapsed: activeStore?.isCurrentWorkspaceCollapsed == true,
             canStepWorkspaces: activeStore?.canStepWorkspaces == true,
+            canStepWindows: library.canStepWindows,
             activeSessionHasSplit: activeStore?.activeSession?.hasSplit == true,
             activeSplitAxis: activeStore?.activeSession?.splitAxis,
             hasPendingClose: activeStore?.pendingCloseSummary != nil,
             hasRecentClosed: !library.recentClosedItems.isEmpty,
             hasActiveSession: activeStore?.activeSession != nil,
+            attentionNavigationAcrossWindows: activeStore?.attentionNavigationAcrossWindows == true,
+            hasSessions: activeStore?.workspaces.contains { !$0.sessions.isEmpty } == true,
             hasCurrentWorkspace: activeStore?.currentWorkspaceID != nil,
+            hasRemotes: !configuredRemotes.isEmpty,
             terminalZoomActive: terminalZoomActive,
             dashboardOpen: frontmostDashboard?.isOpen == true,
-            pickerActive: pickActive(for: library.activeWindowID)
+            pickerActive: pickActive(for: library.activeWindowID),
+            activeSessionHasOverlay: activeStore?.activeSession?.hideableOverlaySlots(nil).isEmpty == false,
+            activeSessionIsPage: activeStore?.activeSession?.content == .page,
+            activeSessionIsCompanion: activeStore?.activeSession?.parentID != nil,
+            activeSessionIsRemote: activeStore?.activeSession?.remoteHost != nil
         )
     }
 
@@ -70,6 +79,9 @@ extension AppActions {
         case .openDirectory: openDirectory()
         case .renameSession: renameActiveSession()
         case .duplicateSession: duplicateActiveSession()
+        case .newCompanion: newCompanionOfActiveSession()
+        case .duplicateCompanion: duplicateActiveSessionAsCompanion()
+        case .convertCompanion: convertActiveSessionToCompanion()
         case .renameWorkspace: renameActiveWorkspace()
         case .closeSession: closeActiveSession()
         case .reopenRecent: openLatestRecentClosed()
@@ -81,6 +93,8 @@ extension AppActions {
         case .nextAttentionSession: selectNextAttentionSession()
         case .previousWorkspace: selectPreviousWorkspace()
         case .nextWorkspace: selectNextWorkspace()
+        case .previousWindow: selectPreviousWindow()
+        case .nextWindow: selectNextWindow()
         case .firstSession: selectFirstSession()
         case .lastSession: selectLastSession()
         case .showAttention: openAttentionPalette()
@@ -89,6 +103,7 @@ extension AppActions {
         case .closeSplit: closeSplit()
         case .swapPanes: swapActiveSessionPanes()
         case .toggleScratch: toggleScratch()
+        case .toggleOverlay: toggleOverlays()
         case .toggleTerminalZoom: toggleTerminalZoom()
         case .toggleSidebar: toggleSidebar()
         case .toggleFlag: toggleFlagActiveSession()
@@ -101,14 +116,19 @@ extension AppActions {
         case .decreaseFontSize: decreaseFontSize()
         case .resetFontSize: resetFontSize()
         case .selectTheme: openThemePalette()
+        case .attachRemote: attachRemote()
         case .editKeymap: editKeymap()
         case .reloadKeymap: reloadKeymap()
+        case .editHooks: editHooks()
+        case .reloadHooks: reloadHooks()
         case .editGhosttyConfig: editGhosttyConfig()
         case .reloadConfig: reloadGhosttyConfig()
         case .deleteWorkspace: deleteActiveWorkspace()
         case .toggleFlaggedView: toggleFlaggedView()
         case .clearFlagged: clearFlags()
+        case .editFlaggedSessions: openFlaggedEditor()
         case .clearFocus: clearFocus()
+        case .editFocusedWorkspaces: openFocusEditor()
         case .addWorkspaceToFocus: addActiveWorkspaceToFocus()
         case .toggleWorkspaceFilter: toggleFocusFilter()
         case .expandWorkspaces: expandAllWorkspaces()
@@ -187,19 +207,54 @@ extension AppActions {
                 self?.openWindow(target)
             })
         }
-        // skip the session's OWN workspace, not `currentWorkspaceID` — a freshly created workspace is
-        // current while the selection still sits elsewhere, and it is a valid destination.
-        if let store, let sessionID = store.selectedSessionID,
-           let owner = store.workspace(forSession: sessionID)?.id {
-            for workspace in store.workspaces where workspace.id != owner {
-                let target = workspace.id
-                items.append(PaletteItem(id: "move-\(target)", title: "Move Session to \(workspace.name)") { [weak self] in
-                    self?.moveSession(sessionID, toWorkspace: target)
-                })
-            }
-        }
+        items.append(contentsOf: moveItems())
+        items.append(contentsOf: tintItems())
         items.append(contentsOf: customCommandItems(badge: "custom"))
         return items
+    }
+
+    /// moveItems are "Move Session to <workspace>" for every workspace but the selected session's own. The
+    /// session is read when the row runs, since the selection can move under an open palette.
+    private func moveItems() -> [PaletteItem] {
+        // skip the session's OWN workspace, not `currentWorkspaceID`: a freshly created workspace is
+        // current while the selection still sits elsewhere, and it is a valid destination.
+        guard let store, let sessionID = store.selectedSessionID,
+              let owner = store.workspace(forSession: sessionID)?.id else { return [] }
+        return store.workspaces.filter { $0.id != owner }.map { workspace in
+            let target = workspace.id
+            let movable: (AppStore) -> UUID? = { store in
+                guard let id = store.selectedSessionID,
+                      let current = store.workspace(forSession: id)?.id, current != target,
+                      store.canMoveSessions([id], toWorkspace: target) else { return nil }
+                return id
+            }
+            return PaletteItem(id: "move-\(target)", title: "Move Session to \(workspace.name)",
+                               isEnabled: { [weak self, weak store] in
+                                   (self?.uiActionsEnabled ?? false) && store.flatMap(movable) != nil
+                               },
+                               run: { [weak self, weak store] in
+                                   guard let store, let id = movable(store) else { return }
+                                   self?.moveSession(id, toWorkspace: target)
+                               })
+        }
+    }
+
+    /// tintItems are "Tint Session: <color>" plus None for the active session, each keeping the session's
+    /// placement. The session is read when the row runs, since the selection can move under an open palette.
+    private func tintItems() -> [PaletteItem] {
+        guard let store, store.selectedSessionID != nil else { return [] }
+        let choices: [TintColor?] = TintColor.allCases + [nil]
+        return choices.map { color in
+            PaletteItem(id: "tint-\(color?.rawValue ?? "none")",
+                        title: "Tint Session: \(color?.rawValue.capitalized ?? "None")",
+                        isEnabled: { [weak self, weak store] in
+                            (self?.uiActionsEnabled ?? false) && store?.selectedSessionID != nil
+                        },
+                        run: { [weak self, weak store] in
+                            guard self?.uiActionsEnabled == true, let store, let id = store.selectedSessionID else { return }
+                            store.setTintColor(color, forSessions: [id])
+                        })
+        }
     }
 
     /// The user-defined keymap commands as palette items with their bound chord. `badge` tags each entry.
@@ -229,30 +284,38 @@ extension AppActions {
     /// leads with the owning workspace, telling same-named sessions apart and searchable, then `subtitleDetail`.
     func paletteSessions() -> [PaletteItem] {
         guard let store else { return [] }
-        return store.navigableSessions.map { paletteItem(for: $0, in: store) }
+        return store.listOrdered(store.navigableSessions).map { paletteItem(for: $0, in: store) }
     }
 
-    /// The window's non-idle sessions as palette items (`.attention` mode), each row carrying the session's
-    /// agent-status glyph. `store.attentionSessions` orders blocked→active→completed, newest status-change
-    /// first, so the empty-query order matches; choosing one selects it. Subtitle as in `paletteSessions()`.
+    /// Every open window's non-idle sessions as palette items (`.attention` mode), in the library's order so
+    /// the empty query keeps it. Enablement asks the OWNING window, not the frontmost one, and the run
+    /// defers `selectAttention` past the palette's close and focus-restore so a raise never competes with
+    /// the dismissal.
     func paletteAttention() -> [PaletteItem] {
-        guard let store else { return [] }
-        return store.attentionSessions.map {
-            paletteItem(for: $0, in: store, status: $0.agentIndicator.status,
-                        statusColor: $0.agentIndicator.color, statusShape: $0.agentIndicator.shape)
+        library.attentionAcrossWindows.map { entry in
+            let windowID = entry.window.id
+            let sessionID = entry.session.id
+            return PaletteItem(id: sessionID.uuidString, title: library.attentionLabel(entry),
+                               subtitle: library.attentionSubtitle(entry),
+                               indicator: { [weak session = entry.session] in session?.agentIndicator ?? AgentIndicator() },
+                               isEnabled: { [weak self] in
+                self?.canSelectAttention(windowID: windowID, sessionID: sessionID) ?? false
+            },
+                               run: { [weak self] in
+                DispatchQueue.main.async { self?.selectAttention(windowID: windowID, sessionID: sessionID) }
+            })
         }
     }
 
-    /// Maps one session to a palette row — title `displayName`, subtitle "`workspace` · `subtitleDetail`", run
-    /// selects it. Shared by `paletteSessions()` (status nil) and `paletteAttention()`, where a set status makes
-    /// `CommandPalette.row` render the leading `StatusGlyph` in the per-call `statusColor`/`statusShape`.
-    private func paletteItem(for session: Session, in store: AppStore, status: AgentStatus? = nil,
-                             statusColor: String? = nil, statusShape: StatusShape? = nil) -> PaletteItem {
+    /// Maps one session to a palette row — title `listLabel`, subtitle "`workspace` · `subtitleDetail`", run
+    /// selects it.
+    private func paletteItem(for session: Session, in store: AppStore) -> PaletteItem {
         let id = session.id
         let workspaceName = store.workspace(forSession: id)?.name ?? ""
         let subtitle = "\(workspaceName) · \(session.subtitleDetail)"
-        return PaletteItem(id: id.uuidString, title: session.displayName, subtitle: subtitle,
-                           status: status, statusColor: statusColor, statusShape: statusShape) { [weak self] in
+        return PaletteItem(id: id.uuidString, title: store.listLabel(for: session), subtitle: subtitle,
+                           indicator: { [weak session] in session?.agentIndicator ?? AgentIndicator() },
+                           run: { [weak self] in
             guard self?.uiActionsEnabled == true else { return }
             // a palette pick is user-initiated: note activity so it buys the full idle grace before
             // auto-follow can pull the selection back.
@@ -261,7 +324,7 @@ extension AppActions {
             // reveal the picked session's blocked pane (no-op without a pane-tagged block), async so it runs
             // AFTER the palette closes and its focus-restore, winning the focus race.
             DispatchQueue.main.async { self?.revealActiveBlockedPane(captured: indicator) }
-        }
+        })
     }
 
     /// Toggle the `.attention` palette. Driven by ⌃⇧I `BuiltinAction.showAttention`, Navigate ▸ Go to
@@ -291,30 +354,73 @@ extension AppActions {
         palette?.toggle(.customCommands)
     }
 
-    /// Open `.attention` from the action-palette "Show Attention" launcher on the next runloop tick, like
-    /// `openThemePalette()`: the launcher runs inside the action palette's `runItem`, which calls
-    /// `controller.close()` right after this returns, so a synchronous toggle would be undone.
     func openAttentionPalette() {
+        openDeferred(.attention)
+    }
+
+    // MARK: - Membership editors
+
+    func openFlaggedEditor() {
+        openDeferred(.flaggedEditor)
+    }
+
+    func openFocusEditor() {
+        openDeferred(.focusEditor)
+    }
+
+    // defer until the launching action palette has dismissed: its runItem closes the controller right after
+    // the launcher returns, so a synchronous open would be undone.
+    private func openDeferred(_ mode: PaletteMode) {
         guard !terminalZoomActive, !pickActive(for: library.activeWindowID) else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.terminalZoomActive,
                   !self.pickActive(for: self.library.activeWindowID) else { return }
-            self.palette?.open(.attention)
+            self.palette?.open(mode)
+        }
+    }
+
+    // capture the row target because unflagging can change the active session.
+    func paletteFlaggedEditor() -> [PaletteItem] {
+        guard let store else { return [] }
+        return store.workspaces.flatMap { workspace in
+            workspace.sessions.map { session in
+                let id = session.id
+                return PaletteItem(id: id.uuidString, title: store.listLabel(for: session), subtitle: workspace.name,
+                                   indicator: { [weak session] in session?.agentIndicator ?? AgentIndicator() },
+                                   isEnabled: { [weak self, weak store] in
+                                       self?.uiActionsEnabled == true && store?.session(withID: id) != nil
+                                   },
+                                   mark: { [weak store] in .flag(store?.session(withID: id)?.flagged == true) },
+                                   run: { [weak store] in
+                                       guard let store, let live = store.session(withID: id) else { return }
+                                       store.setFlag(!live.flagged, forSession: id)
+                                   })
+            }
+        }
+    }
+
+    func paletteFocusEditor() -> [PaletteItem] {
+        guard let store else { return [] }
+        return store.workspaces.map { workspace in
+            let id = workspace.id
+            let count = workspace.sessions.count
+            return PaletteItem(id: id.uuidString, title: workspace.name,
+                               subtitle: count == 1 ? "1 session" : "\(count) sessions",
+                               isEnabled: { [weak self, weak store] in
+                                   self?.uiActionsEnabled == true && store?.workspaces.contains { $0.id == id } == true
+                               },
+                               mark: { [weak store] in .focus(store?.focusedWorkspaceIDs.contains(id) == true) },
+                               run: { [weak store] in
+                                   guard let store else { return }
+                                   store.setFocusMembership(id, member: !store.focusedWorkspaceIDs.contains(id))
+                               })
         }
     }
 
     // MARK: - Theme picker
 
-    /// Open the `.themes` palette (the live-preview theme picker), from the action-palette "Select Theme…"
-    /// launcher or View ▸ Select Theme…, on the next runloop tick: launched from the open action palette, that
-    /// palette's run handler closes itself right after this returns, so only an async reopen survives it.
     func openThemePalette() {
-        guard !terminalZoomActive, !pickActive(for: library.activeWindowID) else { return }
-        DispatchQueue.main.async { [weak self] in
-            guard let self, !self.terminalZoomActive,
-                  !self.pickActive(for: self.library.activeWindowID) else { return }
-            self.palette?.open(.themes)
-        }
+        openDeferred(.themes)
     }
 
     /// Theme rows for the `.themes` palette: a leading "Default" entry plus one per bundled theme,

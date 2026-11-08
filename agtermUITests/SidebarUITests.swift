@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 
 /// Real UI tests: launch the actual app and drive the sidebar through the
@@ -162,6 +163,43 @@ final class SidebarUITests: XCTestCase {
         XCTAssertTrue(triangle.waitForExistence(timeout: 5), "the workspace row should expose its disclosure triangle")
         triangle.click()
         XCTAssertTrue(pollSessionRowCount(0, timeout: 8), "the disclosure triangle should collapse regardless of the setting")
+    }
+
+    func testHiddenChevronsLeaveTheRowClickToggle() throws {
+        let ws = try relaunch(settings: ["hiddenInterfaceElements": ["workspaceChevrons"]])
+        XCTAssertFalse(app.disclosureTriangles.firstMatch.waitForExistence(timeout: 2), "the workspace chevron should be hidden")
+
+        ws.click()
+        XCTAssertTrue(pollSessionRowCount(0, timeout: 5), "a row click should collapse the workspace")
+        ws.click()
+        XCTAssertTrue(pollSessionRowCount(1, timeout: 5), "a second row click should expand it again")
+    }
+
+    func testHiddenChevronsWithRowClickOffFoldThroughTheRowMenu() throws {
+        let ws = try relaunch(settings: ["hiddenInterfaceElements": ["workspaceChevrons"], "workspaceRowClickExpands": false])
+
+        ws.click()
+        XCTAssertFalse(pollSessionRowCount(0, timeout: 3), "a row click must not collapse the workspace while the setting is off")
+
+        ws.rightClick()
+        let collapse = app.menus.menuItems["Collapse Workspace"].firstMatch
+        XCTAssertTrue(collapse.waitForExistence(timeout: 5), "the row menu should offer Collapse Workspace")
+        collapse.click()
+        XCTAssertTrue(pollSessionRowCount(0, timeout: 5), "the row menu should collapse the workspace")
+    }
+
+    private func relaunch(settings: [String: Any]) throws -> XCUIElement {
+        XCTAssertTrue(app.staticTexts["workspace 1"].waitForExistence(timeout: 20), "seeded workspace should exist")
+        XCTAssertTrue(pollSessionRowCount(1, timeout: 10), "seeded session should be visible")
+        app.terminate()
+        try JSONSerialization.data(withJSONObject: settings).write(to: stateDir.appendingPathComponent("settings.json"))
+        app = XCUIApplication()
+        app.launchEnvironment["AGTERM_STATE_DIR"] = stateDir.path
+        app.launchForUITest()
+        let ws = app.staticTexts["workspace 1"]
+        XCTAssertTrue(ws.waitForExistence(timeout: 20), "workspace 1 should restore")
+        XCTAssertTrue(pollSessionRowCount(1, timeout: 10), "the session row should be visible after relaunch")
+        return ws
     }
 
     // the `persistAndApply()` mirror leg: the seeded-file test above covers only the launch-time one, so
@@ -353,6 +391,76 @@ final class SidebarUITests: XCTestCase {
                       "committing a rename should return focus to the session terminal")
     }
 
+    private func controlClick(_ element: XCUIElement) {
+        XCTAssertTrue(element.waitForHittable(timeout: 10), "row should be hittable for Control-click")
+        XCUIElement.perform(withKeyModifiers: .control) {
+            element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+        }
+    }
+
+    func testControlClickSessionRowOpensContextMenu() throws {
+        controlClick(sessionRow())
+        XCTAssertTrue(presentedMenuItem("Rename").isHittable, "Control-click should open the session row's context menu")
+    }
+
+    func testControlClickWorkspaceRowOpensContextMenuWithoutToggling() throws {
+        let session = sessionRow()
+        XCTAssertTrue(session.waitForExistence(timeout: 20), "seeded session row should be visible while expanded")
+        controlClick(app.staticTexts["workspace 1"])
+        let delete = presentedMenuItem("Delete Workspace")
+        XCTAssertTrue(delete.isHittable, "Control-click should open the workspace row's context menu")
+        app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+        XCTAssertTrue(delete.waitForNonExistence(timeout: 5), "Esc should dismiss the context menu")
+        usleep(UInt32(NSEvent.doubleClickInterval * 1_000_000) + 300_000)
+        XCTAssertTrue(session.exists, "Control-click must not toggle the workspace's expansion")
+    }
+
+    func testCompanionsNestFoldAndReorderAmongSiblings() throws {
+        let parent = app.staticTexts.matching(identifier: "session-row").element(boundBy: 0)
+        XCTAssertTrue(parent.waitForExistence(timeout: 20))
+        for count in [2, 3] {
+            parent.rightClick()
+            presentedMenuItem("New Companion").click()
+            XCTAssertTrue(pollSessionRowCount(count, timeout: 5), "New Companion should add a row under the parent")
+        }
+        let before = try XCTUnwrap(pollSessions { $0.count == 3 && $0.dropFirst().allSatisfy { $0["parentID"] != nil } })
+        let ids = before.compactMap { $0["id"] as? String }
+
+        let triangle = app.disclosureTriangles.element(boundBy: 1)
+        XCTAssertTrue(triangle.waitForHittable(timeout: 5), "a parent with companions should have a disclosure triangle")
+        triangle.click()
+        XCTAssertTrue(pollSessionRowCount(1, timeout: 5), "folding the parent should hide its companions")
+        XCTAssertNotNil(pollSessions { $0.first?["collapsed"] as? Bool == true }, "the fold should persist")
+        triangle.click()
+        XCTAssertTrue(pollSessionRowCount(3, timeout: 5))
+
+        let rows = app.staticTexts.matching(identifier: "session-row")
+        let last = rows.element(boundBy: 2)
+        let first = rows.element(boundBy: 1)
+        XCTAssertTrue(last.waitForHittable(timeout: 10))
+        last.click()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        last.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .click(forDuration: 0.7, thenDragTo: first.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.05)),
+                   withVelocity: 180, thenHoldForDuration: 0.25)
+        XCTAssertNotNil(pollSessions { $0.compactMap { $0["id"] as? String } == [ids[0], ids[2], ids[1]] },
+                        "dragging the last companion above its sibling should reorder inside the group")
+    }
+
+    private func pollSessions(_ predicate: ([[String: Any]]) -> Bool) -> [[String: Any]]? {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if let data = try? Data(contentsOf: stateDir.windowSnapshotFile()),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let sessions = (obj["workspaces"] as? [[String: Any]])?.first?["sessions"] as? [[String: Any]],
+               predicate(sessions) {
+                return sessions
+            }
+            usleep(200_000)
+        }
+        return nil
+    }
+
     func testCloseSession() throws {
         let row = sessionRow()
         XCTAssertTrue(row.waitForExistence(timeout: 20))
@@ -452,6 +560,24 @@ final class SidebarUITests: XCTestCase {
         addBtn.click()
         XCTAssertTrue(pollSessionCount(workspace: "workspace 1", expected: 2, timeout: 5),
                       "workspace 1 should have 2 sessions after clicking the inline '+' button")
+    }
+
+    func testControlClickInlineAddSessionButtonOpensWorkspaceMenu() throws {
+        XCTAssertTrue(sessionRow().waitForExistence(timeout: 20), "seeded session should exist")
+        let ws = app.staticTexts["workspace 1"]
+        XCTAssertTrue(ws.waitForExistence(timeout: 5), "seeded workspace should exist")
+        let addBtn = app.descendants(matching: .any).matching(identifier: "workspace-add-session").firstMatch
+        let deadline = Date().addingTimeInterval(8)
+        while !addBtn.isHittable, Date() < deadline {
+            ws.hover()
+            usleep(200_000)
+        }
+        controlClick(addBtn)
+        let delete = presentedMenuItem("Delete Workspace")
+        XCTAssertTrue(delete.isHittable, "Control-click on '+' should open the workspace row's context menu")
+        app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+        usleep(1_000_000)
+        XCTAssertTrue(pollSessionRowCount(1, timeout: 2), "Control-click on '+' must not create a session")
     }
 
     // the picker is system UI, so only its presentation is checked here; the resulting addSession(cwd:)

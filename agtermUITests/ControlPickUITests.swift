@@ -78,6 +78,21 @@ final class ControlPickUITests: ControlAPITestCase {
         XCTAssertEqual(result["index"] as? Int, 0, "the caller's first row is index 0, not the A→Z winner")
     }
 
+    func testSelectOpensOnTheNamedRowScrolledIntoView() throws {
+        let items = (1...40).map { ["id": "item-\($0)", "label": "Item \($0)"] }
+        let pickID = try resultID(openPick(items, selection: "item-30"))
+        XCTAssertTrue(pickPalette.waitForExistence(timeout: 10), "pick.open should present the picker")
+        XCTAssertTrue(app.paletteRow("item-30").waitForHittable(timeout: 5),
+                      "the selected row must be scrolled into view, not highlighted off screen")
+
+        app.typeKey(.return, modifierFlags: [])
+
+        let result = try awaitTerminalResult(id: pickID)
+        XCTAssertEqual(result["result"] as? String, "picked")
+        XCTAssertEqual(result["id"] as? String, "item-30", "Return without typing must run the selected row")
+        XCTAssertEqual(result["index"] as? Int, 29, "the index is the caller's array position")
+    }
+
     /// Pins the trim: `query` is unvalidated, and a newline survived the old whitespace-only trim while
     /// `fuzzyScore` still consumed it, so every row scored 0 and the A→Z tie-break replaced the caller's
     /// first row with the one Return runs.
@@ -165,6 +180,46 @@ final class ControlPickUITests: ControlAPITestCase {
         XCTAssertEqual(result["result"] as? String, "picked")
         XCTAssertEqual(result["id"] as? String, "gamma", "Return should run the prefiltered list's only row")
         XCTAssertEqual(result["index"] as? Int, 2, "the reported index stays the caller's array position")
+    }
+
+    func testControlJAndKMoveThePickSelection() throws {
+        let pickID = try resultID(openPick([
+            ["id": "alpha", "label": "Alpha"],
+            ["id": "beta", "label": "Beta"],
+            ["id": "gamma", "label": "Gamma"],
+        ]))
+        XCTAssertTrue(pickPalette.waitForExistence(timeout: 10), "pick.open should present the picker")
+        XCTAssertTrue(app.paletteRow("gamma").waitForExistence(timeout: 5), "the items should be listed")
+
+        app.typeKey("j", modifierFlags: [.control])
+        app.typeKey("j", modifierFlags: [.control])
+        app.typeKey("k", modifierFlags: [.control])
+        app.typeKey(.return, modifierFlags: [])
+
+        let result = try awaitTerminalResult(id: pickID)
+        XCTAssertEqual(result["result"] as? String, "picked")
+        XCTAssertEqual(result["id"] as? String, "beta", "⌃J⌃J⌃K should land on the second row")
+    }
+
+    func testPlainJAndKStillTypeIntoThePickQuery() throws {
+        let pickID = try resultID(openPick([], allowCustom: true))
+        XCTAssertTrue(pickPalette.waitForExistence(timeout: 10), "pick.open should present the picker")
+        let field = app.textFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 5), "the picker query field should exist")
+
+        app.typeText("jk")
+        // caret at the start, where an unhandled ctrl+k would kill the whole query.
+        app.typeKey(.leftArrow, modifierFlags: [])
+        app.typeKey(.leftArrow, modifierFlags: [])
+        app.typeKey("j", modifierFlags: [.control])
+        app.typeKey("k", modifierFlags: [.control])
+        XCTAssertEqual(field.value as? String, "jk", "bare j and k type, and the control chords leave the query alone")
+
+        app.typeKey(.return, modifierFlags: [])
+
+        let result = try awaitTerminalResult(id: pickID)
+        XCTAssertEqual(result["result"] as? String, "custom")
+        XCTAssertEqual(result["query"] as? String, "jk")
     }
 
     func testEmptyItemsWithAllowCustomActAsAPrefilledPrompt() throws {
@@ -518,12 +573,14 @@ final class ControlPickUITests: ControlAPITestCase {
         prompt: String? = nil,
         query: String? = nil,
         allowCustom: Bool = false,
+        selection: String? = nil,
         window: String? = nil
     ) throws -> [String: Any] {
         var args: [String: Any] = ["items": items]
         if let prompt { args["prompt"] = prompt }
         if let query { args["query"] = query }
         if allowCustom { args["allowCustom"] = true }
+        if let selection { args["selection"] = selection }
         if let window { args["window"] = window }
         return try sendCommand(request(command: "pick.open", args: args))
     }

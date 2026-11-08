@@ -85,6 +85,13 @@ struct AskCommandsTests {
         (["Question", "--button", "ok", "--style", "gui", "--pane-id", "token"], "--pane requires a session"),
         (["Question", "--button", "ok", "--style", "gui", "--pane", "left", "--pane-id", "token"], "--pane requires a session"),
         (["Question", "--button", "ok", "--target", "active", "--pane", "scratch"], "--pane must be left or right"),
+        (["Question", "--button", "ok", "--choice-subtitle", "a=x"], "--choice-subtitle requires --choice"),
+        (["Question", "--choice", "a", "--choice-subtitle", "a"], "--choice-subtitle requires ID=TEXT"),
+        (["Question", "--choice", "a", "--choice-subtitle", "b=x"], "unknown subtitle choice: b"),
+        (["Question", "--choice", "a", "--choice-subtitle", "a=x", "--choice-subtitle", "a=y"], "subtitle already set for choice: a"),
+        (["Question", "--input", "line", "--hotkey", "ok=o"], "--hotkey requires --button"),
+        (["Question", "--button", "ok", "--other", "x"], "--other requires --choice"),
+        (["Question", "--input", "line", "--other", "x"], "--other requires --choice"),
     ])
     func rootRejectsInvalidSyntax(argv: [String], expected: String) {
         do {
@@ -108,7 +115,7 @@ struct AskCommandsTests {
         var lines: [String] = []
         try command.execute(send: {
             requests.append($0)
-            return ControlResponse(ok: true, result: ControlResult(id: "ask-id", pane: "right"))
+            return SocketReply(ControlResponse(ok: true, result: ControlResult(id: "ask-id", pane: "right")))
         }, sleep: { _ in Issue.record("no-block must not sleep") }, output: { lines.append($0) })
 
         #expect(requests.count == 1)
@@ -128,11 +135,11 @@ struct AskCommandsTests {
         let answer = ControlAskResult(result: .answered, id: "yes", label: "Yes", index: 0)
         try command.execute(send: { request in
             requests.append(request)
-            if request.cmd == .askOpen { return ControlResponse(ok: true, result: ControlResult(id: "ask-id")) }
+            if request.cmd == .askOpen { return SocketReply(ControlResponse(ok: true, result: ControlResult(id: "ask-id"))) }
             polls += 1
-            return ControlResponse(ok: true, result: ControlResult(
+            return SocketReply(ControlResponse(ok: true, result: ControlResult(
                 ask: polls <= 11 ? ControlAskResult(result: .pending) : answer
-            ))
+            )))
         }, sleep: { delays.append($0) }, output: { lines.append($0) })
 
         #expect(requests.first?.args?.window == "w")
@@ -149,8 +156,8 @@ struct AskCommandsTests {
         #expect(throws: ExitCode(rawValue: code)) {
             try command.execute(send: {
                 $0.cmd == .askOpen
-                    ? ControlResponse(ok: true, result: ControlResult(id: "ask-id"))
-                    : ControlResponse(ok: true, result: ControlResult(ask: ControlAskResult(result: outcome)))
+                    ? SocketReply(ControlResponse(ok: true, result: ControlResult(id: "ask-id")))
+                    : SocketReply(ControlResponse(ok: true, result: ControlResult(ask: ControlAskResult(result: outcome))))
             }, sleep: { _ in }, output: { lines.append($0) })
         }
         #expect(lines == ["{\"result\":\"\(outcome.rawValue)\"}"])
@@ -161,16 +168,14 @@ struct AskCommandsTests {
         let command = try open(["Continue?", "--button", "yes=Yes"] + (json ? ["--json"] : []))
         var lines: [String] = []
         var errors: [String] = []
-        let response = ControlResponse(ok: false, error: "ask already pending")
+        let raw = Data(#"{"ok": false, "error": "ask already pending", "hint": "unmodeled"}"#.utf8)
+        let reply = SocketReply(response: try JSONDecoder().decode(ControlResponse.self, from: raw), raw: raw)
         #expect(throws: ExitCode.failure) {
-            try command.execute(send: { _ in response }, sleep: { _ in }, output: { lines.append($0) },
+            try command.execute(send: { _ in reply }, sleep: { _ in }, output: { lines.append($0) },
                                 errorOutput: { errors.append($0) })
         }
-        #expect(lines.count == (json ? 1 : 0))
+        #expect(lines == (json ? [String(decoding: raw, as: UTF8.self)] : []))
         #expect(errors == (json ? [] : ["error: ask already pending"]))
-        if json {
-            #expect(try JSONDecoder().decode(ControlResponse.self, from: Data(#require(lines.first).utf8)) == response)
-        }
     }
 
     @Test func missingOpenIDFailsBeforePolling() throws {
@@ -180,7 +185,7 @@ struct AskCommandsTests {
         #expect(throws: ExitCode.failure) {
             try command.execute(send: {
                 requests.append($0)
-                return ControlResponse(ok: true)
+                return SocketReply(ControlResponse(ok: true))
             }, sleep: { _ in }, output: { _ in Issue.record("malformed open must not print an answer") },
             errorOutput: { errors.append($0) })
         }
@@ -195,7 +200,7 @@ struct AskCommandsTests {
         #expect(throws: ExitCode.failure) {
             try command.execute(send: {
                 requests.append($0)
-                return $0.cmd == .askOpen ? ControlResponse(ok: true, result: ControlResult(id: "ask-id")) : ControlResponse(ok: true)
+                return $0.cmd == .askOpen ? SocketReply(ControlResponse(ok: true, result: ControlResult(id: "ask-id"))) : SocketReply(ControlResponse(ok: true))
             }, sleep: { _ in }, output: { _ in Issue.record("malformed poll must not print an answer") },
             errorOutput: { errors.append($0) })
         }
@@ -211,7 +216,7 @@ struct AskCommandsTests {
             try command.execute(send: {
                 requests.append($0)
                 switch $0.cmd {
-                case .askOpen: return ControlResponse(ok: true, result: ControlResult(id: "ask-id"))
+                case .askOpen: return SocketReply(ControlResponse(ok: true, result: ControlResult(id: "ask-id")))
                 case .askResult: throw SocketClientError("poll failed")
                 default: throw SocketClientError("cancel failed")
                 }
@@ -231,8 +236,8 @@ struct AskCommandsTests {
             try command.execute(send: {
                 requests.append($0)
                 return $0.cmd == .askOpen
-                    ? ControlResponse(ok: true, result: ControlResult(id: "ask-id"))
-                    : ControlResponse(ok: false, error: "unknown ask: ask-id")
+                    ? SocketReply(ControlResponse(ok: true, result: ControlResult(id: "ask-id")))
+                    : SocketReply(ControlResponse(ok: false, error: "unknown ask: ask-id"))
             }, sleep: { _ in }, output: { _ in }, errorOutput: { _ in })
         }
         #expect(requests.map(\.cmd) == [.askOpen, .askResult])
@@ -242,7 +247,10 @@ struct AskCommandsTests {
         (ControlAskResult(result: .pending), Int32(1)),
         (ControlAskResult(result: .answered, id: "yes", label: "Yes", index: 0), Int32(0)),
         (ControlAskResult(result: .cancelled), Int32(2)),
+        (ControlAskResult(result: .cancelled, reason: ControlAskResult.presentationLost), Int32(2)),
         (ControlAskResult(result: .escaped), Int32(3)),
+        (ControlAskResult(result: .answered, id: "ok", label: "OK", index: 0, text: "two\nlines"), Int32(0)),
+        (ControlAskResult(result: .answered, id: "ok", label: "OK", index: 0, selected: ["395", "398"]), Int32(0)),
     ])
     func oneShotResultPrintsEveryOutcomeAndMapsExit(result: ControlAskResult, expectedExit: Int32) throws {
         let command = try #require(try Agtermctl.parseAsRoot(["ask", "result", "ask-id", "--window", "w"]) as? Ask.Result)
@@ -252,7 +260,7 @@ struct AskCommandsTests {
         do {
             try command.execute(send: {
                 requests.append($0)
-                return ControlResponse(ok: true, result: ControlResult(ask: result))
+                return SocketReply(ControlResponse(ok: true, result: ControlResult(ask: result)))
             }, output: { lines.append($0) })
         } catch let code as ExitCode {
             exit = code.rawValue
@@ -270,11 +278,61 @@ struct AskCommandsTests {
         #expect(throws: ExitCode.failure) {
             try command.execute(send: {
                 requests.append($0)
-                return ControlResponse(ok: true)
+                return SocketReply(ControlResponse(ok: true))
             }, output: { _ in }, errorOutput: { errors.append($0) })
         }
         #expect(requests.map(\.cmd) == [.askResult])
         #expect(errors == ["error: ask.result missing result"])
+    }
+
+    @Test func inputFormNeedsNoButtonsAndMapsItsOptions() throws {
+        let command = try open(["Name", "--input", "multiline", "--value", "draft", "--placeholder", "type here", "--cancel", "cancel"])
+        #expect(try command.makeRequest() == ControlRequest(cmd: .askOpen, args: ControlArgs(
+            style: "terminal", align: "right", title: "Name", value: "draft", cancelButton: "cancel", input: "multiline",
+            placeholder: "type here"
+        )))
+    }
+
+    @Test func choiceFormMapsItemsSubtitlesAndChecks() throws {
+        let command = try open([
+            "Review", "--choice", "398=issue #398", "--choice", "395", "--choice-subtitle", "398=waits on you",
+            "--multiple", "--checked", "395", "--checked", "398",
+        ])
+        let args = try #require(try command.makeRequest().args)
+        #expect(args.buttons == nil)
+        #expect(args.choices == [ControlAskChoice(id: "398", label: "issue #398", subtitle: "waits on you"),
+                                 ControlAskChoice(id: "395", label: "395")])
+        #expect(args.multiple == true)
+        #expect(args.checked == ["395", "398"])
+    }
+
+    @Test func otherMapsItsPlaceholderBesideTheChoices() throws {
+        let args = try #require(try open(["Review", "--choice", "a", "--other", "Something else"]).makeRequest().args)
+        #expect(args.other == "Something else")
+        #expect(args.choices == [ControlAskChoice(id: "a", label: "a")])
+        #expect(try #require(try open(["Review", "--choice", "a"]).makeRequest().args).other == nil)
+    }
+
+    @Test func answerWithOtherTextPrintsTheSelectionAndTheText() throws {
+        let command = try open(["Review", "--choice", "a", "--multiple", "--other", "Something else"])
+        let answer = ControlAskResult(result: .answered, id: "ok", label: "OK", index: 0, text: " mine ", selected: ["a"])
+        var lines: [String] = []
+        try command.execute(send: {
+            $0.cmd == .askOpen
+                ? SocketReply(ControlResponse(ok: true, result: ControlResult(id: "ask-id")))
+                : SocketReply(ControlResponse(ok: true, result: ControlResult(ask: answer)))
+        }, sleep: { _ in }, output: { lines.append($0) })
+        #expect(lines.count == 1)
+        #expect(try JSONDecoder().decode(ControlAskResult.self, from: Data(#require(lines.first).utf8)) == answer)
+    }
+
+    @Test func formKeepsCallerButtons() throws {
+        let command = try open(["Name", "--input", "line", "--button", "save=Save", "--button", "skip=Skip", "--cancel", "skip"])
+        let args = try #require(try command.makeRequest().args)
+        #expect(args.buttons?.map(\.id) == ["save", "skip"])
+        #expect(args.cancelButton == "skip")
+        #expect(args.multiple == nil)
+        #expect(args.checked == nil)
     }
 
     private func open(_ argv: [String]) throws -> Ask.Open {

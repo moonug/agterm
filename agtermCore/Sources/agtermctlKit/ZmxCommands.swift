@@ -15,18 +15,46 @@ struct Zmx: ParsableCommand {
         Every one needs a running agterm: only the app can join its live windows, its pending closes and \
         its persisted snapshots against what zmx reports. With agterm stopped there is nothing to ask.
         """,
-        subcommands: [List.self, Prune.self, Kill.self, Reset.self, Tree.self, Attach.self]
+        subcommands: [List.self, Screen.self, Prune.self, Kill.self, Reset.self, Tree.self, Attach.self, Present.self]
     )
+
+    struct Present: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Carry a presentation stream for one session between stdin/stdout and this app.",
+            discussion: """
+            Run by the agterm on another Mac, over ssh, after it attached one of this app's sessions: it \
+            is how that Mac shows this session's status, context, notifications and HUD. Stdout carries \
+            newline-delimited JSON frames and nothing else, and stdin takes the other side's frames. It \
+            is not meant to be run by hand. A refused session exits nonzero with the reason on stderr.
+            """)
+
+        @Argument(help: "The session id the other Mac attached.")
+        var session: String
+
+        @OptionGroup var options: BasicOptions
+
+        func makeRequest() -> ControlRequest { ControlRequest(cmd: .zmxPresent, target: session) }
+
+        func run() throws {
+            let socket = try SocketClient(path: options.socketPath()).connect()
+            defer { close(socket) }
+            let bridge = StreamBridge(socket: socket, input: STDIN_FILENO, output: STDOUT_FILENO)
+            try bridge.open(makeRequest())
+            bridge.pump()
+        }
+    }
 
     struct Reset: RequestCommand {
         static let configuration = CommandConfiguration(
-            abstract: "Reset the live sessions this app does not supervise, then quit and reopen agterm.",
+            abstract: "Reset live sessions that are unsupervised or predate the recorded zmx update, then reopen.",
             discussion: """
-            The same operation as Help > Reset Live Sessions, without the dialog. A live session created \
+            The same operation as Agterm > Reset Live Sessions, without the dialog. A live session created \
             before the session host existed keeps its own macOS permission identity, so every new version \
             of a tool in it asks for the microphone again. The reset ends those sessions' processes at the \
             next launch and recreates them under the host, starting their captured commands again where \
-            possible. Sessions already supervised are left alone.
+            possible. It also covers every session created before the recorded first launch with this zmx \
+            build: live sessions keep the zmx they started with through updates. Other supervised sessions \
+            are left alone.
 
             agterm quits and reopens itself right after answering. Running work in the affected sessions \
             stops, and agent conversations may need to be resumed by hand. Run from inside one of those \
@@ -69,13 +97,42 @@ struct Zmx: ParsableCommand {
         var session: String
         @Option(help: "Local open window id, unique prefix, or active (default: frontmost after discovery).")
         var window: String?
+        @Flag(help: "Also attach every companion of the session, under it; the session must not itself be a companion.")
+        var companions = false
         @OptionGroup var options: BasicOptions
 
         /// It creates a local session, so it echoes that session's id like every other create command.
         var echoesResultID: Bool { true }
 
         func makeRequest() throws -> ControlRequest {
-            ControlRequest(cmd: .zmxAttach, target: session, args: ControlArgs(host: host, window: window))
+            ControlRequest(cmd: companions ? .zmxAttachGroup : .zmxAttach, target: session,
+                           args: ControlArgs(host: host, window: window))
+        }
+
+        func run() throws {
+            guard companions else { return try defaultRun() }
+            let send = companionSend(SocketClient(path: options.socketPath()).send, json: options.json,
+                                     tooOld: "the running app is too old for group attach")
+            let reply = try send(try makeRequest())
+            if options.json {
+                print(reply.line)
+            } else {
+                printGroup(reply.response)
+            }
+            if !reply.response.ok { throw ExitCode.failure }
+        }
+
+        // the note goes out on failure too: a partial attach from an origin that lists no membership can
+        // have missed companions it never named
+        private func printGroup(_ response: ControlResponse) {
+            if response.ok {
+                print(SocketClient.formatRemoteGroup(parent: response.result?.id, group: response.result?.remoteGroup))
+            } else {
+                FileHandle.standardError.write(Data((SocketClient.formatResponse(response) + "\n").utf8))
+            }
+            if response.result?.remoteGroup?.membershipKnown == false {
+                FileHandle.standardError.write(Data((SocketClient.remoteGroupNote(host: host) + "\n").utf8))
+            }
         }
     }
 
@@ -125,6 +182,36 @@ struct Zmx: ParsableCommand {
         @OptionGroup var options: BasicOptions
 
         func makeRequest() throws -> ControlRequest { ControlRequest(cmd: .zmxList) }
+    }
+
+    struct Screen: RequestCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Print a daemon's screen as plain text, whether or not a window shows its pane.",
+            discussion: """
+            NAME is a daemon name as `zmx list` prints it, not a session id. The read attaches nothing, \
+            opens no window and changes no pane's size, so it reaches a pane in a closed window.
+
+            The default is the daemon's current screen at the size its last leader gave it, \
+            which has no scroll position of its own. --all adds the scrollback the daemon retains; \
+            --lines keeps the last N lines of that.
+            """)
+        @Argument(help: "Daemon name, from `zmx list`.") var name: String
+        @Flag(name: .long, help: "Read the screen plus the retained scrollback.") var all = false
+        @Option(name: .long, help: "Keep only the last N lines of the full buffer.") var lines: Int?
+        @OptionGroup var options: BasicOptions
+
+        func validate() throws {
+            if all, lines != nil {
+                throw ValidationError("use either --all or --lines, not both")
+            }
+            if let lines, lines <= 0 {
+                throw ValidationError("--lines must be greater than 0")
+            }
+        }
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .zmxScreen, args: ControlArgs(name: name, all: all ? true : nil, lines: lines))
+        }
     }
 
     struct Prune: RequestCommand {

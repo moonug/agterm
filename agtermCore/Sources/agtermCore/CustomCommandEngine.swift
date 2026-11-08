@@ -8,20 +8,23 @@ public struct CustomCommandEngine: Sendable {
     private var matcher: KeybindMatcher
     private let commandsByID: [UUID: CustomCommand]
 
-    /// `builtinSequences` is `Keymap.builtinSequences`, which owns what belongs in it.
-    public init(commands: [CustomCommand], builtinSequences: [BuiltinAction: [Keybind]] = [:]) {
+    /// `builtinSequences` and `builtinRepeating` are `Keymap`'s, which owns what belongs in them.
+    public init(commands: [CustomCommand], builtinSequences: [BuiltinAction: [Keybind]] = [:],
+                builtinRepeating: Set<BuiltinAction> = []) {
         commandsByID = Dictionary(commands.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
 
         var binds: [(Keybind, KeybindTarget)] = []
+        var repeating = Set(builtinRepeating.map(KeybindTarget.builtin))
         for command in commands where !command.shortcut.isEmpty {
             guard let keybinds = parseKeybinds(command.shortcut) else { continue }
             binds += keybinds.map { ($0, .command(command.id)) }
+            if command.repeats { repeating.insert(.command(command.id)) }
         }
         // sorted so registration order does not vary with dictionary hashing.
         for (action, keybinds) in builtinSequences.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
             binds += keybinds.map { ($0, .builtin(action)) }
         }
-        matcher = KeybindMatcher(binds)
+        matcher = KeybindMatcher(binds, repeating: repeating)
     }
 
     public enum Outcome: Equatable, Sendable {
@@ -45,6 +48,10 @@ public struct CustomCommandEngine: Sendable {
     }
 
     public var isArmed: Bool { matcher.isArmed }
+
+    public var isRepeating: Bool { matcher.isRepeating }
+
+    public func isRepeatTail(_ chord: Chord) -> Bool { matcher.isRepeatTail(chord) }
 
     public mutating func reset() {
         matcher.reset()

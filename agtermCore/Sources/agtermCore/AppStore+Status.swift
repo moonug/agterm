@@ -37,13 +37,13 @@ extension AppStore {
         return .applied
     }
 
-    /// Sets a session's agent status indicator (the sidebar status glyph) — the single mutation point for the
-    /// control channel's `session.status`. Stamps `statusChangedAt` on any non-idle status (the attention
-    /// list's newest-first sort key) and clears it on idle. Clears the session's `autoFollowConsumed` on a
-    /// transition INTO blocked, re-arming idle auto-follow for the fresh episode. No-op for an unknown id.
-    /// Not persisted (the indicator is ephemeral), so it never triggers a `save()`.
+    /// Sets a session's agent status indicator, the single mutation point for `session.status`. Stamps
+    /// `statusChangedAt` on every set, idle and repeated values included. A transition into blocked re-arms
+    /// idle auto-follow. No-op for an unknown id; never persisted.
     public func setAgentIndicator(_ indicator: AgentIndicator, forSession id: UUID) {
         guard let session = session(withID: id) else { return }
+        // any write through here is a local one until `applyRemoteStatus` says otherwise right after it
+        session.remotePresentation?.statusBridged = false
         let previous = session.agentIndicator
         let wasBlocked = session.agentIndicator.status == .blocked
         var indicator = indicator
@@ -55,9 +55,11 @@ extension AppStore {
         // surface down with it), so `!hasSplit` still covers every genuinely splitless session.
         indicator.statusPane = indicator.normalizedPane(hasSplit: session.hasSplit)
         session.agentIndicator = indicator
-        session.statusChangedAt = indicator.status == .idle ? nil : Date()
+        session.statusChangedAt = Date()
         // a re-asserted blocked-over-blocked is not a new episode and stays muted (Session.autoFollowConsumed).
         if !wasBlocked, indicator.status == .blocked { session.autoFollowConsumed = false }
+        // ahead of the unchanged guard: a repeated write restamps `statusChangedAt`, which a viewer orders by
+        presentationHub?.publish(.status(presentationStatus(of: session)), session: id)
         guard previous != indicator else { return }
         emitControlEvent(
             .status,
@@ -69,29 +71,48 @@ extension AppStore {
                 pane: indicator.statusPane?.rawValue,
                 blink: indicator.blink,
                 color: indicator.color,
-                shape: indicator.shape?.rawValue
+                shape: indicator.shape?.rawValue,
+                previous: previous.status.rawValue
             )
         )
     }
 
-    /// The window-wide non-idle sessions, the single source of truth for the titlebar attention icon and the
-    /// `.attention` palette. Spans ALL workspaces (`workspaces.flatMap(\.sessions)`) and deliberately IGNORES
-    /// the focus/flagged sidebar filter (unlike `navigableSessions`) — the point is window-wide visibility even
-    /// when the sidebar is hidden. Sorted by `attentionRank` ascending (blocked → active → completed) then
-    /// `statusChangedAt` DESCENDING (newest first; a nil stamp sorts last within its rank group).
+    /// Marks each idle session `completed` so it rejoins the attention list until the usual keystroke, Clear
+    /// Status or hook write clears it. No `autoReset`, or merely visiting the session would undo the mark; a
+    /// non-idle session is skipped so a live `active` or `blocked` is never overwritten.
+    public func markForAttention(_ sessionIDs: [UUID]) {
+        for id in sessionIDs where session(withID: id)?.agentIndicator.status == .idle {
+            setAgentIndicator(AgentIndicator(status: .completed), forSession: id)
+        }
+    }
+
+    /// The window's non-idle sessions across ALL workspaces, ignoring the focus/flagged sidebar filter
+    /// (unlike `navigableSessions`) so they stay visible with the sidebar hidden. Ordered by `attentionPrecedes`.
     public var attentionSessions: [Session] {
         workspaces.flatMap(\.sessions)
             .filter { $0.agentIndicator.status != .idle }
-            .sorted { lhs, rhs in
-                let lrank = lhs.agentIndicator.status.attentionRank
-                let rrank = rhs.agentIndicator.status.attentionRank
-                if lrank != rrank { return lrank < rrank }
-                switch (lhs.statusChangedAt, rhs.statusChangedAt) {
-                case let (l?, r?): return l > r // newest change first within the rank group
-                case (_?, nil): return true     // a stamped session sorts before an unstamped one
-                case (nil, _?): return false
-                case (nil, nil): return false
-                }
-            }
+            .sorted(by: Self.attentionPrecedes)
+    }
+
+    /// Whether attention navigation lands on `session`: `needsAttention`, or `active` under
+    /// `attentionIncludesActive`. Shared with `WindowLibrary.attentionStep`.
+    func stopsAttentionNavigation(_ session: Session) -> Bool {
+        let status = session.agentIndicator.status
+        return status.needsAttention || (attentionIncludesActive && status == .active)
+    }
+
+    /// The attention order every attention list shares, so the per-window and cross-window lists cannot
+    /// drift: `attentionRank` ascending (blocked → active → completed), then `statusChangedAt` DESCENDING
+    /// (newest first; a nil stamp sorts last within its rank group).
+    public static func attentionPrecedes(_ lhs: Session, _ rhs: Session) -> Bool {
+        let lrank = lhs.agentIndicator.status.attentionRank
+        let rrank = rhs.agentIndicator.status.attentionRank
+        if lrank != rrank { return lrank < rrank }
+        switch (lhs.statusChangedAt, rhs.statusChangedAt) {
+        case let (l?, r?): return l > r
+        case (_?, nil): return true
+        case (nil, _?): return false
+        case (nil, nil): return false
+        }
     }
 }

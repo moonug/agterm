@@ -9,21 +9,34 @@ extension ControlDispatcher {
             // no host is this app's own attachable sessions, which is also exactly what a `zmx tree HOST`
             // runs on the far side
             return await actions.remoteTree(host: request.args?.host?.trimmedOrNil)
-        case .zmxAttach:
+        case .zmxAttach, .zmxAttachGroup:
             guard let host = request.args?.host?.trimmedOrNil else {
-                return ControlResponse(ok: false, error: "zmx.attach requires a host")
+                return ControlResponse(ok: false, error: "\(request.cmd.rawValue) requires a host")
             }
             // no `active` default: the target names a session on ANOTHER machine, which nothing local
             // could resolve for the caller
             guard let session = request.target?.trimmedOrNil else {
-                return ControlResponse(ok: false, error: "zmx.attach requires a remote session")
+                return ControlResponse(ok: false, error: "\(request.cmd.rawValue) requires a remote session")
             }
             // the unresolved case names the id it could not find, so a control character here would reach
             // a terminal through that message
             guard RemoteSession.isPlain(session) else {
                 return ControlResponse(ok: false, error: "invalid remote session")
             }
-            return await actions.attachRemoteSession(host: host, session: session, window: request.args?.window?.trimmedOrNil)
+            let window = request.args?.window?.trimmedOrNil
+            if request.cmd == .zmxAttachGroup {
+                return await actions.attachRemoteGroup(host: host, session: session, window: window)
+            }
+            return await actions.attachRemoteSession(host: host, session: session, window: window)
+        case .zmxPresent:
+            // no `active` default: a viewer names the session it attached, and a guess would stream another
+            guard let session = request.target?.trimmedOrNil else {
+                return ControlResponse(ok: false, error: "zmx.present requires a session")
+            }
+            guard RemoteSession.isPlain(session) else {
+                return ControlResponse(ok: false, error: "invalid session")
+            }
+            return actions.openPresentation(session: session)
         default:
             return dispatchLocalZmxCommand(request)
         }
@@ -56,6 +69,16 @@ extension ControlDispatcher {
                 return ControlResponse(ok: false, error: "zmx.kill requires --force")
             }
             return actions.killZmxDaemon(target: target, window: request.args?.window, pane: pane)
+        case .zmxScreen:
+            // a daemon name, as `zmx list` prints it: the session resolver sees only open windows
+            guard let name = request.args?.name?.trimmedOrNil, RemoteSession.isPlain(name) else {
+                return ControlResponse(ok: false, error: "zmx.screen requires a daemon name")
+            }
+            switch parseBufferExtent(request.args) {
+            case .rejected(let response): return response
+            case .extent(let all, let lines):
+                return actions.readZmxScreen(name: name, fullBuffer: all || lines != nil, lines: lines)
+            }
         case .zmxReset:
             guard request.args?.force == true else {
                 return ControlResponse(ok: false, error: "zmx.reset requires --force")

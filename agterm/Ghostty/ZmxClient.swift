@@ -5,9 +5,10 @@ import os
 
 @MainActor
 final class ZmxClient {
-    // A 55-daemon cold refresh measured at 10-30 ms; timeout plus kill grace stays below the exit budget.
-    nonisolated static let captureInvocationTimeout: TimeInterval = 0.1
-    nonisolated static let terminationGrace: TimeInterval = 0.25
+    // zmx list probes daemons one at a time, so its cost grows with the daemon count and their load;
+    // timeout plus kill grace stays below the exit budget.
+    nonisolated static let captureInvocationTimeout: TimeInterval = 0.3
+    nonisolated static let terminationGrace = ProcessOutputCapture.terminationGrace
     nonisolated static let captureWallClockLimit = captureInvocationTimeout + terminationGrace
 
     struct Invocation {
@@ -15,6 +16,10 @@ final class ZmxClient {
         let arguments: [String]
         let environment: [String: String]
         let timeout: TimeInterval
+        // kill needs stderr diagnostics; list must exclude stderr notices.
+        let mergesStderr: Bool
+        /// Written to the child's stdin, which is then closed. Nil leaves stdin inherited.
+        var input: Data?
     }
 
     enum CommandError: Error {
@@ -30,12 +35,45 @@ final class ZmxClient {
     private let timeout: TimeInterval
     private let runner: Runner
 
+    private let sweeper: ProcessSweeper?
+
     init(executablePath: String, socketDirectory: String, timeout: TimeInterval = 3,
-         runner: @escaping Runner = ZmxClient.run) {
+         sweeper: ProcessSweeper? = nil, runner: @escaping Runner = ZmxClient.run) {
         self.executablePath = executablePath
         self.socketDirectory = socketDirectory
         self.timeout = timeout
+        self.sweeper = sweeper
         self.runner = runner
+    }
+
+    /// foregroundJobs reads the foreground job of each named daemon's shell, before a kill. A confirmed
+    /// kill then sends those jobs the SIGHUP a closed terminal would have: zmx signals only the shell's own
+    /// process group, and a pane's creation command runs in another. `shells` saves the listing when the
+    /// caller already holds the leader pids. Empty without a sweeper or when the listing fails.
+    func foregroundJobs(of names: [String], shells: [String: pid_t]? = nil,
+                        timeout: TimeInterval? = nil) -> [String: [ProcessRecord]] {
+        guard let sweeper else { return [:] }
+        guard let known = shells ?? sessionRecords(timeout: timeout).map({ records in
+            Dictionary(records.compactMap { record in record.leaderPID.map { (record.name, $0) } }) { first, _ in first }
+        }) else { return [:] }
+        return sweeper.capture(shells: known.filter { names.contains($0.key) })
+    }
+
+    /// foregroundJob reads one shell's foreground job for a caller that waits on it. Nil when the process
+    /// table cannot be read; empty with no sweeper, where nothing is ever signalled or waited on.
+    func foregroundJob(ofShell pid: pid_t) -> [ProcessRecord]? {
+        guard let sweeper else { return [] }
+        return sweeper.foregroundJob(of: pid)
+    }
+
+    /// isRunning is whether any process of `job` still runs.
+    func isRunning(_ job: [ProcessRecord]) -> Bool {
+        sweeper?.isRunning(job) ?? false
+    }
+
+    /// forceEnd kills what is left of `job`, for a restart whose old program ignored the hangup.
+    func forceEnd(_ job: [ProcessRecord]) {
+        sweeper?.send(SIGKILL, to: job)
     }
 
     /// What the launch reap learned. `runningNames` is every daemon whose client count the listing could
@@ -81,7 +119,8 @@ final class ZmxClient {
             sessions: sessions, requestedMode: requestedMode, knownNames: knownNames) else {
             return ReapOutcome(runningNames: running, killedAll: true)
         }
-        return ReapOutcome(runningNames: running, killedAll: kill(names: names))
+        let shells = Dictionary(sessions.compactMap { session in session.leaderPID.map { (session.name, $0) } }) { first, _ in first }
+        return ReapOutcome(runningNames: running, killedAll: kill(names: names, shells: shells))
     }
 
     @discardableResult
@@ -119,8 +158,8 @@ final class ZmxClient {
     /// One `zmx kill … --force` for every name. The result is diagnostic only: zmx handles the names in
     /// order, so a failure part-way has already reached some daemons, and the caller confirms each by
     /// leader exit rather than by this Bool.
-    func killBatch(names: [String], timeout: TimeInterval) -> Bool {
-        kill(names: names, timeout: timeout)
+    func killBatch(names: [String], shells: [String: pid_t]? = nil, timeout: TimeInterval) -> Bool {
+        kill(names: names, shells: shells, timeout: timeout)
     }
 
     struct LeaderPoll {
@@ -158,9 +197,11 @@ final class ZmxClient {
     /// stale-socket unlink above, which is exactly the outcome that cannot be distinguished from success.
     func killObservedOrphan(names: [String]) -> [String: KillOutcome] {
         var outcomes: [String: KillOutcome] = [:]
+        let jobs = foregroundJobs(of: names)
         for name in Set(names) {
             do {
-                outcomes[name] = Self.outcome(of: try invoke(["kill", name]), name: name)
+                outcomes[name] = Self.outcome(of: try invoke(["kill", name], mergesStderr: true), name: name)
+                if outcomes[name] == .killed, let job = jobs[name] { sweeper?.send(SIGHUP, to: job) }
             } catch {
                 Self.logger.error("zmx kill failed for \(name, privacy: .public): \(String(describing: error), privacy: .public)")
                 outcomes[name] = .failed(String(describing: error))
@@ -169,11 +210,7 @@ final class ZmxClient {
         return outcomes
     }
 
-    /// Classifies a kill by EXACT output line, because zmx exits zero on more than the two happy answers:
-    /// a non-refused connect failure prints `is unresponsive` and succeeds, and a broken pipe after the
-    /// kill was sent returns with nothing printed at all. Anything unrecognized is a failure, so a daemon
-    /// whose fate is unknown is never reported as gone — and a substring test would let a line merely
-    /// CONTAINING `killed session <name>` count as a confirmation.
+    /// Exit zero can mean an unreachable daemon; require an exact confirmation line.
     static func outcome(of output: String, name: String) -> KillOutcome {
         let lines = output.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
         if lines.contains("killed session \(name)") { return .killed }
@@ -188,20 +225,28 @@ final class ZmxClient {
     /// or promotes a LIVE pane on the strength of this answer, so an exit status is not enough: zmx exits
     /// zero after merely unlinking a socket it could not reach, and that daemon may still be running.
     func killConfirmed(name: String) -> KillOutcome {
+        let job = foregroundJobs(of: [name])[name]
         do {
-            return Self.outcome(of: try invoke(["kill", name, "--force"]), name: name)
+            let outcome = Self.outcome(of: try invoke(["kill", name, "--force"], mergesStderr: true), name: name)
+            if outcome == .killed, let job { sweeper?.send(SIGHUP, to: job) }
+            return outcome
         } catch {
             Self.logger.error("zmx kill failed for \(name, privacy: .public): \(String(describing: error), privacy: .public)")
             return .failed(String(describing: error))
         }
     }
 
-    private func kill(names: [String], timeout: TimeInterval? = nil) -> Bool {
+    private func kill(names: [String], shells: [String: pid_t]? = nil, timeout: TimeInterval? = nil) -> Bool {
         var seen: Set<String> = []
         let unique = names.filter { seen.insert($0).inserted }
         guard !unique.isEmpty else { return true }
+        let jobs = foregroundJobs(of: unique, shells: shells, timeout: timeout)
         do {
-            _ = try invoke(["kill"] + unique + ["--force"], timeout: timeout)
+            let output = try invoke(["kill"] + unique + ["--force"], timeout: timeout, mergesStderr: true)
+            // only a name zmx confirmed: a stale-socket cleanup leaves the shell, and its job, running
+            for (name, job) in jobs where Self.outcome(of: output, name: name) == .killed {
+                sweeper?.send(SIGHUP, to: job)
+            }
             return true
         } catch {
             Self.logger.error("zmx kill failed for \(unique.joined(separator: ","), privacy: .public): \(String(describing: error), privacy: .public)")
@@ -209,40 +254,79 @@ final class ZmxClient {
         }
     }
 
-    private func invoke(_ arguments: [String], timeout timeoutOverride: TimeInterval? = nil) throws -> String {
+    /// The daemon's own screen for `name`, which always has the leader's layout. Nil when the read
+    /// failed for any reason, a zmx without the query included: a caller must not fall back to a pane's
+    /// own surface, whose layout is the thing in doubt.
+    func screen(name: String, all: Bool) -> ZmxScreen? {
+        do {
+            return ZmxScreen(output: try invoke(["screen", name] + (all ? ["--all"] : [])))
+        } catch {
+            Self.logger.error("zmx screen failed for \(name, privacy: .public): \(String(describing: error), privacy: .public)")
+            return nil
+        }
+    }
+
+    /// Queues `bytes` as input to `name` without taking the lead. True means the daemon queued them, not
+    /// that the program read them. Never retried: a second attempt after an unclear failure types twice.
+    func type(name: String, bytes: [UInt8]) -> Bool {
+        do {
+            _ = try invoke(["type", name], input: Data(bytes))
+            return true
+        } catch {
+            Self.logger.error("zmx type failed for \(name, privacy: .public): \(String(describing: error), privacy: .public)")
+            return false
+        }
+    }
+
+    private func invoke(_ arguments: [String], timeout timeoutOverride: TimeInterval? = nil,
+                        mergesStderr: Bool = false, input: Data? = nil) throws -> String {
         var environment = ProcessInfo.processInfo.environment
         environment["ZMX_DIR"] = socketDirectory
         environment.removeValue(forKey: "ZMX_SESSION")
         environment.removeValue(forKey: "ZMX_SESSION_PREFIX")
-        return try runner(Invocation(executablePath: executablePath, arguments: arguments,
-                                     environment: environment, timeout: timeoutOverride ?? timeout))
+        return try runner(Invocation(executablePath: executablePath, arguments: arguments, environment: environment,
+                                     timeout: timeoutOverride ?? timeout, mergesStderr: mergesStderr, input: input))
     }
 
-    private nonisolated static func run(_ invocation: Invocation) throws -> String {
+    nonisolated static func run(_ invocation: Invocation) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: invocation.executablePath)
         process.arguments = invocation.arguments
         process.environment = invocation.environment
-        let output = Pipe()
-        let errors = Pipe()
-        process.standardOutput = output
-        process.standardError = errors
+        // drained while waiting: zmx writes the listing row by row, so a few daemons fill the pipe before exit
+        let capture = try ProcessOutputCapture(attachingTo: process)
+        let stdin = invocation.input.map { _ in Pipe() }
+        if let stdin { process.standardInput = stdin }
         let finished = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in finished.signal() }
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            capture.cancel()
+            throw error
+        }
+        capture.didLaunch()
+        if let stdin, let input = invocation.input {
+            try? stdin.fileHandleForWriting.write(contentsOf: input)
+            try? stdin.fileHandleForWriting.close()
+        }
         if finished.wait(timeout: .now() + invocation.timeout) == .timedOut {
             process.terminate()
             if finished.wait(timeout: .now() + terminationGrace) == .timedOut {
                 Darwin.kill(process.processIdentifier, SIGKILL)
                 process.waitUntilExit()
             }
+            capture.cancel()
             throw CommandError.timedOut
         }
-        let stdout = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        let stderr = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        guard process.terminationStatus == 0 else {
-            throw CommandError.failed(process.terminationStatus, stdout + stderr)
+        // EOF is due once the child has exited, unless a write end leaked to another process; a miss is a
+        // failed listing rather than a short one.
+        guard let output = capture.collect(until: .now() + terminationGrace) else {
+            throw CommandError.timedOut
         }
-        return stdout
+        guard process.terminationStatus == 0 else {
+            throw CommandError.failed(process.terminationStatus, output.stdout + output.stderr)
+        }
+        return invocation.mergesStderr ? output.stdout + output.stderr : output.stdout
     }
 }

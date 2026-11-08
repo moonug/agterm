@@ -144,6 +144,98 @@ struct AppStoreHudTests {
         #expect(node.hud?.position == "bottom-center")
     }
 
+    @Test func theReadBackReportsMarkdownAndTheRequestedFontSize() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "**ok**", markdown: true, fontSize: 18),
+                      file: "/tmp/hud", size: HudPanelSize(widthPercent: 22, heightPercent: 9))
+
+        let node = try #require(store.controlTree().workspaces[0].sessions.first)
+
+        #expect(node.hud?.markdown == true)
+        #expect(node.hud?.fontSize == 18)
+    }
+
+    @Test func thePlainReadBackReportsMarkdownOffAndNoFontSize() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "working"), file: "/tmp/hud",
+                      size: HudPanelSize(widthPercent: 22, heightPercent: 9))
+
+        let node = try #require(store.controlTree().workspaces[0].sessions.first)
+
+        #expect(node.hud?.markdown == false)
+        #expect(node.hud?.fontSize == nil)
+    }
+
+    @Test func anUpdateKeepsTheLiveFontRequestAndEffectiveSize() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        let size = HudPanelSize(widthPercent: 22, heightPercent: 9)
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "a", fontSize: 18), file: "/tmp/hud",
+                      size: size, fontSize: 18)
+
+        #expect(store.updateHud(session.id, spec: HudSpec(message: "b"), size: size))
+
+        #expect(session.hudSpec?.fontSize == 18)
+        #expect(session.hudSpec?.message == "b")
+        #expect(session.hudFontSize == 18)
+    }
+
+    @Test func aReplacingOpenTakesTheNewFontSize() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        let size = HudPanelSize(widthPercent: 22, heightPercent: 9)
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "a", fontSize: 12), file: "/tmp/hud",
+                      size: size, fontSize: 12)
+
+        #expect(store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "b", fontSize: 48),
+                              file: "/tmp/hud", size: size, fontSize: 48))
+
+        #expect(session.hudSpec?.fontSize == 48)
+        #expect(session.hudFontSize == 48)
+    }
+
+    @Test func aRefusedOpenLeavesNoHudFontSize() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        #expect(store.openOverlay(session.id, command: "htop"))
+
+        #expect(!store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "a", fontSize: 20),
+                               file: "/tmp/hud", size: HudPanelSize(widthPercent: 22, heightPercent: 9), fontSize: 20))
+
+        #expect(session.hudFontSize == nil)
+    }
+
+    @Test func closingTheHudClearsItsFontSize() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "a"), file: "/tmp/hud",
+                      size: HudPanelSize(widthPercent: 22, heightPercent: 9), fontSize: 13)
+
+        #expect(store.closeHud(session.id))
+
+        #expect(session.hudFontSize == nil)
+    }
+
+    @Test func aSessionZoomAfterOpenLeavesTheHudFontSize() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "a"), file: "/tmp/hud",
+                      size: HudPanelSize(widthPercent: 22, heightPercent: 9), fontSize: 13)
+
+        store.setFontSize(session.id, 24)
+
+        #expect(session.hudFontSize == 13)
+    }
+
     @Test func theReadBackOmitsTextColorWhenTheCallerSetNone() throws {
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
@@ -222,5 +314,304 @@ struct AppStoreHudTests {
         #expect(withProgram.overlay)
         #expect(withProgram.overlaySizePercent == 70)
         #expect(withProgram.hud == nil)
+    }
+
+    @MainActor
+    private final class HudSink: PresentationSink {
+        var frames: [PresentationFrame] = []
+        func offer(_ frame: PresentationFrame) -> Bool {
+            frames.append(frame)
+            return true
+        }
+        func close(_ reason: PresentationHub.CloseReason) {}
+
+        var huds: [PresentationHud?] {
+            frames.compactMap { if case .hud(let hud) = $0.body { return .some(hud) } else { return nil } }
+        }
+        var snapshot: PresentationSnapshot? {
+            frames.lazy.compactMap { if case .snapshot(let snapshot) = $0.body { snapshot } else { nil } }.first
+        }
+    }
+
+    private static let start = Date(timeIntervalSince1970: 1_789_000_000)
+    private static let size = HudPanelSize(widthPercent: 30, heightPercent: 8)
+
+    private struct Mirrored {
+        let store: AppStore
+        let session: Session
+        let hub: PresentationHub
+        let sink: HudSink
+    }
+
+    private func measuredHud(_ spec: HudSpec, pane: PaneMetrics) throws -> (AppStore, Session) {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        store.openHud(session.id, command: "hud.sh", spec: spec, file: "/tmp/hud",
+                      size: HudLayout.panelSize(for: spec, pane: pane))
+        return (store, session)
+    }
+
+    private static let widePane = PaneMetrics(cellWidth: 8, cellHeight: 18, paneWidth: 1600, paneHeight: 1000,
+                                              paddingWidth: 8, paddingHeight: 6)
+
+    @Test func openStoresTheHeightInPointsAndCloseClearsIt() throws {
+        let (store, session) = try measuredHud(HudSpec(message: "working"), pane: Self.widePane)
+
+        #expect(session.hudHeightPoints == 66)
+        #expect(session.hudPanelSize?.heightPoints == 66)
+
+        store.closeHud(session.id)
+
+        #expect(session.hudHeightPoints == nil)
+        #expect(session.hudPanelSize == nil)
+    }
+
+    @Test func aStickyHudMayTakeTheFullWidthAndALooseOneIsStillCapped() throws {
+        let sticky = HudSpec(message: "caption", sizePercent: 100, position: .topCenter, sticky: true)
+        let (store, session) = try measuredHud(sticky, pane: Self.widePane)
+
+        #expect(session.overlaySizePercent == 100)
+        #expect(store.controlTree().workspaces[0].sessions[0].hud?.sizePercent == 100)
+
+        let loose = HudSpec(message: "caption", sizePercent: 100, position: .topCenter)
+        store.updateHud(session.id, spec: loose, size: HudLayout.panelSize(for: loose, pane: Self.widePane))
+
+        #expect(session.overlaySizePercent == HudLayout.maxSizePercent)
+    }
+
+    @Test func aResizeForcesTheWidthUntilTheNextUpdate() throws {
+        let (store, session) = try measuredHud(HudSpec(message: "working"), pane: Self.widePane)
+
+        #expect(session.hudResizedWidthPercent == nil)
+        #expect(store.resizeOverlay(session.id, sizePercent: 100))
+
+        #expect(session.overlaySizePercent == HudLayout.maxSizePercent)
+        #expect(session.hudResizedWidthPercent == HudLayout.maxSizePercent)
+        #expect(session.effectiveHudSpec?.sizePercent == HudLayout.maxSizePercent)
+        #expect(session.hudSpec?.sizePercent == nil)
+
+        let next = HudSpec(message: "done")
+        store.updateHud(session.id, spec: next, size: HudLayout.panelSize(for: next, pane: Self.widePane))
+
+        #expect(session.hudResizedWidthPercent == nil)
+    }
+
+    @Test func aRemeasureKeepsAForcedWidthAndFollowsThePane() throws {
+        let line = Array(repeating: "word", count: 20).joined(separator: " ")
+        let (store, session) = try measuredHud(HudSpec(message: line, markdown: true), pane: Self.widePane)
+        let wrapped = try #require(session.hudHeightPoints)
+        store.resizeOverlay(session.id, sizePercent: 80)
+
+        #expect(store.remeasureHud(session.id, pane: Self.widePane))
+
+        #expect(session.overlaySizePercent == 80)
+        #expect(session.hudResizedWidthPercent == 80)
+        #expect(session.hudHeightPoints == wrapped - 18)
+
+        let short = PaneMetrics(cellWidth: 8, cellHeight: 18, paneWidth: 1600, paneHeight: 500,
+                                paddingWidth: 8, paddingHeight: 6)
+        store.remeasureHud(session.id, pane: short)
+
+        #expect(session.hudHeightPoints == wrapped - 18)
+        #expect(session.hudHeightPercent == 14)
+    }
+
+    @Test func settingTheSizeBackRestoresAMeasuredWidthAsMeasured() throws {
+        let (store, session) = try measuredHud(HudSpec(message: "working"), pane: Self.widePane)
+        let measured = try #require(session.hudPanelSize)
+        store.resizeOverlay(session.id, sizePercent: 60)
+
+        #expect(store.setHudSize(session.id, size: measured, forcedWidthPercent: nil))
+
+        #expect(session.hudPanelSize == measured)
+        #expect(session.hudResizedWidthPercent == nil)
+        #expect(!store.setHudSize(UUID(), size: measured, forcedWidthPercent: nil))
+    }
+
+    @Test func theTreeReportsStickyAndFrameAndAnOlderServersNodeDecodesToTheDefaults() throws {
+        let caption = HudSpec(message: "caption", position: .topCenter, sticky: true, frame: false)
+        let (store, _) = try measuredHud(caption, pane: Self.widePane)
+
+        let node = try #require(store.controlTree().workspaces[0].sessions[0].hud)
+        let older = try JSONDecoder().decode(ControlHudNode.self, from: Data(
+            #"{"message":"m","spinner":"none","position":"center","hideAfter":0}"#.utf8))
+
+        #expect(node.sticky)
+        #expect(!node.frame)
+        #expect(try JSONDecoder().decode(ControlHudNode.self, from: JSONEncoder().encode(node)) == node)
+        #expect(!older.sticky)
+        #expect(older.frame)
+    }
+
+    @Test func aPlainHudReadsBackNotStickyAndFramed() throws {
+        let (store, _) = try measuredHud(HudSpec(message: "working"), pane: Self.widePane)
+
+        let node = try #require(store.controlTree().workspaces[0].sessions[0].hud)
+
+        #expect(!node.sticky)
+        #expect(node.frame)
+    }
+
+    private func mirroredStore() throws -> Mirrored {
+        let store = makeStore()
+        let hub = PresentationHub(staleTimeout: 30)
+        store.presentationHub = hub
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/repo"))
+        let sink = HudSink()
+        try subscribe(sink, to: session, in: store, hub: hub, now: Self.start)
+        return Mirrored(store: store, session: session, hub: hub, sink: sink)
+    }
+
+    private func subscribe(_ sink: HudSink, to session: Session, in store: AppStore, hub: PresentationHub,
+                           now: Date) throws {
+        try hub.subscribe(session: session.id, hello: PresentationHello(version: 1, kinds: ["hud"], mode: .mirror),
+                          sink: sink) { store.presentationSnapshot(forSession: session.id, now: now) }
+    }
+
+    private func openAndPublish(_ message: String, hideAfter: Double? = nil, in store: AppStore,
+                                session: Session, paneIdentity: UUID? = nil) {
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: message, hideAfter: hideAfter),
+                      file: "/tmp/agterm-test-hud-\(session.id)", size: Self.size, paneIdentity: paneIdentity)
+        store.publishHud(forSession: session.id, expiresAt: hideAfter.map { Self.start.addingTimeInterval($0) },
+                         now: Self.start)
+    }
+
+    @Test func aPublishedHudTravelsWithItsPaneIdentityAndRemainingLifetime() throws {
+        let fix = try mirroredStore()
+        let (store, session, sink) = (fix.store, fix.session, fix.sink)
+
+        openAndPublish("deploying", hideAfter: 10, in: store, session: session,
+                       paneIdentity: session.paneIdentity)
+
+        let hud = try #require(sink.huds.last ?? nil)
+        #expect(hud.spec.message == "deploying")
+        #expect(hud.pane == .identity(session.paneIdentity))
+        #expect(hud.remaining == 10)
+    }
+
+    @Test func aSessionWideHudWithNoAutoHideTravelsWithNeither() throws {
+        let fix = try mirroredStore()
+        let (store, session, sink) = (fix.store, fix.session, fix.sink)
+
+        openAndPublish("waiting", in: store, session: session)
+
+        let hud = try #require(sink.huds.last ?? nil)
+        #expect(hud.pane == nil)
+        #expect(hud.remaining == nil)
+    }
+
+    @Test func everyPublicationCarriesALargerGeneration() throws {
+        let fix = try mirroredStore()
+        let (store, session, sink) = (fix.store, fix.session, fix.sink)
+        openAndPublish("one", in: store, session: session)
+
+        store.updateHud(session.id, spec: HudSpec(message: "two"), size: Self.size)
+        store.publishHud(forSession: session.id, expiresAt: nil, now: Self.start)
+        openAndPublish("three", in: store, session: session)
+
+        let generations = sink.huds.compactMap { $0?.generation }
+        #expect(generations.count == 3)
+        #expect(generations == generations.sorted())
+        #expect(Set(generations).count == 3)
+    }
+
+    @Test func aLateSubscriberGetsTheRemainingLifetimeNotTheConfiguredOne() throws {
+        let fix = try mirroredStore()
+        let (store, session, hub) = (fix.store, fix.session, fix.hub)
+        openAndPublish("deploying", hideAfter: 10, in: store, session: session)
+        let late = HudSink()
+
+        try subscribe(late, to: session, in: store, hub: hub, now: Self.start.addingTimeInterval(7))
+
+        #expect(late.snapshot?.hud?.remaining == 3)
+        #expect(late.snapshot?.hud?.spec.hideAfter == 10)
+    }
+
+    @Test func remainingLifetimeNeverGoesNegative() throws {
+        let fix = try mirroredStore()
+        let (store, session, hub) = (fix.store, fix.session, fix.hub)
+        openAndPublish("deploying", hideAfter: 10, in: store, session: session)
+        let late = HudSink()
+
+        try subscribe(late, to: session, in: store, hub: hub, now: Self.start.addingTimeInterval(11))
+
+        #expect(late.snapshot?.hud?.remaining == 0)
+    }
+
+    @Test func closingTheHudPublishesAbsence() throws {
+        let fix = try mirroredStore()
+        let (store, session, sink) = (fix.store, fix.session, fix.sink)
+        openAndPublish("deploying", in: store, session: session)
+
+        store.closeHud(session.id)
+
+        #expect(sink.huds.count == 2)
+        #expect(sink.huds.last == .some(nil))
+        #expect(store.presentationSnapshot(forSession: session.id, now: Self.start).hud == nil)
+    }
+
+    @Test func aProgramOverlayReplacingTheHudPublishesAbsence() throws {
+        let fix = try mirroredStore()
+        let (store, session, sink) = (fix.store, fix.session, fix.sink)
+        openAndPublish("deploying", in: store, session: session)
+
+        #expect(store.openOverlay(session.id, command: "htop"))
+
+        #expect(sink.huds.last == .some(nil))
+    }
+
+    @Test func aHudThatWasNeverPublishedIsAbsentFromTheSnapshotAndPublishesNothingOnDiscard() throws {
+        let fix = try mirroredStore()
+        let (store, session, sink) = (fix.store, fix.session, fix.sink)
+
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "unwritten"), file: "/tmp/agterm-x",
+                      size: Self.size)
+        #expect(store.presentationSnapshot(forSession: session.id, now: Self.start).hud == nil)
+        store.closeHud(session.id)
+
+        #expect(sink.huds.isEmpty)
+    }
+
+    @Test func aFailedReplacementPublishesAbsenceOnceAndNeverTheRejectedSpec() throws {
+        let fix = try mirroredStore()
+        let (store, session, sink) = (fix.store, fix.session, fix.sink)
+        openAndPublish("first", in: store, session: session)
+
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "rejected"), file: "/tmp/agterm-x",
+                      size: Self.size)
+        store.closeHud(session.id)
+
+        #expect(sink.huds.map { $0?.spec.message } == ["first", nil])
+    }
+
+    @Test func aResizeRepublishesTheForcedWidthAndKeepsTheDeadline() throws {
+        let fix = try mirroredStore()
+        let (store, session, hub) = (fix.store, fix.session, fix.hub)
+        openAndPublish("deploying", hideAfter: 10, in: store, session: session)
+
+        #expect(store.resizeOverlay(session.id, sizePercent: 60))
+        store.publishHudResize(forSession: session.id, now: Self.start.addingTimeInterval(4))
+
+        let resized = try #require(fix.sink.huds.last ?? nil)
+        #expect(resized.spec.sizePercent == 60)
+        #expect(resized.remaining == 6)
+        let late = HudSink()
+        try subscribe(late, to: session, in: store, hub: hub, now: Self.start.addingTimeInterval(4))
+        #expect(late.snapshot?.hud?.spec.sizePercent == 60)
+    }
+
+    @Test func theNextPublicationDropsAForcedWidthItsSpecDoesNotAsk() throws {
+        let fix = try mirroredStore()
+        let (store, session) = (fix.store, fix.session)
+        openAndPublish("deploying", in: store, session: session)
+        store.resizeOverlay(session.id, sizePercent: 60)
+        store.publishHudResize(forSession: session.id, now: Self.start)
+
+        store.updateHud(session.id, spec: HudSpec(message: "done"), size: Self.size)
+        store.publishHud(forSession: session.id, expiresAt: nil, now: Self.start)
+
+        #expect((fix.sink.huds.last ?? nil)?.spec.sizePercent == nil)
     }
 }

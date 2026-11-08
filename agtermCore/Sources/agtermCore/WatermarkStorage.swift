@@ -24,16 +24,26 @@ public enum WatermarkStorage {
         return dir
     }
 
-    /// The per-session rendered-text PNG path (`<stateDir>/watermarks/<sessionID>.png`).
-    public static func renderedTextURL(sessionID: UUID, stateDir: URL? = nil) -> URL {
-        directoryURL(stateDir: stateDir).appendingPathComponent("\(sessionID.uuidString).png")
+    /// renderedTextURL is `<stateDir>/watermarks/<sessionID>.png` for the session default, or
+    /// `<sessionID>-<paneKey>.png` for a pane override (`Session.backgroundFileKey(for:)`).
+    public static func renderedTextURL(sessionID: UUID, paneKey: String? = nil, stateDir: URL? = nil) -> URL {
+        let name = paneKey.map { "\(sessionID.uuidString)-\($0)" } ?? sessionID.uuidString
+        return directoryURL(stateDir: stateDir).appendingPathComponent("\(name).png")
     }
 
-    /// Remove a session's rendered `.text` PNG (best effort), so the state dir doesn't accumulate stale
-    /// files. A no-op when none exists. Called on watermark clear AND when the owning session is
-    /// permanently removed (`AppStore.closeSession`/`removeWorkspace`) — a `.text` watermark always
-    /// re-renders its PNG on apply, so an over-eager removal is self-healing.
-    public static func removeRenderedText(sessionID: UUID, stateDir: URL? = nil) {
-        try? FileManager.default.removeItem(at: renderedTextURL(sessionID: sessionID, stateDir: stateDir))
+    /// removeRenderedText deletes the default's or one pane override's PNG; the next apply re-renders it.
+    public static func removeRenderedText(sessionID: UUID, paneKey: String? = nil, stateDir: URL? = nil) {
+        try? FileManager.default.removeItem(at: renderedTextURL(sessionID: sessionID, paneKey: paneKey,
+                                                                stateDir: stateDir))
+    }
+
+    /// removeAllRenderedText deletes every PNG a session owns, for permanent session removal.
+    public static func removeAllRenderedText(sessionID: UUID, stateDir: URL? = nil) {
+        let dir = directoryURL(stateDir: stateDir)
+        let id = sessionID.uuidString
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        for name in names where name == "\(id).png" || (name.hasPrefix("\(id)-") && name.hasSuffix(".png")) {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
+        }
     }
 }

@@ -11,7 +11,8 @@ extension GhosttySurfaceView {
     /// (`ghostty_surface_key` with `.text` set), NOT `ghostty_surface_text`, whose bracketed-paste wrapping
     /// suppresses command execution and leaks `\e[200~`/`\e[201~` markers when fired rapidly. Every line ending
     /// (`\n`, `\r`, `\r\n`) becomes a real Return keypress, so a trailing newline submits and a multi-line
-    /// payload runs line by line; `withCString` means no buffer outlives the call. Returns `false` when the
+    /// payload runs line by line; the final Return after text waits `KeystrokeSegments.submitGap`.
+    /// `withCString` means no buffer outlives the call. Returns `false` when the
     /// surface is not created yet, so a caller injecting into a pane with no realize path
     /// (`right`/`scratch`) reports `session not realized`, not a false ok; the main pane instead feeds this
     /// false return into a bounded poll, selecting only when `select` was passed.
@@ -22,7 +23,8 @@ extension GhosttySurfaceView {
         // keystrokes and re-commit on the user's next one, landing their half-typed word after the
         // injected text. No-op unless THIS pane is composing (see `commitOrDiscardComposition`).
         commitOrDiscardComposition()
-        for segment in KeystrokeSegments.split(text) {
+        let paced = KeystrokeSegments.paced(text)
+        for segment in paced.head {
             switch segment {
             case let .text(segment):
                 segment.withCString { ptr in
@@ -34,6 +36,11 @@ extension GhosttySurfaceView {
             case .returnKey:
                 sendReturn(to: surface)
             }
+        }
+        if paced.pacedReturn {
+            // blocking, not scheduled: a deferred Return could be overtaken by another injection or a keystroke
+            Thread.sleep(forTimeInterval: KeystrokeSegments.submitGap)
+            sendReturn(to: surface)
         }
         return true
     }
@@ -160,6 +167,19 @@ extension GhosttySurfaceView {
         let column = Int(((x - columnZeroX) / cellWidth).rounded(.down))
         guard column >= 0, column < Int(size.columns) else { return nil }
         return column
+    }
+
+    /// This surface's real cell in points, nil when the surface is not created or reports no grid. The
+    /// height is what `ghostty_surface_ime_point` returns over the content scale, and the width follows from
+    /// the pixel ratio, as `readCursorColumn` derives it.
+    func cellSize() -> (width: Double, height: Double)? {
+        guard let surface else { return nil }
+        let size = ghostty_surface_size(surface)
+        guard size.cell_width_px > 0, size.cell_height_px > 0 else { return nil }
+        var x = 0.0, y = 0.0, w = 0.0, h = 0.0
+        ghostty_surface_ime_point(surface, &x, &y, &w, &h)
+        guard h > 0, h.isFinite else { return nil }
+        return (width: h * Double(size.cell_width_px) / Double(size.cell_height_px), height: h)
     }
 
     /// This surface's foreground process pid (`ghostty_surface_foreground_pid`), nil when the surface is not

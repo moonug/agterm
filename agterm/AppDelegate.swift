@@ -9,8 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static let logger = Logger(subsystem: "com.umputun.agterm", category: "AppDelegate")
 
-    // Leaves 150 ms after the refresh's 350 ms worst case for the per-pane kernel reads.
-    private static let exitCaptureBudget: Duration = .milliseconds(500)
+    // leaves 150 ms after the listing's 550 ms worst case for the per-pane kernel reads
+    private static let exitCaptureBudget: Duration = .milliseconds(700)
 
     /// App-global window library, set on scene appear; terminate flushes every window's state.
     var library: WindowLibrary?
@@ -71,26 +71,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         if ContentView.isUITestLaunch {
             scheduleUITestWindowActivationRetries()
-        } else {
+        } else if !agtermApp.isHostedUnitTest {
             NSApp.activate()
         }
-        // libghostty is already booted: `SettingsModel.init` touches `GhosttyApp.shared` during App.init,
+        // libghostty is already booted: `restoredRuntime` touches `GhosttyApp.shared` during App.init,
         // before NSApp exists. This keeps the dependency explicit ahead of the re-side below.
         _ = GhosttyApp.shared
         // then re-side the config to the launch appearance, while NSApp exists and no scene has mounted —
         // a dark launch otherwise strips the env, restore replay and command off every restored surface.
         GhosttyApp.shared.syncLaunchColorScheme()
+        HtmlOverlayRegistry.shared.install()
         scheduleRestoredWindowReconciliation(reason: "did-finish-launching")
         NotificationCenter.default.addObserver(self, selector: #selector(menuBeganTracking),
                                                name: NSMenu.didBeginTrackingNotification, object: nil)
-        // SwiftUI defers its menu rebuild to the next app ACTIVATION, and that rebuild is what lets the
-        // stock File ▸ Close claim ⌘W. Reconcile after it (async, once SwiftUI has rebuilt) and on every
-        // keymap change, so a `keymap reload` takes effect on the chord immediately.
+        // any SwiftUI menu rebuild can hand a stock item back a chord the keymap gave agterm, so reconcile
+        // after activation (async, once SwiftUI has rebuilt), on menu tracking, and on every keymap change.
         NotificationCenter.default.addObserver(self, selector: #selector(appDidBecomeActive),
                                                name: NSApplication.didBecomeActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keymapChanged),
                                                name: .agtermKeymapChanged, object: nil)
-        reconcileCloseSessionChord()
+        reconcileStockMenuChords()
     }
 
     /// XCUITest-only seam: pin the LAUNCH appearance from `AGTERM_UITEST_FORCE_APPEARANCE` (`light`/`dark`).
@@ -111,30 +111,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func appDidBecomeActive(_: Notification) {
         DispatchQueue.main.async { [weak self] in
             MainActor.assumeIsolated {
-                self?.reconcileCloseSessionChord()
+                self?.reconcileStockMenuChords()
             }
         }
     }
 
     @objc private func keymapChanged(_: Notification) {
-        MainActor.assumeIsolated { reconcileCloseSessionChord() }
+        MainActor.assumeIsolated { reconcileStockMenuChords() }
     }
 
     @objc private func menuBeganTracking(_: Notification) {
         MainActor.assumeIsolated {
-            reconcileCloseSessionChord()
+            reconcileStockMenuChords()
         }
     }
 
-    /// Keep ⌘W with agterm's File ▸ Close Session whenever the keymap says it owns that chord.
-    ///
-    /// SwiftUI hands the stock File ▸ Close (`performClose:`) a ⌘W equivalent the moment agterm's item
-    /// vacates the chord, and putting `close_session` back does NOT reclaim it: SwiftUI drops the shortcut
-    /// from its OWN item, leaving Close Session unbound and ⌘W closing the whole window until relaunch
-    /// (issue #296). agterm asserts the split from the AppKit side — no SwiftUI API does either half.
-    private func reconcileCloseSessionChord() {
+    /// reconcileStockMenuChords reapplies `applyStockMenuChords`, since any SwiftUI menu rebuild can undo it.
+    private func reconcileStockMenuChords() {
         guard let keymap = settingsModel?.keymap else { return }
-        AppDelegate.applyCloseSessionChord(keymap, in: NSApp.mainMenu)
+        AppDelegate.applyStockMenuChords(keymap, in: NSApp.mainMenu)
     }
 
     /// Split ⌘W between agterm's Close Session item and the stock `performClose:` one, following `keymap`.
@@ -146,7 +141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// SwiftUI's next rebuild unbind agterm's own item.
     ///
     /// agterm's item is a SwiftUI closure button with no distinguishing selector, so it is matched by title.
-    static func applyCloseSessionChord(_ keymap: Keymap, in mainMenu: NSMenu?) {
+    private static func applyCloseSessionChord(_ keymap: Keymap, in mainMenu: NSMenu?) {
         let closeSessionOwns = keymap.equivalent(for: .closeSession) == commandW
         let anyBuiltinOwns = BuiltinAction.allCases.contains { keymap.equivalent(for: $0) == commandW }
         let closeSelector = #selector(NSWindow.performClose(_:))
@@ -155,8 +150,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   let stockClose = submenu.items.first(where: { $0.action == closeSelector }),
                   let ours = submenu.items.first(where: { $0.title == closeSessionItemTitle })
             else { continue }
-            // clear a stale ⌘W on our item: SwiftUI defers its rebuild to the next activation, so right after
-            // a reload that rebound close_session away ours still advertises the chord the stock item takes.
+            // clear a stale ⌘W on our item: SwiftUI rebuilds lazily, so right after a reload that rebound
+            // close_session away ours still advertises the chord the stock item takes.
             if closeSessionOwns {
                 ours.keyEquivalent = "w"
                 ours.keyEquivalentModifierMask = .command
@@ -167,6 +162,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stockClose.keyEquivalent = anyBuiltinOwns ? "" : "w"
             stockClose.keyEquivalentModifierMask = anyBuiltinOwns ? [] : .command
         }
+    }
+
+    /// StockMenuChord is one contested stock item, identified by selector plus modifier mask because several
+    /// stock items share a selector.
+    struct StockMenuChord {
+        let selector: Selector
+        let chord: Chord
+
+        var keyEquivalent: String { chord.key == "space" ? " " : chord.key }
+
+        var modifierMask: NSEvent.ModifierFlags {
+            var mask: NSEvent.ModifierFlags = []
+            if chord.mods.contains(.control) { mask.insert(.control) }
+            if chord.mods.contains(.command) { mask.insert(.command) }
+            if chord.mods.contains(.option) { mask.insert(.option) }
+            if chord.mods.contains(.shift) { mask.insert(.shift) }
+            return mask
+        }
+
+        // the mask is compared whole, so the fn-masked palette item never matches an entry
+        func matchesMask(of item: NSMenuItem) -> Bool {
+            item.keyEquivalentModifierMask.intersection([.control, .command, .option, .shift, .function]) == modifierMask
+        }
+    }
+
+    /// stockMenuChords lists the stock chords a keymap can spell; ⌘W's `performClose:` is `applyCloseSessionChord`'s.
+    static let stockMenuChords: [StockMenuChord] = [
+        StockMenuChord(selector: NSSelectorFromString("hide:"), chord: Chord(mods: [.command], key: "h")),
+        StockMenuChord(selector: NSSelectorFromString("hideOtherApplications:"), chord: Chord(mods: [.command, .option], key: "h")),
+        StockMenuChord(selector: NSSelectorFromString("terminate:"), chord: Chord(mods: [.command], key: "q")),
+        StockMenuChord(selector: NSSelectorFromString("terminate:"), chord: Chord(mods: [.command, .option], key: "q")),
+        StockMenuChord(selector: NSSelectorFromString("closeAll:"), chord: Chord(mods: [.command, .option], key: "w")),
+        StockMenuChord(selector: NSSelectorFromString("cut:"), chord: Chord(mods: [.command], key: "x")),
+        StockMenuChord(selector: NSSelectorFromString("copy:"), chord: Chord(mods: [.command], key: "c")),
+        StockMenuChord(selector: NSSelectorFromString("paste:"), chord: Chord(mods: [.command], key: "v")),
+        StockMenuChord(selector: NSSelectorFromString("selectAll:"), chord: Chord(mods: [.command], key: "a")),
+        StockMenuChord(selector: NSSelectorFromString("orderFrontCharacterPalette:"), chord: Chord(mods: [.command], key: "space")),
+        StockMenuChord(selector: NSSelectorFromString("orderFrontCharacterPalette:"), chord: Chord(mods: [.control, .command], key: "space")),
+        StockMenuChord(selector: NSSelectorFromString("performMiniaturize:"), chord: Chord(mods: [.command], key: "m")),
+        StockMenuChord(selector: NSSelectorFromString("miniaturizeAll:"), chord: Chord(mods: [.command, .option], key: "m")),
+    ]
+
+    /// applyStockMenuChords gives each contested stock chord to whichever side `keymap` says owns it.
+    static func applyStockMenuChords(_ keymap: Keymap, in mainMenu: NSMenu?) {
+        applyCloseSessionChord(keymap, in: mainMenu)
+        let claimed = Set(BuiltinAction.allCases.compactMap { keymap.equivalent(for: $0) })
+        let items = menuItems(in: mainMenu)
+        // stale own chords go before any restore, even with the stock item absent: AppKit adds some alternates lazily
+        for entry in stockMenuChords where !claimed.contains(entry.chord) {
+            for item in items where item.action == ownItemAction && item.keyEquivalent == entry.keyEquivalent
+                && entry.matchesMask(of: item) {
+                item.keyEquivalent = ""
+            }
+        }
+        // only the key is cleared; the kept mask finds the same item again on release
+        for item in items {
+            guard let entry = stockMenuChords.first(where: { $0.selector == item.action && $0.matchesMask(of: item) })
+            else { continue }
+            item.keyEquivalent = claimed.contains(entry.chord) ? "" : entry.keyEquivalent
+        }
+    }
+
+    /// ownItemAction is the selector every agterm SwiftUI menu item reports (see `ControlKeymapMenuItem.selector`).
+    private static let ownItemAction = NSSelectorFromString("menuAction:")
+
+    private static func menuItems(in menu: NSMenu?) -> [NSMenuItem] {
+        (menu?.items ?? []).flatMap { [$0] + menuItems(in: $0.submenu) }
     }
 
     private static func hasCommandW(_ item: NSMenuItem) -> Bool {
@@ -332,6 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         actions?.cancelAllPendingModals()
         controlServer?.stop()
         customCommandRunner?.stop()
+        TerminalInputSource.shared.stop()
         // clear the OS-level Dock badge — it outlives the process while unseenCount is ephemeral, so a quit
         // with unseen > 0 pins a stale count (the willClose refresh() can't: isTerminating no-ops closeWindow).
         DockBadgeController.shared.clear()
@@ -343,8 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Self.exitFlush(pending: liveReset?.armablePending, steps: ExitFlushSteps(
                 capture: { _ = self.captureOnExit?(library.allOpenSessions()) },
                 finalize: { library.finalizeAllPendingCloses() },
-                saveChecked: { library.saveAllOpenChecked() },
-                save: { library.saveAllOpen() },
+                save: { library.saveAllChecked() },
                 arm: { selection in
                     guard let store = self.liveResetMarkerStore else { return false }
                     return Self.armLiveReset(selection, store: store) {
@@ -353,7 +415,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }))
         }
-        library?.saveIndex()
         // flush pending debounced settings writes (a keyboard-driven opacity/blur change holds a ~0.3s save
         // no drag-end commit fires) so they survive ⌘Q.
         settingsModel?.flushPendingSaves()
@@ -362,24 +423,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     struct ExitFlushSteps {
         let capture: () -> Void
         let finalize: () -> Void
-        let saveChecked: () -> Bool
-        let save: () -> Void
+        let save: () -> Bool
         let arm: (LiveReset.Selection) -> Bool
     }
 
-    /// The exit flush in its fixed order: capture, finalize pending closes, then save. A pending Live
-    /// sessions reset takes the CHECKED save and arms only when it reports every snapshot written; capture
-    /// is invoked, not judged, since its count is best effort. Returns whether a reset was armed.
+    /// exitFlush runs in a fixed order: capture, finalize pending closes, then save. A pending Live
+    /// sessions reset arms only when the save reports every snapshot and the index written; capture is
+    /// invoked, not judged, since its count is best effort. Returns whether a reset was armed.
     @discardableResult
     static func exitFlush(pending: LiveReset.Selection?, steps: ExitFlushSteps) -> Bool {
         steps.capture()
         steps.finalize()
-        guard let pending else {
-            steps.save()
-            return false
-        }
-        guard steps.saveChecked() else {
-            logger.error("live sessions reset not armed: a window snapshot did not save")
+        let saved = steps.save()
+        guard let pending else { return false }
+        guard saved else {
+            logger.error("live sessions reset not armed: window state or the index did not save")
             return false
         }
         return steps.arm(pending)

@@ -38,6 +38,7 @@ final class ControlServerSessionActionsTests: XCTestCase {
 
     override func tearDown() async throws {
         await MainActor.run {
+            HtmlOverlayRegistry.shared.setZoom(1)
             server = nil
             actions = nil
             library = nil
@@ -45,6 +46,217 @@ final class ControlServerSessionActionsTests: XCTestCase {
             stateDir = nil
         }
         try await super.tearDown()
+    }
+
+    func testAPageOpensWithItsIdAndASubmitIsReadBackByThatId() throws {
+        let (_, session) = try addSession()
+        let options = ControlSessionOverlayOpenOptions(command: "", cwd: nil, wait: false, sizePercent: nil,
+                                                       backgroundColor: nil, follow: false, pane: nil,
+                                                       page: .file(path: "/tmp/pick.html", grantRoot: nil))
+        let opened = server.openSessionOverlay(session.id.uuidString, window: nil, options: options)
+        XCTAssertTrue(opened.ok, opened.error ?? "")
+        XCTAssertEqual(opened.result?.id, session.id.uuidString)
+        let pageID = try XCTUnwrap(opened.result?.pageID.flatMap(UUID.init(uuidString:)))
+        XCTAssertEqual(server.htmlPageResult(pageID).result?.pageOutcome?.outcome, .pending)
+
+        let submitted = server.submitSessionOverlay(session.id.uuidString, window: nil, pane: nil, value: "feature-x")
+        XCTAssertTrue(submitted.ok, submitted.error ?? "")
+        XCTAssertFalse(session.overlayActive)
+        XCTAssertEqual(server.htmlPageResult(pageID).result?.pageOutcome,
+                       ControlHtmlPageOutcome(pageID: pageID.uuidString, outcome: .submitted, value: "feature-x"))
+        let again = server.submitSessionOverlay(session.id.uuidString, window: nil, pane: nil, value: "x")
+        XCTAssertEqual(again.error, OverlayHtmlError.noOverlay)
+    }
+
+    func testATaggedButtonSwitchesSessionsThroughTheRealDispatch() async throws {
+        let (store, pageSession) = try addSession()
+        let (_, other) = try addSession()
+        store.selectSession(pageSession.id)
+        let file = stateDir.appendingPathComponent("switch.html")
+        try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        try """
+            <title>S</title>
+            <button type="button" id="go" data-agterm="session.select" data-agterm-target="\(other.id.uuidString)">go</button>
+            """.write(to: file, atomically: true, encoding: .utf8)
+        let options = ControlSessionOverlayOpenOptions(command: "", cwd: nil, wait: false, sizePercent: nil,
+                                                       backgroundColor: nil, follow: false, pane: nil,
+                                                       page: .file(path: file.path, grantRoot: nil))
+        XCTAssertTrue(server.openSessionOverlay(pageSession.id.uuidString, window: nil, options: options).ok)
+        let overlay = try XCTUnwrap(pageSession.htmlOverlay)
+        let page = HtmlOverlayRegistry.shared.page(for: overlay, store: store)
+        defer { store.closeOverlay(pageSession.id) }
+        let deadline = Date().addingTimeInterval(10)
+        while page.webView.title != "S", Date() < deadline { try await Task.sleep(for: .milliseconds(50)) }
+
+        _ = try await page.webView.evaluateJavaScript("document.getElementById('go').click()")
+        while store.selectedSessionID != other.id, Date() < deadline { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertEqual(store.selectedSessionID, other.id)
+    }
+
+    @MainActor private final class Replies {
+        var values: [(Any?, String?)] = []
+    }
+
+    @MainActor private final class Gate {
+        private var continuation: CheckedContinuation<Void, Never>?
+        var held = false
+        var dispatched = 0
+
+        func wait() async {
+            held = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func open() {
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
+    private func openPage(in store: AppStore, _ session: Session) throws -> HtmlOverlayPage {
+        let file = stateDir.appendingPathComponent("page-\(UUID().uuidString).html")
+        try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        try "<title>P</title>".write(to: file, atomically: true, encoding: .utf8)
+        let options = ControlSessionOverlayOpenOptions(command: "", cwd: nil, wait: false, sizePercent: nil,
+                                                       backgroundColor: nil, follow: false, pane: nil,
+                                                       page: .file(path: file.path, grantRoot: nil))
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: options).ok)
+        return HtmlOverlayRegistry.shared.page(for: try XCTUnwrap(session.htmlOverlay), store: store)
+    }
+
+    private func send(_ body: [String: Any], from page: HtmlOverlayPage) -> Replies {
+        let replies = Replies()
+        page.handleBridgeRequest(body, mainFrame: true) { replies.values.append(($0, $1)) }
+        return replies
+    }
+
+    private func settle(_ replies: Replies) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while replies.values.isEmpty, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(replies.values.count, 1, "a request is answered exactly once")
+    }
+
+    func testAPageClosingItselfIsAnsweredOnceAndRecordedDismissed() async throws {
+        let (store, session) = try addSession()
+        let page = try openPage(in: store, session)
+        let replies = send(["cmd": "session.overlay.close"], from: page)
+        try await settle(replies)
+        XCTAssertNil(replies.values.first?.1)
+        XCTAssertFalse(session.overlayActive)
+        XCTAssertNil(HtmlOverlayRegistry.shared.existing(page.id))
+        XCTAssertEqual(HtmlPageOutcomes.shared.outcome(for: page.id)?.outcome, .dismissed)
+    }
+
+    func testAPageReloadingItselfIsAnsweredOnceAndKeepsItsPage() async throws {
+        let (store, session) = try addSession()
+        let page = try openPage(in: store, session)
+        defer { store.closeOverlay(session.id) }
+        let revision = session.htmlOverlay?.reloadRevision ?? 0
+        let replies = send(["cmd": "session.overlay.reload"], from: page)
+        try await settle(replies)
+        XCTAssertNil(replies.values.first?.1)
+        XCTAssertEqual(session.htmlOverlay?.reloadRevision, revision + 1)
+        XCTAssertEqual(session.htmlOverlay?.reloadTarget, .current)
+        XCTAssertTrue(HtmlOverlayRegistry.shared.existing(page.id) === page)
+    }
+
+    func testAPageSubmittingItselfIsAnsweredOnceAndRecordedSubmitted() async throws {
+        let (store, session) = try addSession()
+        let page = try openPage(in: store, session)
+        let replies = send(["cmd": "session.overlay.submit", "args": ["value": "v"]], from: page)
+        try await settle(replies)
+        XCTAssertNil(replies.values.first?.1)
+        XCTAssertEqual(HtmlPageOutcomes.shared.outcome(for: page.id)?.value, "v")
+        XCTAssertNil(HtmlOverlayRegistry.shared.existing(page.id))
+    }
+
+    func testAPageZoomingItselfThroughTheFontKeysKeepsItsIdAndOutcome() async throws {
+        let (store, session) = try addSession()
+        let page = try openPage(in: store, session)
+        defer { store.closeOverlay(session.id) }
+        let increased = send(["cmd": "font.inc"], from: page)
+        try await settle(increased)
+        XCTAssertNil(increased.values.first?.1)
+        XCTAssertEqual(server.settingsModel.settings.htmlOverlayZoom, 1.15)
+        let id = session.id.uuidString
+        let node = server.controlTree(window: nil).result?.tree?.workspaces.flatMap(\.sessions).first { $0.id == id }
+        XCTAssertEqual(node?.htmlOverlays?.first?.zoom, 1.15)
+        XCTAssertEqual(node?.htmlOverlays?.first?.id, page.id.uuidString)
+        XCTAssertEqual(HtmlPageOutcomes.shared.outcome(for: page.id)?.outcome, .pending)
+
+        let reset = send(["cmd": "font.reset"], from: page)
+        try await settle(reset)
+        XCTAssertNil(reset.values.first?.1)
+        XCTAssertNil(server.settingsModel.settings.htmlOverlayZoom)
+        XCTAssertTrue(HtmlOverlayRegistry.shared.existing(page.id) === page)
+    }
+
+    func testACommandThatReloadsItsPageMidDispatchIsAnsweredOnce() async throws {
+        let (store, session) = try addSession()
+        let page = try openPage(in: store, session)
+        defer { store.closeOverlay(session.id) }
+        let real = try XCTUnwrap(HtmlOverlayRegistry.shared.dispatch)
+        HtmlOverlayRegistry.shared.dispatch = { request in
+            page.applyTheme(HtmlOverlayTheme(background: "#123456", foreground: "#fedcba", dark: true))
+            return await real(request)
+        }
+        defer { HtmlOverlayRegistry.shared.dispatch = real }
+        let replies = send(["cmd": "version"], from: page)
+        try await settle(replies)
+        XCTAssertNil(replies.values.first?.1)
+    }
+
+    func testCommandWOverAPageRecordsItDismissed() throws {
+        let (store, session) = try addSession()
+        let page = try openPage(in: store, session)
+        store.selectSession(session.id)
+        XCTAssertTrue(actions.closeActiveSession())
+        XCTAssertFalse(session.overlayActive)
+        XCTAssertEqual(HtmlPageOutcomes.shared.outcome(for: page.id)?.outcome, .dismissed)
+    }
+
+    func testARequestHeldAcrossAnAppSessionCloseStillAnswersOnceAndThePageGoesSilent() async throws {
+        let (store, session) = try addSession()
+        let page = try openPage(in: store, session)
+        let real = try XCTUnwrap(HtmlOverlayRegistry.shared.dispatch)
+        let gate = Gate()
+        HtmlOverlayRegistry.shared.dispatch = { request in
+            gate.dispatched += 1
+            await gate.wait()
+            return await real(request)
+        }
+        defer { HtmlOverlayRegistry.shared.dispatch = real }
+
+        let held = send(["cmd": "session.rename", "args": ["name": "late"]], from: page)
+        let deadline = Date().addingTimeInterval(5)
+        while !gate.held, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertTrue(server.closeSession(session.id.uuidString, window: nil).ok)
+        gate.open()
+        try await settle(held)
+        XCTAssertNotNil(held.values.first?.1, "the rename reaches a session that is gone")
+
+        let later = send(["cmd": "session.rename", "args": ["name": "again"]], from: page)
+        try await settle(later)
+        XCTAssertEqual(later.values.first?.1, "page closed")
+        XCTAssertEqual(gate.dispatched, 1)
+    }
+
+    func testAPageRequestRefreshesTheCachedWindowList() async throws {
+        let (store, session) = try addSession()
+        let page = try openPage(in: store, session)
+        defer { store.closeOverlay(session.id) }
+        let replies = send(["cmd": "window.rename", "args": ["name": "from-page"]], from: page)
+        try await settle(replies)
+        XCTAssertNil(replies.values.first?.1)
+        let windowID = try XCTUnwrap(library.windowID(for: store)?.uuidString)
+        let cached = server.fastPathResponse(for: ControlRequest(cmd: .windowList))
+        XCTAssertEqual(cached?.result?.windows?.first { $0.id == windowID }?.name, "from-page")
+    }
+
+    private func persistentOptions() throws -> ControlSessionOverlayOpenOptions {
+        ControlSessionOverlayOpenOptions(command: "", cwd: nil, wait: false, sizePercent: nil, backgroundColor: nil,
+                                         page: .url(try XCTUnwrap(URL(string: "http://127.0.0.1:1/"))), persistent: true)
     }
 
     private func overlayOptions(follow: Bool, pane: OverlayPane? = nil) -> ControlSessionOverlayOpenOptions {
@@ -56,76 +268,6 @@ final class ControlServerSessionActionsTests: XCTestCase {
         let store = try XCTUnwrap(library.activeStore)
         let owner = try XCTUnwrap(store.currentWorkspaceID)
         return (store, try XCTUnwrap(store.addSession(toWorkspace: owner, cwd: NSHomeDirectory())))
-    }
-
-    func testGuardedTypingDeliversOnlyToMatchingExplicitSlot() throws {
-        let (store, session) = try addSession()
-        store.setSplitVisibility(session.id, shown: true)
-        let rightID = try XCTUnwrap(session.splitPaneIdentity)
-        let left = GhosttySurfaceView(workingDirectory: "/tmp", env: ["AGTERM_PANE_ID": session.paneIdentity.uuidString])
-        let right = GhosttySurfaceView(workingDirectory: "/tmp", env: ["AGTERM_PANE_ID": rightID.uuidString])
-        session.surface = left
-        session.splitSurface = right
-        for (pane, token, expected) in [(StatusPane.left, session.paneIdentity, left), (.right, rightID, right)] {
-            var calls = 0
-            let response = server.injectGuardedText("hello", into: session.id, store: store, pane: pane,
-                expectedPaneID: token.uuidString.lowercased()) { surface, text in
-                    calls += 1
-                    XCTAssertTrue(surface === expected)
-                    XCTAssertEqual(text, "hello")
-                    return true
-                }
-            XCTAssertTrue(response.ok)
-            XCTAssertEqual(calls, 1)
-        }
-    }
-
-    func testGuardedTypingRejectsSwapAndReplacementWithoutSending() throws {
-        let (store, session) = try addSession()
-        store.setSplitVisibility(session.id, shown: true)
-        let leftID = session.paneIdentity
-        let rightID = try XCTUnwrap(session.splitPaneIdentity)
-        session.surface = GhosttySurfaceView(workingDirectory: "/tmp", env: ["AGTERM_PANE_ID": leftID.uuidString])
-        session.splitSurface = GhosttySurfaceView(workingDirectory: "/tmp", env: ["AGTERM_PANE_ID": rightID.uuidString])
-        XCTAssertNil(store.swapPanes(session.id))
-        var calls = 0
-        let send: (GhosttySurfaceView, String) -> Bool = { _, _ in calls += 1; return true }
-        for (pane, token) in [(StatusPane.left, leftID), (.right, rightID)] {
-            let response = server.injectGuardedText("hello", into: session.id, store: store, pane: pane,
-                                                   expectedPaneID: token.uuidString, send: send)
-            XCTAssertEqual(response.error, "pane identity mismatch")
-        }
-        session.surface = GhosttySurfaceView(workingDirectory: "/tmp", env: ["AGTERM_PANE_ID": UUID().uuidString])
-        XCTAssertEqual(server.injectGuardedText("hello", into: session.id, store: store, pane: .left,
-            expectedPaneID: rightID.uuidString, send: send).error, "pane identity mismatch")
-        session.paneIdentity = UUID()
-        XCTAssertFalse(server.injectGuardedText("hello", into: session.id, store: store, pane: .left,
-            expectedPaneID: rightID.uuidString, send: send).ok)
-        XCTAssertEqual(calls, 0)
-    }
-
-    func testGuardedTypingRejectsInvalidTokenOrPaneWithoutSending() throws {
-        let (store, session) = try addSession()
-        var calls = 0
-        for (pane, token) in [(StatusPane.left, ""), (.right, "bad"), (.scratch, session.paneIdentity.uuidString),
-                              (nil, session.paneIdentity.uuidString)] as [(StatusPane?, String)] {
-            let response = server.injectGuardedText("hello", into: session.id, store: store, pane: pane,
-                expectedPaneID: token) { _, _ in calls += 1; return true }
-            XCTAssertFalse(response.ok)
-        }
-        XCTAssertEqual(calls, 0)
-    }
-
-    func testTypeSessionEnforcesGuardAndDoesNotSelectUnrealizedPane() async throws {
-        let (store, session) = try addSession()
-        let (_, selected) = try addSession()
-        let wrong = await server.typeSession(session.id.uuidString, window: nil,
-            options: ControlSessionTypeOptions(text: "hello", select: true, pane: .left, expectedPaneID: UUID().uuidString))
-        XCTAssertEqual(wrong.error, "pane identity mismatch")
-        let unmounted = await server.typeSession(session.id.uuidString, window: nil,
-            options: ControlSessionTypeOptions(text: "hello", select: true, pane: .left, expectedPaneID: session.paneIdentity.uuidString))
-        XCTAssertEqual(unmounted.error, "session not realized")
-        XCTAssertEqual(store.selectedSessionID, selected.id)
     }
 
     private func parkSwappablePanes(on session: Session) -> (GhosttySurfaceView, GhosttySurfaceView) {
@@ -263,6 +405,65 @@ final class ControlServerSessionActionsTests: XCTestCase {
         let response = server.setSessionContext(UUID().uuidString, window: nil, context: "PR #517")
 
         XCTAssertFalse(response.ok)
+    }
+
+    func testAPersistentOpenIsRefusedWhenTheProfileCannotBeRead() throws {
+        let (_, session) = try addSession()
+        try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        let file = stateDir.appendingPathComponent("browser-profile")
+        try Data("not a uuid".utf8).write(to: file)
+        let registry = HtmlOverlayRegistry.shared
+        let before = registry.profile
+        defer { registry.profile = before }
+        registry.profile = BrowserProfile(directory: stateDir)
+
+        let response = server.openSessionOverlay(session.id.uuidString, window: nil, options: try persistentOptions())
+
+        XCTAssertEqual(response, ControlResponse(
+            ok: false, error: "session.overlay.open: \(BrowserProfile.Failure.malformed(file.path).description)"))
+        XCTAssertNil(session.htmlOverlay)
+        XCTAssertEqual(try Data(contentsOf: file), Data("not a uuid".utf8))
+    }
+
+    func testAPersistentOpenPutsAPersistentPageInTheSlot() async throws {
+        let (store, session) = try addSession()
+        let registry = HtmlOverlayRegistry.shared
+        let before = registry.profile
+        let profile = BrowserProfile(directory: stateDir)
+        registry.profile = profile
+
+        let response = server.openSessionOverlay(session.id.uuidString, window: nil, options: try persistentOptions())
+
+        XCTAssertTrue(response.ok, response.error ?? "")
+        XCTAssertEqual(session.htmlOverlay?.persistent, true)
+        XCTAssertNotNil(try profile.existingIdentifier())
+        store.closeOverlay(session.id)
+        try await TestBrowserStore.remove(profile)
+        registry.profile = before
+    }
+
+    // an accepted page no view had shown yet did not block a clear, which then failed that page for good
+    func testAnAcceptedPersistentPageBlocksAClearBeforeAnyViewShowsIt() async throws {
+        let (store, session) = try addSession()
+        let registry = HtmlOverlayRegistry.shared
+        let before = registry.profile
+        let profile = BrowserProfile(directory: stateDir)
+        registry.profile = profile
+
+        let response = server.openSessionOverlay(session.id.uuidString, window: nil, options: try persistentOptions())
+        XCTAssertTrue(response.ok, response.error ?? "")
+        let overlay = try XCTUnwrap(session.htmlOverlay)
+
+        let refused = await server.clearBrowser()
+
+        XCTAssertEqual(refused, ControlResponse(ok: false, error: "browser.clear: \(BrowserClearError.pagesOpen(1))"))
+        XCTAssertEqual(registry.existing(overlay.id)?.usesSavedStore, true)
+        XCTAssertTrue(registry.page(for: overlay, store: store).usesSavedStore)
+        store.closeOverlay(session.id)
+        let cleared = await server.clearBrowser()
+        XCTAssertEqual(cleared, ControlResponse(ok: true))
+        try await TestBrowserStore.remove(profile)
+        registry.profile = before
     }
 
     func testFollowSelectsTheTargetWhenNothingIsSelected() throws {
@@ -434,6 +635,70 @@ final class ControlServerSessionActionsTests: XCTestCase {
         }
     }
 
+    func testFontUnderAPageStepsThePageZoomAndLeavesTheTerminal() throws {
+        let (store, target) = try addSession()
+        let queued = queuePane(in: target)
+        let page = HtmlOverlay(source: .file(path: "/tmp/a/report.html", grantRoot: nil))
+        XCTAssertNil(store.openHtmlOverlay(target.id, pane: nil, overlay: page, sizePercent: nil))
+        let id = target.id.uuidString
+
+        let increased = server.font(id, window: nil, pane: nil, action: "increase_font_size:1")
+
+        XCTAssertTrue(increased.ok, increased.error ?? "")
+        XCTAssertFalse(queued.granted, "the terminal under the page must not be touched")
+        XCTAssertEqual(server.settingsModel.settings.htmlOverlayZoom, 1.15)
+        let node = server.controlTree(window: nil).result?.tree?.workspaces.flatMap(\.sessions).first { $0.id == id }
+        XCTAssertEqual(node?.htmlOverlays?.first?.zoom, 1.15)
+
+        XCTAssertEqual(server.font(id, window: nil, pane: .right, action: "reset_font_size").error, "session has no split pane")
+        XCTAssertEqual(server.settingsModel.settings.htmlOverlayZoom, 1.15)
+        XCTAssertEqual(server.font(id, window: nil, pane: .scratch, action: "reset_font_size").error, "session has no scratch terminal")
+        XCTAssertTrue(server.font(id, window: nil, pane: nil, action: "reset_font_size").ok)
+        XCTAssertNil(server.settingsModel.settings.htmlOverlayZoom)
+        XCTAssertEqual(HtmlOverlayRegistry.shared.zoom, 1)
+    }
+
+    func testFontOnTheRightPaneUnderASessionWidePageZoomsThePage() throws {
+        let (store, target) = try addSession()
+        store.setSplitVisibility(target.id, shown: true)
+        let queued = queuePane(in: target, split: true)
+        let page = HtmlOverlay(source: .file(path: "/tmp/a/report.html", grantRoot: nil))
+        XCTAssertNil(store.openHtmlOverlay(target.id, pane: nil, overlay: page, sizePercent: nil))
+
+        let response = server.font(target.id.uuidString, window: nil, pane: .right, action: "decrease_font_size:1")
+
+        XCTAssertTrue(response.ok, response.error ?? "")
+        XCTAssertFalse(queued.granted)
+        XCTAssertEqual(server.settingsModel.settings.htmlOverlayZoom, 0.85)
+    }
+
+    func testFontOnAShownScratchUnderASessionWidePageZoomsThePage() throws {
+        let (store, target) = try addSession()
+        target.scratchSurface = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory())
+        target.scratchActive = true
+        let page = HtmlOverlay(source: .file(path: "/tmp/a/report.html", grantRoot: nil))
+        XCTAssertNil(store.openHtmlOverlay(target.id, pane: nil, overlay: page, sizePercent: nil))
+
+        let response = server.font(target.id.uuidString, window: nil, pane: .scratch, action: "increase_font_size:1")
+
+        XCTAssertTrue(response.ok, response.error ?? "")
+        XCTAssertEqual(server.settingsModel.settings.htmlOverlayZoom, 1.15)
+    }
+
+    func testFontOnTheUncoveredPaneBesideAPanePageActsOnTheTerminal() throws {
+        let (store, target) = try addSession()
+        store.setSplitVisibility(target.id, shown: true)
+        let queued = queuePane(in: target)
+        let page = HtmlOverlay(source: .file(path: "/tmp/a/report.html", grantRoot: nil))
+        XCTAssertNil(store.openHtmlOverlay(target.id, pane: .right, overlay: page, sizePercent: nil))
+
+        let response = server.font(target.id.uuidString, window: nil, pane: .left, action: "increase_font_size:1")
+
+        XCTAssertEqual(response.error, "session not realized")
+        XCTAssertTrue(queued.granted)
+        XCTAssertNil(server.settingsModel.settings.htmlOverlayZoom)
+    }
+
     func testReadsLeaveAQueuedPaneQueued() throws {
         let (_, target) = try addSession()
         let queued = queuePane(in: target)
@@ -461,10 +726,9 @@ final class ControlServerSessionActionsTests: XCTestCase {
                                                   env: ["AGTERM_PANE_ID": "right-token"])
         session.hasSplit = true
 
-        XCTAssertEqual(ControlServer.resolvedSessionTextPane(in: session, pane: .left, paneID: "right-token"),
-                       .right)
-        XCTAssertEqual(ControlServer.resolvedSessionTextPane(in: session, pane: .scratch, paneID: "unknown"),
-                       .scratch, "an unknown token falls back to the explicit role")
+        XCTAssertEqual(session.paneAddress(token: "right-token", pane: .left), .pane(.right))
+        XCTAssertEqual(session.paneAddress(token: "unknown", pane: .scratch), .pane(.scratch),
+                       "an unknown token falls back to the explicit role")
     }
 
     func testTextPaneIDFollowsItsSurfaceAfterSwap() throws {
@@ -479,8 +743,76 @@ final class ControlServerSessionActionsTests: XCTestCase {
 
         XCTAssertNil(store.swapPanes(session.id))
 
-        XCTAssertEqual(ControlServer.resolvedSessionTextPane(in: session, pane: .left, paneID: "moving-token"),
-                       .right)
+        XCTAssertEqual(session.paneAddress(token: "moving-token", pane: .left), .pane(.right))
+    }
+
+    // pins an unknown id given alone reading the on-screen pane and answering ok
+    func testAnUnknownPaneIDWithoutAPaneIsRefusedByTextTypeAndCursor() async throws {
+        let (store, session) = try addSession()
+        session.surface = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory(),
+                                             env: ["AGTERM_PANE_ID": "left-token"])
+        let id = session.id.uuidString
+
+        let text = server.readSessionText(id, window: nil,
+                                          options: ControlSessionTextOptions(pane: nil, paneID: "gone", all: false, lines: nil))
+        let typed = await server.typeSession(id, window: nil,
+                                             options: ControlSessionTypeOptions(text: "x", select: false, pane: nil, paneID: "gone"))
+        let cursor = server.readSurfaceCursor(id, window: nil, paneID: "gone")
+
+        XCTAssertEqual(text.error, "unknown pane id: gone")
+        XCTAssertEqual(typed.error, "unknown pane id: gone")
+        XCTAssertEqual(cursor.error, "unknown pane id: gone")
+        XCTAssertEqual(store.selectedSessionID, session.id)
+    }
+
+    func testAPaneIDAddressesItsSlotForTextTypeAndCursor() async throws {
+        let (_, session) = try addSession()
+        session.surface = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory(),
+                                             env: ["AGTERM_PANE_ID": "left-token"])
+        let id = session.id.uuidString
+
+        let text = server.readSessionText(id, window: nil,
+                                          options: ControlSessionTextOptions(pane: nil, paneID: "right-token", all: false, lines: nil))
+        let fallback = server.readSessionText(id, window: nil,
+                                              options: ControlSessionTextOptions(pane: .right, paneID: "gone", all: false, lines: nil))
+        let typed = await server.typeSession(id, window: nil,
+                                             options: ControlSessionTypeOptions(text: "x", select: false, pane: .right, paneID: "gone"))
+        let cursor = server.readSurfaceCursor(id, window: nil, paneID: "left-token")
+
+        XCTAssertEqual(text.error, "unknown pane id: right-token")
+        XCTAssertEqual(fallback.error, "session has no split pane", "an unknown id beside an explicit pane uses that pane")
+        XCTAssertEqual(typed.error, "session has no split pane")
+        XCTAssertEqual(cursor.error, "surface not realized", "the id resolved to the parked left pane")
+    }
+
+    // pins a pane replaced during the realize wait taking the keystrokes meant for the id's terminal
+    func testTypeByPaneIDFollowsTheIDThroughTheRealizeWait() async throws {
+        let (_, session) = try addSession()
+        session.surface = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory(),
+                                             env: ["AGTERM_PANE_ID": "left-token"])
+        let server = try XCTUnwrap(self.server)
+        let id = session.id.uuidString
+
+        let typing = Task { @MainActor in
+            await server.typeSession(id, window: nil,
+                                     options: ControlSessionTypeOptions(text: "x", select: false, pane: nil, paneID: "left-token"))
+        }
+        try await Task.sleep(nanoseconds: 60_000_000)
+        session.surface = GhosttySurfaceView(workingDirectory: NSTemporaryDirectory(),
+                                             env: ["AGTERM_PANE_ID": "other-token"])
+        let typed = await typing.value
+
+        XCTAssertEqual(typed.error, "unknown pane id: left-token")
+    }
+
+    func testCursorPaneIDRefusesASurfaceTarget() throws {
+        let (_, session) = try addSession()
+        let id = session.id.uuidString
+
+        XCTAssertEqual(server.readSurfaceCursor("surface:\(id):left", window: nil, paneID: "left-token").error,
+                       "surface.cursor: --pane-id takes a session target")
+        XCTAssertEqual(server.readSurfaceCursor("quick", window: nil, paneID: "left-token").error,
+                       "surface.cursor: --pane-id takes a session target")
     }
 
     // the same parked pane, one command over: `surfaceBindingAction`'s cast proves only that the SLOT is
@@ -724,10 +1056,134 @@ final class ControlServerSessionActionsTests: XCTestCase {
         XCTAssertTrue(response.ok, response.error ?? "")
         XCTAssertEqual(session.hudPaneIdentity, rightIdentity)
         XCTAssertEqual(store.controlTree().workspaces[0].sessions.last?.hud?.pane, "right")
-        let rightSize = HudLayout.panelSize(for: spec, pane: server.paneMetrics(for: session, pane: .right))
-        let leftSize = HudLayout.panelSize(for: spec, pane: server.paneMetrics(for: session, pane: .left))
+        let rightSize = HudLayout.panelSize(for: spec, pane: server.paneMetrics(for: session, pane: .right, fontSize: server.liveHudFontSize(session)))
+        let leftSize = HudLayout.panelSize(for: spec, pane: server.paneMetrics(for: session, pane: .left, fontSize: server.liveHudFontSize(session)))
         XCTAssertEqual(session.overlaySizePercent, rightSize.widthPercent)
         XCTAssertNotEqual(rightSize.widthPercent, leftSize.widthPercent)
+    }
+
+    func testTheHudIsMeasuredWithItsOwnFontThroughOpenZoomUpdateAndResize() throws {
+        let (store, session) = try makeHudSession()
+        session.splitPaneIdentity = UUID()
+        session.hasSplit = true
+        session.isSplit = true
+        session.surface = SessionRestoreTestSurface(paneToken: "left-token")
+        session.splitSurface = SessionRestoreTestSurface(paneToken: "right-token")
+        session.hudPaneFrames = HudPaneFrames(
+            left: HudPaneFrame(x: 0, y: 0, width: 1_600, height: 1_000),
+            right: HudPaneFrame(x: 1_604, y: 0, width: 400, height: 1_000)
+        )
+        store.setFontSize(session.id, 10)
+        let hudMetrics = server.paneMetrics(for: session, pane: .left, fontSize: 24)
+        let spec = HudSpec(message: String(repeating: "x", count: 30), detail: "d", fontSize: 24)
+        let size = HudLayout.panelSize(for: spec, pane: hudMetrics)
+        XCTAssertNotEqual(size, HudLayout.panelSize(for: spec, pane: server.paneMetrics(for: session, pane: .left, fontSize: 10)))
+
+        XCTAssertTrue(server.openHud(session.id.uuidString, window: nil, spec: spec,
+                                     placement: ControlHudPlacement(pane: .left)).ok)
+
+        XCTAssertEqual(session.hudPanelSize, size)
+        XCTAssertEqual(headerGrid(session), gridField(HudLayout.paintGrid(for: spec, size: size, pane: hudMetrics)))
+
+        store.setFontSize(session.id, 12)
+        let update = HudSpec(message: String(repeating: "y", count: 40))
+        XCTAssertTrue(server.updateHud(session.id.uuidString, window: nil, spec: update,
+                                       placement: ControlHudPlacement(pane: .left)).ok)
+
+        let updated = HudLayout.panelSize(for: update, pane: hudMetrics)
+        XCTAssertNotEqual(updated, HudLayout.panelSize(for: update, pane: server.paneMetrics(for: session, pane: .left, fontSize: 12)))
+        XCTAssertEqual(session.hudPanelSize, updated)
+
+        XCTAssertTrue(server.resizeSessionOverlay(session.id.uuidString, window: nil, sizePercent: 50).ok)
+
+        let live = try XCTUnwrap(session.effectiveHudSpec)
+        let resized = HudLayout.panelSize(for: live, pane: hudMetrics)
+        XCTAssertEqual(session.hudPanelSize, resized)
+        XCTAssertEqual(headerGrid(session), gridField(HudLayout.paintGrid(for: live, size: resized, pane: hudMetrics)))
+        XCTAssertNotEqual(headerGrid(session), gridField(HudLayout.paintGrid(
+            for: live, size: resized, pane: server.paneMetrics(for: session, pane: .left, fontSize: 12))))
+    }
+
+    private func headerGrid(_ session: Session) -> String? {
+        bodyText(session)?.split(separator: "\n").first?.split(separator: " ").prefix(2).joined(separator: " ")
+    }
+
+    private func gridField(_ grid: (columns: Int, rows: Int)) -> String {
+        "\(grid.columns) \(grid.rows)"
+    }
+
+    func testAPaneShrinkKeepsAMarkdownHudsRowsOnceForABurstAndClipsOnlyAtTheCap() async throws {
+        let (_, session) = try makeHudSession()
+        let message = (1...12).map { "- item \($0)" }.joined(separator: "\n")
+        let before = try openLeftPaneHud(session, spec: HudSpec(message: message, markdown: true))
+        let points = try XCTUnwrap(session.hudHeightPoints)
+        XCTAssertFalse(before.contains("more"))
+
+        session.hudPaneFrames = HudPaneFrames(left: HudPaneFrame(x: 0, y: 0, width: 1_600, height: 400),
+                                              right: HudPaneFrame(x: 1_604, y: 0, width: 400, height: 400))
+        session.onHudGeometryChange?()
+        session.onHudGeometryChange?()
+        XCTAssertEqual(server.hudGeometryPending, [session.id])
+        await drainGeometry(session)
+
+        XCTAssertEqual(bodyText(session), before, "the same rows fit a shorter pane, so nothing is rewrapped or clipped")
+        XCTAssertEqual(session.hudHeightPoints, points)
+
+        session.hudPaneFrames = HudPaneFrames(left: HudPaneFrame(x: 0, y: 0, width: 1_600, height: 150),
+                                              right: HudPaneFrame(x: 1_604, y: 0, width: 400, height: 150))
+        session.onHudGeometryChange?()
+        await drainGeometry(session)
+
+        let clipped = try XCTUnwrap(bodyText(session))
+        XCTAssertEqual(clipped, try expectedLeftPaneBody(session))
+        XCTAssertEqual(session.hudHeightPoints, 120)
+        XCTAssertTrue(clipped.contains("more"))
+    }
+
+    func testAPaneShrinkKeepsAPlainHudsGridAndGivesItALargerShareOfThePane() async throws {
+        let (_, session) = try makeHudSession()
+        let before = try openLeftPaneHud(session, spec: HudSpec(message: "working on it"))
+        let share = try XCTUnwrap(session.hudPanelSize)
+
+        session.hudPaneFrames = HudPaneFrames(left: HudPaneFrame(x: 0, y: 0, width: 700, height: 500),
+                                              right: HudPaneFrame(x: 704, y: 0, width: 400, height: 500))
+        session.onHudGeometryChange?()
+        await drainGeometry(session)
+
+        let after = try XCTUnwrap(bodyText(session))
+        XCTAssertEqual(after, try expectedLeftPaneBody(session))
+        XCTAssertEqual(after, before, "the panel is measured to its text again, so the grid it paints in is the same")
+        let shrunk = try XCTUnwrap(session.hudPanelSize)
+        XCTAssertGreaterThan(shrunk.widthPercent, share.widthPercent)
+        XCTAssertGreaterThan(shrunk.heightPercent, share.heightPercent)
+        XCTAssertEqual(shrunk.heightPoints, share.heightPoints)
+    }
+
+    private func openLeftPaneHud(_ session: Session, spec: HudSpec) throws -> String {
+        session.splitPaneIdentity = UUID()
+        session.hasSplit = true
+        session.isSplit = true
+        session.surface = SessionRestoreTestSurface(paneToken: "left-token")
+        session.splitSurface = SessionRestoreTestSurface(paneToken: "right-token")
+        session.hudPaneFrames = HudPaneFrames(left: HudPaneFrame(x: 0, y: 0, width: 1_600, height: 1_000),
+                                              right: HudPaneFrame(x: 1_604, y: 0, width: 400, height: 1_000))
+        let response = server.openHud(session.id.uuidString, window: nil, spec: spec,
+                                      placement: ControlHudPlacement(pane: .left))
+        XCTAssertTrue(response.ok, response.error ?? "")
+        return try XCTUnwrap(bodyText(session))
+    }
+
+    private func drainGeometry(_ session: Session) async {
+        for _ in 0..<50 where server.hudGeometryPending.contains(session.id) { await Task.yield() }
+        XCTAssertTrue(server.hudGeometryPending.isEmpty)
+    }
+
+    private func expectedLeftPaneBody(_ session: Session) throws -> String {
+        let spec = try XCTUnwrap(session.effectiveHudSpec)
+        let size = try XCTUnwrap(session.hudPanelSize)
+        let metrics = server.paneMetrics(for: session, pane: .left, fontSize: server.liveHudFontSize(session))
+        return HudLayout.renderedBody(for: spec, grid: HudLayout.paintGrid(for: spec, size: size, pane: metrics),
+                                      ownerPid: Self.ownerPid)
     }
 
     func testHudPaneMetricsFallBackToADeckHostedSurfaceBeforeTheFrameCacheFills() throws {
@@ -741,7 +1197,7 @@ final class ControlServerSessionActionsTests: XCTestCase {
         session.hudPaneFrames = HudPaneFrames()
         addTeardownBlock { window.orderOut(nil) }
 
-        let metrics = server.paneMetrics(for: session, pane: .left)
+        let metrics = server.paneMetrics(for: session, pane: .left, fontSize: server.liveHudFontSize(session))
 
         XCTAssertEqual(metrics.paneWidth, 640, accuracy: 0.001)
         XCTAssertEqual(metrics.paneHeight, 480, accuracy: 0.001)
@@ -759,7 +1215,7 @@ final class ControlServerSessionActionsTests: XCTestCase {
         session.hudPaneFrames = HudPaneFrames()
         addTeardownBlock { window.orderOut(nil) }
 
-        let metrics = server.paneMetrics(for: session, pane: .left)
+        let metrics = server.paneMetrics(for: session, pane: .left, fontSize: server.liveHudFontSize(session))
 
         XCTAssertEqual(metrics.paneWidth, 0)
         XCTAssertEqual(metrics.paneHeight, 0)
@@ -831,6 +1287,42 @@ final class ControlServerSessionActionsTests: XCTestCase {
         XCTAssertNil(session.hudPaneIdentity)
     }
 
+    func testRespawningAVisibleScratchWithACommandEmitsNoVisibilityEvents() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let session = try XCTUnwrap(store.activeSession)
+        store.toggleScratch(session.id)
+        session.scratchSurface = SessionRestoreTestSurface(paneToken: "scratch-token")
+        let anchor = try XCTUnwrap(library.readEvents(ControlEventReadOptions(cursor: nil, kinds: nil, limit: 100)).result?.events)
+
+        let response = server.scratchSession(session.id.uuidString, window: nil, mode: "on", command: "top")
+
+        XCTAssertTrue(response.ok, "\(response)")
+        XCTAssertTrue(session.scratchActive)
+        XCTAssertEqual(session.scratchCommand, "top")
+        XCTAssertNil(session.scratchSurface, "the respawn tears the old surface down")
+        let events = try XCTUnwrap(library.readEvents(ControlEventReadOptions(
+            cursor: ControlEventCursor(run: anchor.run, after: anchor.next), kinds: [.paneScratch], limit: 100
+        )).result?.events)
+        XCTAssertEqual(events.items.count, 0, "a scratch that never left the screen emits nothing: \(events.items)")
+
+        store.toggleScratch(session.id)
+        session.scratchSurface = SessionRestoreTestSurface(paneToken: "scratch-token")
+        let hiddenAnchor = try XCTUnwrap(library.readEvents(ControlEventReadOptions(cursor: nil, kinds: nil, limit: 100)).result?.events)
+        XCTAssertTrue(server.scratchSession(session.id.uuidString, window: nil, mode: "on", command: "top").ok)
+        let shown = try XCTUnwrap(library.readEvents(ControlEventReadOptions(
+            cursor: ControlEventCursor(run: hiddenAnchor.run, after: hiddenAnchor.next), kinds: [.paneScratch], limit: 100
+        )).result?.events)
+        XCTAssertEqual(shown.items.map { $0.payload.status }, ["shown"], "a hidden scratch respawn still shows once")
+
+        session.scratchSurface = SessionRestoreTestSurface(paneToken: "scratch-token")
+        let offAnchor = try XCTUnwrap(library.readEvents(ControlEventReadOptions(cursor: nil, kinds: nil, limit: 100)).result?.events)
+        XCTAssertTrue(server.scratchSession(session.id.uuidString, window: nil, mode: "off", command: "top").ok)
+        let hidden = try XCTUnwrap(library.readEvents(ControlEventReadOptions(
+            cursor: ControlEventCursor(run: offAnchor.run, after: offAnchor.next), kinds: [.paneScratch], limit: 100
+        )).result?.events)
+        XCTAssertEqual(hidden.items.map { $0.payload.status }, ["hidden"], "off from visible still hides once")
+    }
+
     func testScratchPaneIDCannotAnchorAHud() throws {
         let (_, session) = try makeHudSession()
         session.scratchSurface = SessionRestoreTestSurface(paneToken: "scratch-token")
@@ -875,6 +1367,17 @@ final class ControlServerSessionActionsTests: XCTestCase {
         XCTAssertEqual(ControlServer.cellSize(family: "Menlo", size: 26).width, menlo.width * 2, accuracy: 0.01)
     }
 
+    func testAHudIsSizedFromTheEstimateWhileItsSessionHasNoLiveSurface() throws {
+        let server = try XCTUnwrap(self.server)
+        let (_, session) = try makeHudSession()
+
+        XCTAssertNil(server.liveCellSize(of: session, fontSize: 13))
+        let estimate = ControlServer.cellSize(family: server.settingsModel.settings.fontFamily, size: 13)
+        let metrics = server.paneMetrics(for: session, fontSize: 13)
+        XCTAssertEqual(metrics.cellWidth, estimate.width, accuracy: 0.001)
+        XCTAssertEqual(metrics.cellHeight, estimate.height, accuracy: 0.001)
+    }
+
     // an unwritable body means the panel would paint nothing or stale text, so neither open nor update may
     // leave the store claiming a message the helper cannot read.
     func testAFailedBodyWriteRollsTheStoreBack() throws {
@@ -900,6 +1403,7 @@ final class ControlServerSessionActionsTests: XCTestCase {
         XCTAssertEqual(resize.error, OverlayHudError.writeFailed)
         XCTAssertEqual(session.overlaySizePercent, size,
                        "a panel whose header cannot be rewritten must not move away from it")
+        XCTAssertNil(session.hudResizedWidthPercent, "and a measured width must not come back as a forced one")
 
         let open = server.openHud(session.id.uuidString, window: nil, spec: HudSpec(message: "also unwritable"))
         XCTAssertFalse(open.ok)
@@ -926,11 +1430,9 @@ final class ControlServerSessionActionsTests: XCTestCase {
         XCTAssertEqual(session.hudFile, file)
         XCTAssertEqual(bodyText(session), expectedBody(update))
         XCTAssertEqual(session.overlaySizePercent, 40)
-        // the grid rides in the body's header line, which is what lets a running helper re-centre. The
-        // trailing `-` is the no-text-color sentinel, spelled out because this pins the wire format.
         XCTAssertEqual(bodyText(session)?.split(separator: "\n").first.map(String.init),
                        "\(HudLayout.box(for: update).columns) \(HudLayout.box(for: update).rows) 0 "
-                           + "\(Self.ownerPid) \(HudSpinner.staticInterval) -")
+                           + "\(Self.ownerPid) \(HudSpinner.staticInterval) - 0")
     }
 
     // the text color rides that same header, so an update recolors the live panel without re-opening the
@@ -946,7 +1448,7 @@ final class ControlServerSessionActionsTests: XCTestCase {
 
         XCTAssertEqual(session.overlaySlotGeneration, generation, "a recolor must not re-open the slot")
         XCTAssertEqual(bodyText(session)?.split(separator: "\n").first.map(String.init)?
-            .hasSuffix(" 38;2;126;192;126"), true)
+            .hasSuffix(" 38;2;126;192;126 0"), true)
         XCTAssertEqual(session.hudSpec?.textColor, "#7ec07e")
     }
 
@@ -975,6 +1477,250 @@ final class ControlServerSessionActionsTests: XCTestCase {
                        "no hud", "a caller's program is not a hud's to rewrite")
         XCTAssertEqual(server.closeHud(session.id.uuidString, window: nil).error, "no hud")
         XCTAssertTrue(session.overlayActive, "a refused hud command must leave the program overlay alone")
+    }
+
+    private final class PresenterSink: PresentationSink {
+        var bodies: [PresentationFrame.Body] = []
+        var generation = 0
+
+        func offer(_ frame: PresentationFrame) -> Bool {
+            if bodies.isEmpty { generation = frame.gen }
+            bodies.append(frame.body)
+            return true
+        }
+
+        func close(_: PresentationHub.CloseReason) {}
+    }
+
+    @discardableResult
+    private func present(_ session: Session) throws -> (PresenterSink, PresentationHub.SubscriberID) {
+        for pane in [session.paneIdentity] + [session.splitPaneIdentity].compactMap({ $0 }) {
+            ZmxLeadBook.shared.begin(ZmxLeadAttachment(nonce: "n", claim: true), pane: pane)
+            _ = ZmxLeadBook.shared.apply(try XCTUnwrap(ZmxLeadNotice(title: "zmx-role;n:follower:1")), pane: pane)
+        }
+        server.attachPresentationHub()
+        let sink = PresenterSink()
+        let id = try server.presentationHub.subscribe(
+            session: session.id, hello: PresentationHello(version: 1, kinds: [], mode: .presenter), sink: sink
+        ) { PresentationSnapshot(status: nil, hud: nil) }
+        server.presentationHub.receive(PresentationFrame(gen: sink.generation, rev: 0, body: .presenterAcquire), from: id)
+        return (sink, id)
+    }
+
+    private func remoteJob(_ session: Session) throws -> String {
+        try XCTUnwrap(session.remoteOverlays.slot(nil)?.job)
+    }
+
+    func testAnOverlayOpensHereWhileThisMacLeadsAPresentedSession() throws {
+        let (store, session) = try addSession()
+        store.toggleSplit(session.id)
+        let (sink, _) = try present(session)
+        _ = ZmxLeadBook.shared.apply(try XCTUnwrap(ZmxLeadNotice(title: "zmx-role;n:leader:2")), pane: session.paneIdentity)
+        ZmxLeadBook.shared.forget(pane: try XCTUnwrap(session.splitPaneIdentity))
+
+        let response = server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false))
+
+        XCTAssertTrue(response.ok)
+        XCTAssertTrue(session.programOverlayActive)
+        XCTAssertTrue(session.remoteOverlays.slots.isEmpty)
+        XCTAssertFalse(sink.bodies.contains { if case .overlayRequest = $0 { true } else { false } })
+    }
+
+    func testAnOverlayForAPresentedSessionGoesToTheViewerAndCoversNothingHere() throws {
+        let (_, session) = try addSession()
+        let (sink, _) = try present(session)
+
+        let response = server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false))
+
+        XCTAssertEqual(response, ControlResponse(ok: true, result: ControlResult(id: session.id.uuidString)))
+        let job = try remoteJob(session)
+        guard case .overlayRequest(let request)? = sink.bodies.last else { return XCTFail("no overlay.request sent") }
+        XCTAssertEqual(request.job, job)
+        XCTAssertFalse(session.overlayActive)
+        let context = try XCTUnwrap(server.overlayJobs.job(job)?.context)
+        XCTAssertEqual(context.command, "true")
+        XCTAssertEqual(context.environment["AGTERM_SESSION_ID"], session.id.uuidString)
+        XCTAssertEqual(context.environment["AGTERM_SOCKET"], server.resolvedSocketPath)
+    }
+
+    func testALocalOpenOnASlotAViewerStillHoldsIsRefused() throws {
+        let (_, session) = try addSession()
+        let (_, id) = try present(session)
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false)).ok)
+        let job = try remoteJob(session)
+        _ = server.overlayJobs.claim(job) {}
+        server.overlayJobs.started(job)
+        server.presentationHub.unsubscribe(id)
+
+        let response = server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false))
+
+        XCTAssertEqual(response.error, "overlay already open")
+        XCTAssertFalse(session.overlayActive)
+    }
+
+    func testLosingThePresenterCancelsAnOverlayItNeverStarted() throws {
+        let (_, session) = try addSession()
+        let (_, id) = try present(session)
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false)).ok)
+        let job = try remoteJob(session)
+
+        server.presentationHub.unsubscribe(id)
+
+        XCTAssertEqual(server.overlayJobs.job(job)?.state, .finished(.canceled))
+        XCTAssertEqual(server.sessionOverlayResult(session.id.uuidString, window: nil, pane: nil).error,
+                       "overlay ended: canceled")
+    }
+
+    func testARemoteOverlaysResultIsRunningThenItsFailure() throws {
+        let (_, session) = try addSession()
+        try present(session)
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false)).ok)
+        let job = try remoteJob(session)
+
+        XCTAssertEqual(server.sessionOverlayResult(session.id.uuidString, window: nil, pane: nil).error,
+                       OverlayResultError.stillRunning)
+        server.overlayJobs.finish(job, .launchFailed)
+
+        XCTAssertEqual(server.sessionOverlayResult(session.id.uuidString, window: nil, pane: nil).error,
+                       "overlay ended: launch-failed")
+    }
+
+    func testARemoteOverlaysExitCodeIsItsResult() throws {
+        let (_, session) = try addSession()
+        try present(session)
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false)).ok)
+
+        server.overlayJobs.finish(try remoteJob(session), .exited(3))
+
+        XCTAssertEqual(server.sessionOverlayResult(session.id.uuidString, window: nil, pane: nil).result?.exitCode, 3)
+    }
+
+    func testAHeldWaitSurfaceKeepsItsSlotUntilClosedWithItsResultReadable() throws {
+        let (store, session) = try addSession()
+        try present(session)
+        let options = ControlSessionOverlayOpenOptions(command: "true", cwd: nil, wait: true, sizePercent: nil,
+                                                       backgroundColor: nil, follow: false, pane: nil)
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: options).ok)
+        server.overlayJobs.finish(try remoteJob(session), .exited(3))
+
+        XCTAssertEqual(server.sessionOverlayResult(session.id.uuidString, window: nil, pane: nil).result?.exitCode, 3)
+        XCTAssertNotNil(store.controlTree().workspaces.flatMap(\.sessions).first { $0.id == session.id.uuidString }?.remoteOverlays)
+        XCTAssertTrue(server.closeSessionOverlay(session.id.uuidString, window: nil, pane: nil).ok)
+
+        XCTAssertTrue(session.remoteOverlays.slots.isEmpty)
+        XCTAssertEqual(server.sessionOverlayResult(session.id.uuidString, window: nil, pane: nil).result?.exitCode, 3)
+    }
+
+    func testOverlayReadsRefuseAnOverlayShownOnAnotherMac() throws {
+        let (_, session) = try addSession()
+        try present(session)
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false)).ok)
+        let options = ControlSessionOverlayTextOptions(pane: nil, all: false, lines: nil)
+
+        XCTAssertEqual(server.readSessionOverlayText(session.id.uuidString, window: nil, options: options).error,
+                       OverlayResultError.shownElsewhere)
+        XCTAssertEqual(server.copySessionOverlaySelection(session.id.uuidString, window: nil, pane: nil).error,
+                       OverlayResultError.shownElsewhere)
+    }
+
+    func testClosingARemoteOverlayCancelsItAndAsksTheViewerToTakeItDown() throws {
+        let (_, session) = try addSession()
+        let (sink, _) = try present(session)
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false)).ok)
+        let job = try remoteJob(session)
+
+        let response = server.closeSessionOverlay(session.id.uuidString, window: nil, pane: nil)
+
+        XCTAssertTrue(response.ok)
+        XCTAssertEqual(sink.bodies.last, .overlayClose(PresentationOverlayChange(job: job)))
+        XCTAssertEqual(server.overlayJobs.job(job)?.state, .finished(.canceled))
+        XCTAssertEqual(server.sessionOverlayResult(session.id.uuidString, window: nil, pane: nil).error,
+                       "overlay ended: canceled")
+    }
+
+    func testResizingARemoteOverlayIsSentWhileItsViewerIsUpAndRefusedAfter() throws {
+        let (_, session) = try addSession()
+        let (sink, id) = try present(session)
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false)).ok)
+        let job = try remoteJob(session)
+        _ = server.overlayJobs.claim(job) {}
+        server.overlayJobs.started(job)
+
+        XCTAssertTrue(server.resizeSessionOverlay(session.id.uuidString, window: nil, sizePercent: 40).ok)
+        XCTAssertEqual(sink.bodies.last, .overlayResize(PresentationOverlayChange(job: job, sizePercent: 40)))
+        server.presentationHub.unsubscribe(id)
+
+        XCTAssertEqual(server.resizeSessionOverlay(session.id.uuidString, window: nil, sizePercent: 60).error,
+                       OverlayResultError.viewerGone)
+    }
+
+    private func openOriginHud(_ store: AppStore, _ session: Session) {
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "working"), file: "/tmp/hud",
+                      size: HudPanelSize(widthPercent: 30, heightPercent: 8))
+    }
+
+    func testARemoteOpenTakesTheSlotFromAnOriginHud() throws {
+        let (store, session) = try addSession()
+        try present(session)
+        openOriginHud(store, session)
+
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false)).ok)
+
+        XCTAssertFalse(session.hudActive)
+        XCTAssertNotNil(session.remoteOverlays.slot(nil))
+    }
+
+    func testClosingReachesARemoteJobUnderAHudOpenedDuringItsRun() throws {
+        let (store, session) = try addSession()
+        try present(session)
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false)).ok)
+        let job = try remoteJob(session)
+        var reached = 0
+        _ = server.overlayJobs.claim(job) { reached += 1 }
+        server.overlayJobs.started(job)
+        openOriginHud(store, session)
+
+        XCTAssertTrue(server.closeSessionOverlay(session.id.uuidString, window: nil, pane: nil).ok)
+
+        XCTAssertEqual(reached, 1)
+        XCTAssertTrue(session.hudActive)
+    }
+
+    func testARemoteResultEndingUnderAHudIsStillReadable() throws {
+        let (store, session) = try addSession()
+        try present(session)
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false)).ok)
+        let job = try remoteJob(session)
+        openOriginHud(store, session)
+
+        XCTAssertEqual(server.sessionOverlayResult(session.id.uuidString, window: nil, pane: nil).error,
+                       OverlayResultError.stillRunning)
+        server.overlayJobs.finish(job, .exited(3))
+
+        XCTAssertEqual(server.sessionOverlayResult(session.id.uuidString, window: nil, pane: nil).result?.exitCode, 3)
+    }
+
+    func testAHudOpenedAfterARemoteResultReportsNoResult() throws {
+        let (store, session) = try addSession()
+        try present(session)
+        XCTAssertTrue(server.openSessionOverlay(session.id.uuidString, window: nil, options: overlayOptions(follow: false)).ok)
+        server.overlayJobs.finish(try remoteJob(session), .exited(3))
+
+        openOriginHud(store, session)
+
+        XCTAssertEqual(server.sessionOverlayResult(session.id.uuidString, window: nil, pane: nil).error,
+                       OverlayHudError.noResult)
+    }
+
+    func testARemoteOpenOnAPaneTheOriginDoesNotHaveIsRefused() throws {
+        let (_, session) = try addSession()
+        try present(session)
+        let options = ControlSessionOverlayOpenOptions(command: "true", cwd: nil, wait: false, sizePercent: nil,
+                                                       backgroundColor: nil, follow: false, pane: .right)
+
+        XCTAssertEqual(server.openSessionOverlay(session.id.uuidString, window: nil, options: options).error,
+                       PaneOverlayError.paneNotVisible)
+        XCTAssertTrue(session.remoteOverlays.slots.isEmpty)
     }
 
     func testHudOverALiveProgramOverlayIsRefusedAndWritesNothing() throws {

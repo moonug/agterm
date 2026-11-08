@@ -6,12 +6,16 @@ public struct ControlSessionTypeOptions: Equatable, Sendable {
     public let pane: StatusPane?
     /// Expected identity of an explicit left/right slot; never a redirect to another pane.
     public let expectedPaneID: String?
+    /// Upstream token semantics: resolves to the pane's CURRENT slot, overriding a stale `pane`.
+    public let paneID: String?
 
-    public init(text: String, select: Bool, pane: StatusPane?, expectedPaneID: String? = nil) {
+    public init(text: String, select: Bool, pane: StatusPane?, expectedPaneID: String? = nil,
+                paneID: String? = nil) {
         self.text = text
         self.select = select
         self.pane = pane
         self.expectedPaneID = expectedPaneID
+        self.paneID = paneID
     }
 }
 
@@ -20,29 +24,88 @@ public struct ControlSessionOverlayOpenOptions: Equatable, Sendable {
     public let cwd: String?
     public let wait: Bool
     public let sizePercent: Int?
+    /// points overrides `sizePercent` per axis; the dispatcher refuses it without a percent.
+    public let points: OverlayPointSize
     public let backgroundColor: String?
     public let follow: Bool
     /// The pane to cover, nil for the session-wide overlay. A pane overlay is always full, so this and
     /// `sizePercent` are mutually exclusive (rejected in the dispatcher).
     public let pane: OverlayPane?
+    /// page is the file or web page to show instead of running `command`, which is then empty, as is `cwd`.
+    public let page: HtmlSource?
+    public let navigation: Bool
+    public let javascript: Bool
+    public let chromeless: Bool
+    public let persistent: Bool
+    public let browse: Bool
+    /// clicked marks a page opened by a terminal click (`HtmlOverlay.clicked`); the dispatcher never sets it.
+    public let clicked: Bool
+    /// imagePixels is the probed size of an image page, which travels with it when the presenting Mac shows it.
+    /// The app sets it from its probe and the dispatcher never does; an image page without it is never handed over.
+    public let imagePixels: ImagePixels?
+    /// textLog makes a text page a log page (`--tail`, `--follow-file`).
+    public let textLog: TextLog?
+    /// forwarded marks a page a click on the presenting Mac asked for: it opens there or not at all, and replaces a
+    /// hidden clicked page there. The app sets it and the dispatcher never does.
+    public let forwarded: Bool
+    /// markdownLinks is a markdown page's link grant, computed by the app from the file; the dispatcher never sets it.
+    public let markdownLinks: MarkdownLinkGrant?
 
     public init(command: String, cwd: String?, wait: Bool, sizePercent: Int?, backgroundColor: String?,
-                follow: Bool = false, pane: OverlayPane? = nil) {
+                follow: Bool = false, pane: OverlayPane? = nil, page: HtmlSource? = nil, navigation: Bool = false,
+                javascript: Bool = false, chromeless: Bool = false, persistent: Bool = false, browse: Bool = false,
+                points: OverlayPointSize = OverlayPointSize(), clicked: Bool = false, imagePixels: ImagePixels? = nil,
+                textLog: TextLog? = nil, forwarded: Bool = false, markdownLinks: MarkdownLinkGrant? = nil) {
+        self.markdownLinks = markdownLinks
+        self.textLog = textLog
+        self.forwarded = forwarded
+        self.clicked = clicked
+        self.imagePixels = imagePixels
         self.command = command
         self.cwd = cwd
         self.wait = wait
         self.sizePercent = sizePercent
+        self.points = points
         self.backgroundColor = backgroundColor
         self.follow = follow
         self.pane = pane
+        self.page = page
+        self.navigation = navigation
+        self.javascript = javascript
+        self.chromeless = chromeless
+        self.persistent = persistent
+        self.browse = browse
+    }
+
+    /// with returns these options carrying an image page's probed size.
+    public func with(imagePixels: ImagePixels) -> ControlSessionOverlayOpenOptions {
+        ControlSessionOverlayOpenOptions(command: command, cwd: cwd, wait: wait, sizePercent: sizePercent,
+                                         backgroundColor: backgroundColor, follow: follow, pane: pane, page: page,
+                                         navigation: navigation, javascript: javascript, chromeless: chromeless,
+                                         persistent: persistent, browse: browse, points: points, clicked: clicked,
+                                         imagePixels: imagePixels, textLog: textLog, forwarded: forwarded,
+                                         markdownLinks: markdownLinks)
+    }
+
+    /// with returns these options carrying a markdown page's link grant, nil when its links stay text.
+    public func with(markdownLinks: MarkdownLinkGrant?) -> ControlSessionOverlayOpenOptions {
+        ControlSessionOverlayOpenOptions(command: command, cwd: cwd, wait: wait, sizePercent: sizePercent,
+                                         backgroundColor: backgroundColor, follow: follow, pane: pane, page: page,
+                                         navigation: navigation, javascript: javascript, chromeless: chromeless,
+                                         persistent: persistent, browse: browse, points: points, clicked: clicked,
+                                         imagePixels: imagePixels, textLog: textLog, forwarded: forwarded,
+                                         markdownLinks: markdownLinks)
     }
 }
 
 public struct ControlSessionBackgroundOptions: Equatable, Sendable {
     public let watermark: BackgroundWatermark?
+    /// pane selects the override to write; nil writes the session default.
+    public let pane: StatusPane?
 
-    public init(watermark: BackgroundWatermark?) {
+    public init(watermark: BackgroundWatermark?, pane: StatusPane? = nil) {
         self.watermark = watermark
+        self.pane = pane
     }
 }
 
@@ -73,5 +136,42 @@ public struct ControlSessionOverlayTextOptions: Equatable, Sendable {
         self.pane = pane
         self.all = all
         self.lines = lines
+    }
+}
+
+/// ControlSessionRestartOptions is the parsed `session.restart` payload. At least one of `pane` and
+/// `paneID` is set; the host resolves them against the live slots.
+public struct ControlSessionRestartOptions: Equatable, Sendable {
+    /// maxCommandBytes bounds the shell line in UTF-8 bytes. It travels in the new shell's argv, inside
+    /// the session host's 64 KiB creation frame beside the pane's environment.
+    public static let maxCommandBytes = 4096
+
+    /// command is the shell line to run; nil replays the pane's foreground program instead.
+    public let command: String?
+    public let pane: StatusPane?
+    public let paneID: String?
+
+    public init(command: String?, pane: StatusPane?, paneID: String? = nil) {
+        self.command = command
+        self.pane = pane
+        self.paneID = paneID
+    }
+}
+
+/// ControlRestartReceipt is what a successful `session.restart` proves: the pane's shell was replaced.
+/// The pids are the daemon leaders, the pane's root shells, not the program the caller's line starts.
+public struct ControlRestartReceipt: Codable, Equatable, Sendable {
+    public let paneID: String
+    public let oldPid: Int32
+    public let newPid: Int32
+    /// replayedArgv is the foreground program a restart without a command asked the new shell to run;
+    /// nil when the caller supplied the line. It is what was requested, not proof the program started.
+    public let replayedArgv: [String]?
+
+    public init(paneID: String, oldPid: Int32, newPid: Int32, replayedArgv: [String]? = nil) {
+        self.paneID = paneID
+        self.oldPid = oldPid
+        self.newPid = newPid
+        self.replayedArgv = replayedArgv
     }
 }

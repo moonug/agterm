@@ -69,7 +69,7 @@ Work down this list:
 1. **Read the diagnostics.** Open Settings ▸ Key Mapping. A malformed `command` line is listed there and skipped.
 2. **Chord conflict.** If your chord collides with a built-in shortcut or with another custom command, the binding is dropped and the command becomes palette-only. It still runs from the action palette (`⌃⇧P`), where it is listed with a `custom` tag. Pick a free chord, or run it from the palette.
 3. **Reserved chords.** `ctrl+tab` / `ctrl+shift+tab` (the session switcher) and `ctrl+1` / `ctrl+2` (pane focus) are reserved and cannot be bound.
-4. **Modifier-less keys are rejected.** A custom chord needs at least one modifier so it cannot shadow a plain terminal key. `command "x" g …` is palette-only; `command "x" cmd+g …` binds.
+4. **Check the first chord.** A custom shortcut must start with a modifier or a function key (`f1` through `f20`). `command "x" g …` is palette-only; `command "x" cmd+g …` and `command "x" f5 …` bind.
 5. **Focus.** A custom chord fires only while a terminal pane holds keyboard focus. When the sidebar, the inline rename field, a Settings field, or a palette has focus, the chord passes through. Click into the terminal first.
 6. **The command runs in a plain `/bin/sh -c`, not your login shell.** It does not load `~/.zshrc` or `~/.bashrc`, so shell aliases and functions are not available and `PATH` may be shorter than in your terminal. Use absolute paths, or wrap the body in `$SHELL -lc '…'`.
 7. **Exit status.** A non-zero exit posts a failure banner with the code. No banner and no effect usually means the chord never fired (causes above). A banner means it ran and failed, which points at the command itself, its `PATH`, or its arguments.
@@ -99,7 +99,7 @@ A reload applies most keys to your open terminals right away — colors, theme, 
 - **Layout keys** — `window-padding-x`, `window-padding-y`, and other size-affecting keys — do not re-apply to an open pane. libghostty re-derives a surface's padding only when it is first laid out, so a reload (and even resizing the window) leaves existing panes on their old padding. Open a new session or new window to pick up the change; the panes that were already open need a relaunch.
 - **Spawn-time keys** — `term` and `shell-integration-features` — are read once when the shell starts, so a reload cannot change them for a shell that is already running. Open a new session, whose shell is spawned fresh, to apply them.
 
-The full ghostty key reference is at <https://ghostty.org/docs/config>. One pair of values in it does not apply to agterm: the `ssh-env` and `ssh-terminfo` values of `shell-integration-features`. Ghostty implements both by replacing your `ssh` with a wrapper that calls the `ghostty` command-line tool absent from agterm's bundle, so in agterm the wrapper would fail on every connection. agterm forces those two values back off and keeps the rest of your `shell-integration-features` flags, so `ssh` stays the real `ssh`. If you need agterm's terminfo entry on a remote host, install it there once with `infocmp -x xterm-ghostty | ssh <host> 'tic -x -'`.
+The full ghostty key reference is at <https://ghostty.org/docs/config>. One pair of values in it does not apply to agterm: the `ssh-env` and `ssh-terminfo` values of `shell-integration-features`. Ghostty implements both by replacing your `ssh` with a wrapper that calls the `ghostty` command-line tool absent from agterm's bundle, so in agterm the wrapper would fail on every connection. agterm forces those two values back off and keeps the rest of your `shell-integration-features` flags, so `ssh` stays the real `ssh`. If you need agterm's terminfo entry on a remote host, install it there once with `agtermctl terminfo install <host>`, which dumps the bundled entry and compiles it into that account's `~/.terminfo` over one interactive ssh connection; `-p`, `-i`, `-J` and `-F` are passed through, other connection settings belong in `~/.ssh/config` under a host alias, and the settings that decide how the command runs (no pty, stdin kept, no `RemoteCommand`) are the installer's own.
 
 ## Copy/paste and shortcuts on a non-Latin or alternative layout
 
@@ -133,8 +133,22 @@ Reload with **File ▸ Reload Config** or `agtermctl config reload`. The keybind
   To tell "never posted" from "posted but not shown", run `agtermctl notify "test"` and check two things: `agtermctl tree --json` — a rising `unseen` on the target session proves the command reached the notification path — and the log below, which now records every posted and every suppressed notification.
 - **A permission prompt carrying agterm's name, or a tool that cannot get one.** Command-line tools request Automation, Camera, Microphone, Contacts, Calendars, Reminders, Photos, Location, Bluetooth, local network, speech recognition, system administration and system audio recording *through* agterm, so the prompt names agterm rather than the tool. A dismissed prompt is not re-offered, the tool just keeps failing (`osascript` reports "Not authorized to send Apple events"). See [Why agterm asks for camera, microphone and the rest](#why-agterm-asks-for-camera-microphone-and-the-rest) for why, what a grant then covers, and where to change your answer.
 - **A command cannot read `~/Downloads`, `~/Desktop` or `~/Documents`.** Those folders are protected by macOS itself, separately from the services above, and the grant is per application — another terminal reading them says nothing about agterm. See [A command cannot read ~/Downloads, ~/Desktop or ~/Documents](#a-command-cannot-read-downloads-desktop-or-documents).
-- **Agent-status glyph does not update.** Install the hooks from Help ▸ Install Agent Status Hooks…. For shell-integrated agents, start a fresh shell so the `source` line added to your shell rc takes effect. For Pi, restart it or run `/reload` so it loads `~/.pi/agent/extensions/agterm-status.ts`; Pi status is only installed when `~/.pi/agent` already exists. For OpenCode, restart it so it loads `~/.config/opencode/plugins/agterm-status.js`; the plugin installs only when `~/.config/opencode` already exists. The hooks call `agtermctl session status`, so `agtermctl` must resolve first (see above).
+- **Agent-status glyph does not update.** Install the hooks from Help ▸ Install Agent Status Hooks…. For shell-integrated agents, start a fresh shell so the `source` line added to your shell rc takes effect. For Pi, restart it or run `/reload` so it loads `~/.pi/agent/extensions/agterm-status.ts`; Pi status is only installed when `~/.pi/agent` already exists. For OpenCode, re-run the installer after switching majors, then restart OpenCode. V1 uses `~/.config/opencode`; v2 respects the login shell's `OPENCODE_CONFIG_DIR` and `XDG_CONFIG_HOME`. See the [OpenCode installation guide](https://agterm.com/docs#status) for paths, version selection, and v1 cleanup. The v2 plugin reports the CLI's selected session and its descendants, not background tabs or headless runs. The hooks call `agtermctl session status`, so `agtermctl` must resolve first (see above).
 - **Agent-status glyph updates the wrong session.** One session's glyph blinks while the work happens in another — typically when agents run inside tmux (or a tmux-backed session manager such as agent-deck). The working process inherited another session's `AGTERM_SESSION_ID`: the status hooks target whatever id is in their environment, and a long-lived daemon started from inside an agterm session (a tmux server is the usual carrier) captures that session's `AGTERM_*` variables into its global environment and passes them to every child it ever creates. Check `tmux show-environment -g | grep AGTERM` — if present, clear them with `tmux set-environment -g -r AGTERM_SESSION_ID` (and the other `AGTERM_*` names), then restart the affected panes. To avoid it, start such daemons with the variables scrubbed (`env -u AGTERM_SESSION_ID … <command>`) or from a terminal outside agterm.
+- **Codex status lands on another session, or on none.** By default, Codex 0.160.1 CLI sessions share a background app-server daemon, started by the first `codex` that needs it. The server launches hooks using its inherited environment, so every daemon-backed session reports to the session that started the server, or to none when the server was started outside agterm or that session has since closed. Scrubbing the variables prevents wrong-session updates but does not restore status reporting. Run `codex --no-daemon` to keep the session and its hooks in its own process; that running session is unavailable for control through the shared server from the Codex desktop or mobile app. To make that the default for plain `codex`, run `codex features disable daemon_auto_start` once, then `codex app-server daemon stop`; later plain launches start no shared daemon and report to their own session. Disabling auto-start alone still joins a daemon that is already running, and stopping it disconnects the CLI sessions attached to it. A daemon-backed conversation can stay locked after its TUI exits: if `codex --no-daemon resume <id>` shows "This conversation is open in another app", stop the shared daemon and press R to retry. agterm has no automatic mapping from the hook payload's Codex session id to the pane displaying it.
+- **Claude Code background sessions have no status.** A session started with `claude --bg` runs under Claude Code's supervisor, which does not pass the launching pane's `AGTERM_*` variables, so its status hooks find no session and exit quietly. `--settings` carries over into a background session and its hooks inherit the `env` block, so pass the variables there. With the hooks installed, launch from the pane that should show the status:
+
+  ```bash
+  cbg() {
+    claude --bg --settings "$(jq -cn \
+      --arg s "$AGTERM_SESSION_ID" --arg k "$AGTERM_SOCKET" \
+      --arg p "$AGTERM_PANE" --arg i "$AGTERM_PANE_ID" \
+      '{env:{AGTERM_SESSION_ID:$s,AGTERM_SOCKET:$k,AGTERM_PANE:$p,AGTERM_PANE_ID:$i}}')" "$@"
+  }
+  cbg "your prompt"
+  ```
+
+  The status stays with the launching pane; `claude attach` from another pane does not move it. Verified hook routing with Claude Code 2.1.311.
 
 ## Every session restores to the directory it was created in
 
@@ -199,8 +213,10 @@ can claim shift for itself with `XTSHIFTESCAPE`, in which case add `mouse-shift-
 `~/.config/agterm/ghostty.conf` so shift always wins.
 
 To turn mouse reporting off for every program instead, set `mouse-reporting = false` in the same file.
-Selection and links then always work, at the cost of mouse support inside programs that wanted it — mouse
-scrolling in `tmux`, clicking to position the cursor in `vim`.
+Selection then always works, at the cost of mouse support inside programs that wanted it — mouse
+scrolling in `tmux`, clicking to position the cursor in `vim`. Links do not come back: libghostty decides
+link detection from the program's mouse request, not this setting, so inside such a program a link still
+needs ⌘⇧.
 
 ## Claude Code's question or permission prompt stops responding after switching apps
 
@@ -275,6 +291,41 @@ against the folder itself, rather than a replacement such as `eza`. A privacy de
 `Operation not permitted` and ordinary permission bits as `Permission denied`, and some replacements print
 the same wording for both.
 
+## A dropped screenshot reaches a Live pane but cannot be read
+
+Dropping the macOS screenshot thumbnail into a Live pane inserts the path of its temporary copy under
+`TemporaryItems/NSIRD_screencaptureui_*`, but a tool that opens the file fails. Claude Code drops the image
+without a message, and `head -c 8 <path>` in the same pane reports `Operation not permitted`.
+
+In the reported case ([#903](https://github.com/umputun/agterm/issues/903)) agterm had no Full Disk Access,
+and the `com.apple.TCC` log showed nothing at the denial. Granting agterm Full Disk Access made the same read
+of the same file from the same pane succeed at once, with no restart, and dropped screenshots reached Claude
+Code again. The [folder-access section](#a-command-cannot-read-downloads-desktop-or-documents) covers what
+that grant gives away.
+
+## An Accessibility permission you granted stops working after an update
+
+A tool that needs Accessibility is denied in a session, while agterm's toggle in System Settings ▸ Privacy
+& Security ▸ Accessibility still shows it enabled. It can follow an update, or granting the permission to a
+copy you built yourself.
+
+macOS stores each grant with a code requirement the app must satisfy. When agterm was granted while signed
+ad-hoc, that requirement is a bare code hash, so the grant is frozen to that one build; a different build,
+or an installed release, has another hash and no longer satisfies it. The row stays and the toggle stays
+on, but macOS matches the running app against the stored requirement, finds no match, and denies it with
+nothing pointing at the cause. A grant made against the Developer-ID release stores its signing identity
+instead, which later releases keep satisfying.
+
+To recover the Accessibility grant, remove the stale row and grant the installed release fresh:
+
+```
+tccutil reset Accessibility com.umputun.agterm
+```
+
+Then open System Settings ▸ Privacy & Security ▸ Accessibility, remove any lingering agterm entry with the
+minus button, add `/Applications/agterm.app` with the plus button, and switch it on. Grant the release you
+run, so the stored requirement is its Developer-ID signature and later updates satisfy the same requirement.
+
 ## "agterm would like to access data from other apps" keeps coming back
 
 macOS App Data consent belongs to a running process and has no separate entry in System Settings.
@@ -292,11 +343,12 @@ the pane becomes `orphaned`; the same happens to panes whose session host dies. 
 `orphaned` pane remain responsible for themselves until the pane is replaced. Restarting agterm does not
 repair this.
 
-Help ▸ Reset Live Sessions… replaces every `orphaned` and `app` pane at once. The dialog says how many
+Agterm ▸ Reset Live Sessions… replaces every `orphaned` and `app` pane at once, and every pane whose daemon
+was created before the recorded first launch with this zmx build, whatever its attribution. The dialog says how many
 live sessions it resets; on Reset, agterm quits, ends those sessions' processes at the next launch and
 reopens itself with the same sessions and layout, starting each captured command again where possible.
 Other work running in those sessions stops, and agent conversations may need to be resumed by hand.
-Sessions already marked `supervisor` are left alone. A notification afterwards says how many sessions
+Other `supervisor` sessions are left alone. A notification afterwards says how many sessions
 the reset covered; a session whose old process could not be confirmed gone gets no command restarted,
 and the reset can be run again. `agtermctl zmx reset --force` does the same without the dialog.
 

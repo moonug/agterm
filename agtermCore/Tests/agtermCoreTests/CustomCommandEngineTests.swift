@@ -95,7 +95,7 @@ struct CustomCommandEngineTests {
     }
 
     @Test func malformedAlternativePoisonsTheWholeShortcut() {
-        let command = CustomCommand(name: "bad", command: "echo bad", shortcut: "cmd+shift+e|f1")
+        let command = CustomCommand(name: "bad", command: "echo bad", shortcut: "cmd+shift+e|esc")
         var engine = CustomCommandEngine(commands: [command])
 
         #expect(engine.advance(cmdShiftE) == .unmatched)
@@ -117,5 +117,34 @@ struct CustomCommandEngineTests {
         #expect(engine.advance(cmdShiftE) == .fired(command))
         #expect(engine.advance(ctrlA) == .armed)
         #expect(engine.advance(x) == .firedBuiltin(.toggleSplit))
+    }
+
+    @Test func repeatFlagFromEitherVerbKeepsItsSequenceLive() throws {
+        let parsed = parseKeymap("""
+            map ctrl+a>g --repeat next_session
+            command "Grow" ctrl+a>x --repeat agtermctl session resize +0.05
+            """)
+        try #require(parsed.diagnostics.isEmpty)
+        let keymap = parsed.keymap
+        let command = try #require(keymap.commands.first)
+        var engine = CustomCommandEngine(commands: keymap.commands, builtinSequences: keymap.builtinSequences,
+                                         builtinRepeating: keymap.builtinRepeating)
+
+        #expect(engine.advance(ctrlA) == .armed)
+        #expect(engine.advance(g) == .firedBuiltin(.nextSession))
+        #expect(engine.advance(g) == .firedBuiltin(.nextSession))
+        #expect(engine.advance(x) == .fired(command))
+        #expect(engine.isRepeating)
+    }
+
+    @Test func sequenceWithoutTheFlagFiresOnce() throws {
+        let keymap = parseKeymap("map ctrl+a>g next_session").keymap
+        var engine = CustomCommandEngine(commands: [], builtinSequences: keymap.builtinSequences,
+                                         builtinRepeating: keymap.builtinRepeating)
+
+        _ = engine.advance(ctrlA)
+        #expect(engine.advance(g) == .firedBuiltin(.nextSession))
+        #expect(!engine.isRepeating)
+        #expect(engine.advance(g) == .unmatched)
     }
 }

@@ -1,12 +1,12 @@
 ---
 name: peer-chat
-description: 'Hold a back-and-forth conversation with Claude Code running in the left pane of this agterm session, as peers. Use when the user says "chat with claude", "talk to claude", "work with claude", "do this with claude", "build this with claude", "discuss this with claude", or when a prompt arrives starting with "Chat from Claude:". Not for a one-shot task handed to Claude, and not for a read-only second opinion.'
+description: 'Hold a back-and-forth conversation with Claude Code running in the other pane of this agterm session''s split, as peers. Use when the user says "chat with claude", "talk to claude", "work with claude", "do this with claude", "build this with claude", "discuss this with claude", or when a prompt arrives starting with "Chat from Claude:". Not for a one-shot task handed to Claude, and not for a read-only second opinion.'
 ---
 
 # Peer chat, Codex side
 
-Talk with Claude Code in the left pane. The user reads both panes, so the conversation itself is the
-result even when code comes out of it.
+Talk with Claude Code in the other pane of the split. The user reads both panes, so the conversation
+itself is the result even when code comes out of it.
 
 Everything that touches the pane goes through `peer-chat.py`. Do not drive `agtermctl` directly:
 the script checks the target agent, window, composer and cursor, sends the body as bounded, separately
@@ -18,9 +18,9 @@ skill directory.
 
 ## Preconditions
 
-The session needs both panes running, with Claude Code on the left, started by the user. This skill
-never starts an agent and never opens a pane. If the left pane is not running Claude Code, say so
-and stop.
+The session needs both panes running, with Claude Code in the other pane, started by the user. This
+skill never starts an agent and never opens a pane. If the other pane is not running Claude Code, say
+so and stop.
 
 File-backed sends avoid per-call approvals only when the two `peer-chat.py` command-prefix rules from
 the recipe's *Setup* section are in `~/.codex/rules/default.rules`. If they are absent, leave any
@@ -43,8 +43,9 @@ peer-chat.py --to claude --message-file peer-chat-codex-a91f.txt
 Choose a fresh literal suffix for every send. Do not use stdin, a heredoc, shell redirection,
 variables or substitutions in either invocation: Codex then evaluates the request as a `zsh -lc`
 wrapper, so the two command-prefix rules from *Setup* cannot match it. Never put the message text
-directly in an argument. The send consumes the file, and the script collapses whitespace before
-typing.
+directly in an argument. The send consumes the file once it starts typing, and the script collapses
+whitespace before typing. A refusal that says the message was kept leaves the file in place, and the
+same send command delivers it later.
 
 If a send refuses saying more than one session shares this checkout, stop. It means this Codex was
 started without its pane's session id injected, and the fix is a launch flag only the user can apply.

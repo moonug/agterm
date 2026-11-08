@@ -6,18 +6,19 @@ agterm is a native macOS terminal, built on libghostty (Ghostty's engine), with 
 
 ## Key Features
 
-- Two-level vertical sidebar: workspaces grouping their sessions, with drag-reorder, a flagged working-set view, and single-workspace focus
+- Vertical sidebar: workspaces grouping their sessions, with drag-reorder, a flagged working-set view, and single-workspace focus; companion sessions (a shell, a program or an HTML page) pin under a session and move, fold and close with it, on remote sessions too; an HTML page can also be a session of its own that holds companions
 - Agent-status glyphs on sidebar rows: active, blocked, completed, idle — auto-wired for Claude Code, Codex, Pi, and OpenCode
 - agtermctl control CLI over a local unix-domain socket: create, rename, move, and type into sessions, run overlays, move windows, capture output, post notifications tied to a session
 - Installable agent skill that teaches Claude Code and Codex the control model and the full agtermctl command set
-- Surfaces per session: split panes (two shells), a per-session scratch terminal, and floating/full overlays; plus one app-wide quick terminal in a floating panel, summonable by a system-wide hotkey
+- Surfaces per session: split panes (two shells), a per-session scratch terminal, and floating/full overlays that run a program or show a local HTML page or a URL, where a local page can run agterm commands and hand a choice back to its caller; plus one app-wide quick terminal in a floating panel, summonable by a system-wide hotkey
+- Remote sessions: attach a live session from another Mac running agterm over ssh, together with its companions, with its status, context, notifications, HUD and the layout of attached panes mirrored to the attaching Mac, and its questions and program overlays drawn there
 - Multi-window: a library of windows (e.g. "work" and "personal"), one per screen, restored on next launch
-- 512 bundled themes with a live-preview picker, fully rebindable kitty-flavored keymap.conf, and full session persistence
+- 512 bundled themes with a live-preview picker, fully rebindable kitty-flavored keymap.conf, event hooks in hooks.conf that run a shell line on status, session, pane and tree events, and full session persistence
 - In-terminal search, fuzzy command palettes, and a Ctrl-Tab MRU session switcher
 
 ## Docs
 
-- [Documentation](https://agterm.com/docs): full reference — install, keybindings, keymap.conf, ghostty config, themes, control API
+- [Documentation](https://agterm.com/docs): full reference — install, keybindings, keymap.conf, hooks.conf, ghostty config, themes, control API
 - [Control API commands](https://agterm.com/commands): the complete agtermctl command catalog
 - [README](https://github.com/umputun/agterm/blob/master/README.md): the project synopsis, with install, the model, and the control-API demo
 - [Architecture](https://github.com/umputun/agterm/blob/master/ARCHITECTURE.md): module split, surface ownership, and the libghostty C boundary

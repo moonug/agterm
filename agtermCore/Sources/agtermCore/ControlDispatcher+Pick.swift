@@ -30,13 +30,23 @@ extension ControlDispatcher {
             }) else {
                 return ControlResponse(ok: false, error: "item text must not contain control characters")
             }
+            if let error = items.lazy.compactMap(pickItemStatusError).first {
+                return ControlResponse(ok: false, error: error)
+            }
+            // checked against the caller's items, not the rows a `query` prefill leaves visible: a hidden
+            // selection falls back to the first visible row in the palette rather than refusing the open
+            let selection = request.args?.selection
+            if let selection, !items.contains(where: { $0.id == selection }) {
+                return ControlResponse(ok: false, error: "pick select must name an item id")
+            }
 
             let pick = PendingPick(
                 id: UUID().uuidString,
                 items: items,
                 prompt: request.args?.prompt,
                 query: request.args?.query,
-                allowCustom: allowCustom
+                allowCustom: allowCustom,
+                selection: selection
             )
             return actions.openPick(
                 pick,
@@ -59,6 +69,20 @@ extension ControlDispatcher {
         default:
             preconditionFailure("dispatchPickCommand called for \(request.cmd.rawValue)")
         }
+    }
+
+    /// pickItemStatusError never echoes the caller's value.
+    private func pickItemStatusError(_ item: ControlPickItem) -> String? {
+        if let status = item.status, AgentStatus(rawValue: status) == nil {
+            return "invalid pick item status (\(AgentStatus.allCases.map(\.rawValue).joined(separator: "|")))"
+        }
+        if let color = item.statusColor, !WatermarkConfig.isValidColorHex(color) {
+            return "invalid pick item color (expected #rrggbb)"
+        }
+        if let shape = item.statusShape, StatusShape(rawValue: shape) == nil {
+            return "invalid pick item shape (\(StatusShape.validNamesList))"
+        }
+        return nil
     }
 
     /// Shared by every arm that forwards caller text into a terminal surface or a rendered file.
