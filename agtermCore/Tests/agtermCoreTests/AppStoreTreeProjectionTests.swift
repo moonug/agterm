@@ -129,7 +129,7 @@ struct AppStoreTreeProjectionTests {
                                                    backedByZmx: false),
                                ],
                                // store-only session: a surface slot with nothing in it has no terminal
-                               realized: false)
+                               realized: false, paneID: a.paneIdentity.uuidString)
         ])
         #expect(tree.workspaces[1].sessions == [
             ControlSessionNode(id: b.id.uuidString, name: "remote:~/b", cwd: "/live/b",
@@ -151,7 +151,8 @@ struct AppStoreTreeProjectionTests {
                                 ControlSurfaceNode(id: TerminalSurfaceID(sessionID: b.id, surface: .overlay).rawValue,
                                                    kind: "overlay", active: true, visible: true),
                                ],
-                               realized: false, splitCwd: "/live/b")
+                               realized: false, splitCwd: "/live/b",
+                               paneID: b.paneIdentity.uuidString, splitPaneID: b.splitPaneIdentity?.uuidString)
         ])
     }
 

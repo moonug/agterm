@@ -478,6 +478,32 @@ extension ControlServer {
                                                                count: session.searchTotal))
     }
 
+    /// Identity comparison and delivery must stay synchronous on the main actor: a swap cannot interleave.
+    func injectGuardedText(_ text: String, into id: UUID, store: AppStore, pane: StatusPane?, expectedPaneID: String,
+                           send: (GhosttySurfaceView, String) -> Bool = { $0.injectAsUserInput(text: $1) }) -> ControlResponse {
+        guard let expected = UUID(uuidString: expectedPaneID) else {
+            return ControlResponse(ok: false, error: "--expect-pane-id must be a UUID")
+        }
+        guard pane == .left || pane == .right else {
+            return ControlResponse(ok: false, error: "--expect-pane-id requires explicit --pane left or right")
+        }
+        guard let session = store.session(withID: id) else {
+            return ControlResponse(ok: false, error: "session not found")
+        }
+        let identity = pane == .left ? session.paneIdentity : (session.hasSplit ? session.splitPaneIdentity : nil)
+        guard identity == expected else {
+            return ControlResponse(ok: false, error: "pane identity mismatch")
+        }
+        guard let surface = (pane == .left ? session.surface : session.splitSurface) as? GhosttySurfaceView else {
+            return ControlResponse(ok: false, error: "session not realized")
+        }
+        guard UUID(uuidString: surface.paneToken) == expected else {
+            return ControlResponse(ok: false, error: "pane identity mismatch")
+        }
+        guard send(surface, text) else { return ControlResponse(ok: false, error: "session not realized") }
+        return ControlResponse(ok: true, result: ControlResult(id: id.uuidString))
+    }
+
     /// Injects `text` into session `id`'s surface. The deck mounts every session, but realization still
     /// needs a SwiftUI pass plus an AppKit layout pass (`createSurface` defers on a zero backing size), so a
     /// session created moments ago is briefly unrealized whether or not it is selected. `inject(text:)` sends

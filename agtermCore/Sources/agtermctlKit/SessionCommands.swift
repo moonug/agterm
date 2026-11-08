@@ -29,7 +29,8 @@ struct Session: ParsableCommand {
         @Option(name: .long, help: "Target workspace by name; errors if not found unless --create-workspace. Mutually exclusive with --workspace.") var workspaceName: String?
         @Flag(name: .long, help: "With --workspace-name, create the workspace when it does not exist (reuse it otherwise).") var createWorkspace = false
         @Option(name: .long, help: "Run this command as the session's process instead of the login shell (no echoed command line; the session closes when it exits).") var command: String?
-        @Flag(name: .long, help: "With --command, hold the session open after the command exits (press any key to close) instead of closing immediately.") var wait = false
+        @Option(name: .long, help: "With --command, start this command in a visible right pane in the same directory.") var splitCommand: String?
+        @Flag(name: .long, help: "With --command, hold the primary pane open after its command exits (press any key to close).") var wait = false
         @Option(name: .long, help: "Initial session name (defaults to the auto basename).") var name: String?
         @Option(name: .long, help: "Place the new session right AFTER this anchor session (id/prefix/active); the anchor carries its own workspace, replacing --workspace.") var after: String?
         @Option(name: .long, help: "Place the new session right BEFORE this anchor session (id/prefix/active); mirror of --after.") var before: String?
@@ -38,6 +39,9 @@ struct Session: ParsableCommand {
         var echoesResultID: Bool { true }
 
         func validate() throws {
+            if let error = ControlSessionCreateOptions.commandValidationError(command: command, splitCommand: splitCommand) {
+                throw ValidationError(error)
+            }
             if after != nil, before != nil {
                 throw ValidationError("use either --after or --before, not both")
             }
@@ -60,7 +64,7 @@ struct Session: ParsableCommand {
             ControlRequest(cmd: .sessionNew, args: options.withWindow(
                 ControlArgs(name: name, cwd: cwd, workspace: workspace, workspaceName: workspaceName,
                             createWorkspace: createWorkspace ? true : nil, noSelect: noSelect ? true : nil,
-                            command: command, wait: wait ? true : nil, after: after, before: before)))
+                             command: command, splitCommand: splitCommand, wait: wait ? true : nil, after: after, before: before)))
         }
     }
 
@@ -192,10 +196,19 @@ struct Session: ParsableCommand {
         @Flag(name: .long, help: "Read the text from stdin instead of an argument.") var stdin = false
         @Flag(name: .long, help: "Select the session first if its surface is not ready (main pane only; a split pane must already exist).") var select = false
         @Option(name: .long, help: "Which pane to type into: primary/left/top, split/right/bottom, or scratch (even when hidden). Defaults to primary.") var pane: String?
+        @Option(name: .customLong("expect-pane-id"), help: "Require this UUID in the explicit left/right pane slot; never redirect or wait. Not supported for scratch.") var expectedPaneID: String?
         @OptionGroup var target: TargetOptions
         @OptionGroup var options: ClientOptions
 
-        func validate() throws { try validatePaneArgument(pane) }
+        func validate() throws {
+            try validatePaneArgument(pane)
+            if let expectedPaneID {
+                guard UUID(uuidString: expectedPaneID) != nil else { throw ValidationError("--expect-pane-id must be a UUID") }
+                guard let pane, [.left, .right].contains(StatusPane(controlName: pane)) else {
+                    throw ValidationError("--expect-pane-id requires explicit --pane left or right")
+                }
+            }
+        }
 
         func makeRequest() throws -> ControlRequest {
             if stdin {
@@ -209,7 +222,8 @@ struct Session: ParsableCommand {
 
         private func makeRequest(payload: String) -> ControlRequest {
             return ControlRequest(cmd: .sessionType, target: target.target,
-                                  args: options.withWindow(ControlArgs(text: payload, select: select, pane: pane)))
+                                  args: options.withWindow(ControlArgs(text: payload, select: select, pane: pane,
+                                                                       expectedPaneID: expectedPaneID)))
         }
     }
 

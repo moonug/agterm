@@ -263,6 +263,9 @@ public struct ControlDispatcher {
         switch request.cmd {
         case .sessionNew:
             let args = request.args
+            if let error = ControlSessionCreateOptions.commandValidationError(command: args?.command, splitCommand: args?.splitCommand) {
+                return ControlResponse(ok: false, error: error)
+            }
             if args?.after != nil, args?.before != nil {
                 return ControlResponse(ok: false, error: "use either --after or --before, not both")
             }
@@ -287,6 +290,7 @@ public struct ControlDispatcher {
                 workspaceName: args?.workspaceName,
                 createWorkspace: args?.createWorkspace,
                 command: args?.command,
+                splitCommand: args?.splitCommand,
                 wait: args?.wait,
                 name: args?.name,
                 after: args?.after,
@@ -585,11 +589,17 @@ public struct ControlDispatcher {
             case .pane(let parsed): pane = parsed
             case .rejected(let rejection): return rejection
             }
+            if let token = request.args?.expectedPaneID, UUID(uuidString: token) == nil {
+                return ControlResponse(ok: false, error: "--expect-pane-id must be a UUID")
+            }
+            if request.args?.expectedPaneID != nil, pane != .left && pane != .right {
+                return ControlResponse(ok: false, error: "--expect-pane-id requires explicit --pane left or right")
+            }
             return await actions.typeSession(request.target, window: request.args?.window,
                                              options: ControlSessionTypeOptions(
                                                 text: text,
                                                 select: request.args?.select ?? false,
-                                                pane: pane
+                                                pane: pane, expectedPaneID: request.args?.expectedPaneID
                                              ))
         case .sessionCopy:
             return actions.copySessionSelection(request.target, window: request.args?.window)

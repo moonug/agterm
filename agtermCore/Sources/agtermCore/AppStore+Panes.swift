@@ -214,17 +214,12 @@ extension AppStore {
         save()
     }
 
-    /// The primary pane's shell exited: a live split is PROMOTED into the primary slot and the session
-    /// survives as a single pane, otherwise the session closes. The survivor MOVES from `splitSurface` into
-    /// `surface` (cwd, title and foreground command migrate too, and `promoteToPrimaryPane` turns off its
-    /// split-role reporting so future pwd/title reports write to the main fields), leaving `surface != nil`,
-    /// `splitSurface == nil`, `hasSplit == false`, `splitFocused == false` — so the promoted pane is
-    /// addressable as the MAIN/left pane everywhere: `session.type`/`session.text --pane left` (and omitted)
-    /// reach it, `{AGT_PANE}` reports `left`, and a later `session.split` opens a fresh RIGHT pane instead of
-    /// displacing it. Called by the primary surface's `onExit`.
+    /// Promote the split's identity, launch state and any mounted surface into the primary slot. An
+    /// unmounted sibling must survive too: its factory will consume the promoted command and cwd.
+    /// Without a logical split, the exiting primary was the last pane.
     public func closePrimaryPane(_ sessionID: UUID, alreadyFinalized: UUID? = nil) {
         guard let session = session(withID: sessionID) else { return }
-        guard let survivor = session.splitSurface else {
+        guard session.hasSplit else {
             closeSession(sessionID, alreadyFinalized: alreadyFinalized)
             return
         }
@@ -232,8 +227,8 @@ extension AppStore {
         if session.askPaneIdentity == session.paneIdentity { session.cancelPendingAsk() }
         let priorPrimary = session.surface // the exiting pane, torn down below; scopes the search reset
         priorPrimary?.teardown()
-        survivor.promoteToPrimaryPane()
-        session.surface = survivor
+        session.splitSurface?.promoteToPrimaryPane()
+        session.surface = session.splitSurface
         session.splitSurface = nil
         session.paneIdentity = session.splitPaneIdentity ?? UUID()
         session.splitPaneIdentity = nil
@@ -252,6 +247,7 @@ extension AppStore {
         session.currentCwd = session.splitCwd ?? session.initialSplitCwd ?? session.currentCwd
         session.oscTitle = session.splitTitle
         session.foregroundCommand = session.splitForegroundCommand
+        session.pendingForegroundCommand = session.pendingSplitForegroundCommand
         // the restore-command override follows the survivor, BOTH halves: the persisted pin (so the next
         // launch restores the promoted pane's command, not the dead primary's) and the payload still armed
         // for this launch (so a surface built after promotion still runs it).
@@ -261,6 +257,7 @@ extension AppStore {
         session.splitTitle = nil
         session.initialSplitCwd = nil
         session.splitForegroundCommand = nil
+        session.pendingSplitForegroundCommand = nil
         session.splitRestoreCommand = nil
         session.pendingSplitRestoreCommand = nil
         session.splitInitialCommand = nil
@@ -290,15 +287,10 @@ extension AppStore {
         save()
     }
 
-    /// The split pane's shell exited: collapses to the primary (`closeSplit`) ONLY when a genuine two-pane
-    /// split is live, BOTH `surface` and `splitSurface` set. Otherwise this was the session's last pane —
-    /// promoted into the primary slot (`splitSurface == nil`) while keeping the split pane's `onExit`, so its
-    /// exit routes here — and closing rather than collapsing a gone split is what avoids a zombie session.
-    /// The `surface == nil` half of the guard is defensive: `closePrimaryPane` always promotes the survivor
-    /// INTO `surface`. Called by the split surface's `onExit`.
+    /// Preserve the primary even before its surface mounts. A promoted split has no sibling and closes the session.
     public func closeSplitPane(_ sessionID: UUID, alreadyFinalized: UUID? = nil) {
         guard let session = session(withID: sessionID) else { return }
-        guard session.surface != nil, session.splitSurface != nil else {
+        guard session.hasSplit else {
             closeSession(sessionID, alreadyFinalized: alreadyFinalized)
             return
         }

@@ -4,6 +4,28 @@ import Testing
 
 @MainActor
 struct ControlDispatcherTests {
+    @Test func sessionNewSplitCommandPropagation() async throws {
+        let actions = MockControlActions()
+        let args = ControlArgs(cwd: "/pair", noSelect: true, command: "left", splitCommand: "right", wait: true, after: "source")
+        let request = ControlRequest(cmd: .sessionNew, args: args)
+        #expect(try JSONDecoder().decode(ControlRequest.self, from: JSONEncoder().encode(request)) == request)
+        _ = await ControlDispatcher(actions: actions).dispatch(request)
+        let options = ControlSessionCreateOptions(window: nil, cwd: "/pair", workspace: nil, workspaceName: nil,
+                                                  createWorkspace: nil, command: "left", splitCommand: "right", wait: true,
+                                                  name: nil, after: "source", noSelect: true)
+        #expect(actions.calls == [.sessionNew(options)])
+    }
+
+    @Test func sessionNewInvalidPairDoesNotMutate() async {
+        for args in [ControlArgs(splitCommand: "right"), ControlArgs(command: " ", splitCommand: "right"),
+                     ControlArgs(command: "left", splitCommand: "\n"), ControlArgs(command: "left\0", splitCommand: "right"),
+                     ControlArgs(command: "left", splitCommand: "right\0")] {
+            let actions = MockControlActions()
+            let response = await ControlDispatcher(actions: actions).dispatch(ControlRequest(cmd: .sessionNew, args: args))
+            #expect(response?.ok == false)
+            #expect(actions.calls.isEmpty)
+        }
+    }
     @Test func treeRoutesThroughActionsWithWindowArgument() async {
         let actions = MockControlActions()
         let dispatcher = ControlDispatcher(actions: actions)

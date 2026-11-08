@@ -502,6 +502,9 @@
                 in epoch seconds on the same clock as an event's
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">ts</span>; omitted when idle, refreshed by a re-push
                 of the same status, and never persisted),
+                <span style="font-family: &quot;JetBrains Mono&quot;, monospace">paneID</span> /
+                <span style="font-family: &quot;JetBrains Mono&quot;, monospace">splitPaneID</span> (stable model UUIDs for the primary/split pane;
+                the split token is omitted without a split; neither token proves surface realization; use these for guarded typing),
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">foreground</span> /
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">splitForeground</span> (each pane's live foreground
                 argv, omitted at the shell prompt or for a setuid program like top/sudo),
@@ -891,7 +894,7 @@
 
             <div style="background: #22272b; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 11px; padding: 18px 20px; margin-bottom: 12px">
               <div style="font-family: &quot;JetBrains Mono&quot;, monospace; font-size: 13.5px; color: #6d82f3; line-height: 1.6; word-break: break-word">
-                agtermctl session new [--cwd DIR] [--workspace W | --workspace-name NAME [--create-workspace]] [--command CMD] [--wait]
+                agtermctl session new [--cwd DIR] [--workspace W | --workspace-name NAME [--create-workspace]] [--command CMD] [--split-command CMD] [--wait]
                 [--name NAME] [--after SID | --before SID] [--no-select] [--window W]
               </div>
               <div style="font-family: &quot;JetBrains Mono&quot;, monospace; font-size: 11.5px; color: #6b727a; margin-top: 6px">session.new</div>
@@ -937,6 +940,22 @@
                 rather than the launchd default, and the session stays open after the command exits.
               </p>
               <p style="font-size: 13.5px; line-height: 1.6; color: #949ba4; margin: 8px 0 0">
+                <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--split-command RIGHT</span> requires
+                <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--command LEFT</span> and seeds a visible left/right split
+                with independent commands and pane identities in the same initial directory. Both commands must be nonblank and contain no NUL.
+                It composes with placement and <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--no-select</span>;
+                the execution and restore rules above apply to both commands. If one exits, its sibling can survive.
+                Read back <span style="font-family: &quot;JetBrains Mono&quot;, monospace">hasSplit</span>,
+                <span style="font-family: &quot;JetBrains Mono&quot;, monospace">split</span>,
+                <span style="font-family: &quot;JetBrains Mono&quot;, monospace">cwd</span>/<span style="font-family: &quot;JetBrains Mono&quot;, monospace">splitCwd</span>
+                and, once running, <span style="font-family: &quot;JetBrains Mono&quot;, monospace">foreground</span>/<span style="font-family: &quot;JetBrains Mono&quot;, monospace">splitForeground</span>.
+                Creation does not establish program readiness. Protocol field: <span style="font-family: &quot;JetBrains Mono&quot;, monospace">args.splitCommand</span>.
+                This is an <strong style="color: #bfbab0">unreleased local extension</strong>, not guaranteed by v0.28.
+                With a matching native CLI, preflight <span style="font-family: &quot;JetBrains Mono&quot;, monospace">agtermctl version --socket PATH --json</span>:
+                require <span style="font-family: &quot;JetBrains Mono&quot;, monospace">session.new.split-command</span> in
+                <span style="font-family: &quot;JetBrains Mono&quot;, monospace">result.app.capabilities</span>. A missing marker means unsupported.
+              </p>
+              <p style="font-size: 13.5px; line-height: 1.6; color: #949ba4; margin: 8px 0 0">
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--no-select</span> creates the session in the
                 background: it is added to the sidebar but not selected or focused, leaving the current selection untouched (the
                 new node is not <span style="font-family: &quot;JetBrains Mono&quot;, monospace">active</span> in
@@ -946,7 +965,7 @@
               <p style="font-size: 13.5px; line-height: 1.6; color: #949ba4; margin: 8px 0 0">
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--wait</span> (only with
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--command</span>, else an error) <strong style="color: #bfbab0">holds</strong>
-                the session open after the command exits — the press-any-key prompt with the final output intact instead of
+                only the primary pane open after its command exits — the press-any-key prompt with the final output intact instead of
                 closing — so a build, test, or deploy's last output (or an early failure) stays readable. It persists across
                 restart, so a restored command session that re-runs its command holds again. Read it back on
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">tree</span>'s
@@ -1075,14 +1094,14 @@
 
             <div style="background: #22272b; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 11px; padding: 18px 20px; margin-bottom: 12px">
               <div style="font-family: &quot;JetBrains Mono&quot;, monospace; font-size: 13.5px; color: #6d82f3; line-height: 1.6; word-break: break-word">
-                agtermctl session type &lt;text&gt; [--stdin] [--select] [--pane left|right|scratch] [--target T] [--window W]
+                agtermctl session type &lt;text&gt; [--stdin] [--select] [--pane left|right|scratch] [--expect-pane-id UUID] [--target T] [--window W]
               </div>
               <div style="font-family: &quot;JetBrains Mono&quot;, monospace; font-size: 11.5px; color: #6b727a; margin-top: 6px">session.type</div>
               <p style="font-size: 15px; line-height: 1.65; color: #cbc6bc; margin: 10px 0 0">
                 Inject text as real keystrokes — printable runs plus a Return for each newline, with no bracketed-paste markers. So a
                 trailing newline submits the command.
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--stdin</span> reads the text from stdin instead of the
-                argument. Any session is typable without
+                argument. Without <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--expect-pane-id</span>, any session is typable without
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--select</span>, including one created moments ago: the main
                 pane waits briefly for its surface, so creating and typing back to back does not race.
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--select</span> selects the session first, and only when its
@@ -1103,6 +1122,20 @@
                 two characters — use
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace; color: #f2b45c; white-space: nowrap">$'make test\n'</span> or pipe a real
                 newline via <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--stdin</span>.
+              </p>
+              <p style="font-size: 13.5px; line-height: 1.6; color: #949ba4; margin: 8px 0 0">
+                Guarded typing adds <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--expect-pane-id UUID</span>
+                (protocol <span style="font-family: &quot;JetBrains Mono&quot;, monospace">args.expectedPaneID</span>) with explicit
+                <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--pane left|right</span>; omitted pane and scratch are rejected.
+                Use the original tree <span style="font-family: &quot;JetBrains Mono&quot;, monospace">paneID</span>/<span style="font-family: &quot;JetBrains Mono&quot;, monospace">splitPaneID</span> token.
+                The app atomically checks both the positional model slot and realized surface token with input delivery.
+                Swapped or replaced panes fail with <span style="font-family: &quot;JetBrains Mono&quot;, monospace">pane identity mismatch</span>;
+                an unrealized surface fails with <span style="font-family: &quot;JetBrains Mono&quot;, monospace">session not realized</span>.
+                Unlike status/restore tokens, this asserts the original slot rather than redirecting to a token's new position.
+                It never selects, realizes or polls a surface, even with <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--select</span>.
+                No-token behavior is unchanged. Require the unreleased <span style="font-family: &quot;JetBrains Mono&quot;, monospace">session.type.expect-pane-id</span>
+                capability from <span style="font-family: &quot;JetBrains Mono&quot;, monospace">agtermctl version --socket PATH --json</span>
+                and a matching native CLI. Acceptance is not proof that the receiving program executed the input.
               </p>
               <p style="font-size: 13.5px; line-height: 1.6; color: #949ba4; margin: 8px 0 0">
                 Every <span style="font-family: &quot;JetBrains Mono&quot;, monospace">--pane</span> types into the surface UNDERNEATH a covering
@@ -3168,7 +3201,11 @@
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">result.app</span> with
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">version</span> and, when the build recorded one,
                 <span style="font-family: &quot;JetBrains Mono&quot;, monospace">commit</span> — diagnostics only, never part of a
-                version comparison.
+                version comparison. An optional <span style="font-family: &quot;JetBrains Mono&quot;, monospace">capabilities</span>
+                array advertises extensions such as <span style="font-family: &quot;JetBrains Mono&quot;, monospace">session.new.split-command</span>
+                and <span style="font-family: &quot;JetBrains Mono&quot;, monospace">session.type.expect-pane-id</span>;
+                absent capabilities do not imply support. The same array is available at
+                <span style="font-family: &quot;JetBrains Mono&quot;, monospace">result.tree.app.capabilities</span> from tree.
               </p>
               <p style="font-size: 13.5px; line-height: 1.6; color: #949ba4; margin: 8px 0 0">
                 Human output is the version, or <span style="font-family: &quot;JetBrains Mono&quot;, monospace">version (commit)</span>,

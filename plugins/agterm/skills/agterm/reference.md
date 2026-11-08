@@ -113,7 +113,7 @@ when none reported; distinct from `name`, the derived sidebar label), `active` (
 `split` (split SHOWN side by side, the read side of `session split on|off`),
 `realized` (whether the session's MAIN pane has a live terminal — `false` means no shell was spawned and a
 `--command` has not run. `session text` then answers `session not realized` without realizing anything;
-`session type` brings up a restored main pane still waiting its turn in a launch that replays commands,
+`session type` without `--expect-pane-id` brings up a restored main pane still waiting its turn in a launch that replays commands,
 while any other unrealized cause can still exhaust its poll and fail the same way; `session search`
 expedites such a pane too.
 `session new` returns `ok` for a session that exists in the model, which is not the same thing: libghostty
@@ -134,6 +134,9 @@ local session, and never present after a relaunch because a remote session is ne
 read THIS to decide whether a session has a split, because a hidden split reports `split: false` while
 its pane stays alive, and it is present exactly when `splitRatio`/`splitFocused` can be),
 `splitAxis` (`vertical` for left/right or `horizontal` for top/bottom; omitted when there is no split),
+`paneID`/`splitPaneID` (stable model UUIDs for the primary/split pane; the split token is omitted without
+a split, and neither token proves that a surface is realized; guarded `session type` asserts a token
+against its original positional slot and the realized surface),
 `splitRatio` (the primary-pane fraction 0.05-0.95 of the area below the titlebar, left or top, of a
 session that HAS a split,
 shown or hidden; omitted when there's no split, or while the split has never been shown — a shown split
@@ -354,7 +357,7 @@ buys nothing. A caller with no tree uses `version`.
 
 ## session
 
-- `session new [--cwd DIR] [--workspace W] [--workspace-name NAME] [--create-workspace] [--command CMD] [--wait] [--name NAME] [--after SID | --before SID] [--no-select] [--window W]`
+- `session new [--cwd DIR] [--workspace W] [--workspace-name NAME] [--create-workspace] [--command CMD] [--split-command CMD] [--wait] [--name NAME] [--after SID | --before SID] [--no-select] [--window W]`
   — create a session and focus it; returns the new id. `--cwd` sets the start directory (default
   `$HOME`). The destination workspace is addressed one of two mutually-exclusive ways: `--workspace`
   (id / unique prefix / `active`, the default) or `--workspace-name` (the sidebar label) — the latter
@@ -369,7 +372,17 @@ buys nothing. A caller with no tree uses `version`.
   mode the command is instead a create-only zmx payload the persistent shell runs as a login shell, so
   shell operators are interpreted, the `PATH` is that shell's rather than the launchd default, and the
   session stays open after the command exits.
-  `--wait` (only with `--command`, else an error) HOLDS the session open after the command exits —
+  `--split-command RIGHT` requires `--command LEFT`: seed both independent pane commands and identities
+  before insertion, in a visible left/right split with the same initial cwd. Both command values must
+  be nonblank and contain no NUL. It composes with placement and `--no-select`; no typed launch input
+  is needed. Read back `hasSplit`, `split`, `cwd`/`splitCwd` and, once running, `foreground`/`splitForeground`.
+  Creation acknowledges the model, not agent readiness. The existing command execution/restore rules
+  apply to both sides; if one exits, its sibling can survive, with right promoted when left closes.
+  This is an unreleased local extension, not a v0.28 guarantee. Preflight the serving app with the native
+  `agtermctl version --socket PATH --json`: require `session.new.split-command` in
+  `result.app.capabilities` (also `result.tree.app.capabilities` from `tree`). Missing means unsupported;
+  a new CLI alone is insufficient. Protocol spelling: `args.splitCommand` on `session.new`.
+  `--wait` (only with `--command`, else an error) HOLDS only the primary pane open after its command exits —
   showing libghostty's press-any-key prompt with the final output intact instead of closing immediately —
   so you can read a build/test/deploy's final output or an early failure that would otherwise flash and
   vanish. In Re-run commands mode it persists across restart (unlike an overlay's live-only `--wait`),
@@ -444,9 +457,9 @@ Shared pane selectors accept `primary`/`left`/`top` for the primary pane and
 The signatures and read-back below use canonical `left`/`right`/`scratch`; the stable invalid-value
 error keeps those names for compatibility.
 
-- `session type <text> [--stdin] [--select] [--pane left|right|scratch] [--target] [--window W]` — inject text
+- `session type <text> [--stdin] [--select] [--pane left|right|scratch] [--expect-pane-id UUID] [--target] [--window W]` — inject text
   as real keystrokes (printable runs plus Return for each newline; no bracketed-paste markers).
-  `--stdin` reads the text from stdin instead of the argument. Any session is typable without `--select`,
+  `--stdin` reads the text from stdin instead of the argument. Without `--expect-pane-id`, any session is typable without `--select`,
   including a background one and one created moments ago: the main pane bounded-polls (12 × 30ms) for the
   surface, so `session new --no-select` followed straight away by `session type` does not race the mount.
   `--select` selects the session first, and only when its surface is not ready — a realized session is typed
@@ -464,6 +477,16 @@ error keeps those names for compatibility.
   them, so an overlay never has to be closed to keep automation running. It has no read-back twin either —
   `session overlay text` exists because an overlay's output is otherwise unobservable, while its program is
   the caller's own, so there is no way and no need to type into one.
+  Guarded typing adds `--expect-pane-id UUID` (protocol `args.expectedPaneID`) with an explicit `--pane left|right`;
+  omitting the pane or choosing scratch is rejected. Read the expected stable token from the original
+  tree node's `paneID`/`splitPaneID`, not from a replacement pane after a failure.
+  The app checks the model's positional slot and realized surface token synchronously with delivery.
+  Swapped/replaced tokens return `pane identity mismatch`; an unrealized surface returns `session not realized`.
+  Unlike status/restore token resolution, this is an assertion, not redirection to the token's current slot.
+  It never selects, realizes or polls a surface, even if `--select` is supplied. No-token behavior above is unchanged.
+  Require `session.type.expect-pane-id` in the serving app's `result.app.capabilities` from
+  `agtermctl version --socket PATH --json`, plus a matching native CLI. This is an unreleased local extension;
+  a missing marker means unsupported. An accepted type call is not proof that an agent executed the task.
 - `session copy [--target] [--window W]` — returns `result.text` with the session's current selection.
   Does NOT touch the system clipboard (pipe the returned text into another `session type`). No/empty
   selection → `no selection` error. Selection is readable on any realized session regardless of focus, but

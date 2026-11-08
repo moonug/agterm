@@ -22,7 +22,7 @@ final class ControlServerWorkspaceCommandsTests: XCTestCase {
                 library: library,
                 actions: actions,
                 settingsModel: SettingsModel(library: library, settingsStore: SettingsStore(directory: stateDir)),
-                identity: AppIdentity(version: "9.9.9", commit: "testsha"),
+                identity: AppIdentity(version: "9.9.9", commit: "testsha", capabilities: ["session.new.split-command", "session.type.expect-pane-id"]),
                 socketPath: stateDir.appendingPathComponent("control.sock").path
             )
         }
@@ -60,7 +60,7 @@ final class ControlServerWorkspaceCommandsTests: XCTestCase {
 
     // both projections must be the SAME injected identity, not two independent bundle reads
     func testVersionAndTreeReportTheInjectedIdentity() throws {
-        let injected = AppIdentity(version: "9.9.9", commit: "testsha")
+        let injected = AppIdentity(version: "9.9.9", commit: "testsha", capabilities: ["session.new.split-command", "session.type.expect-pane-id"])
 
         let version = server.appIdentity()
         XCTAssertTrue(version.ok, version.error ?? "")
@@ -84,6 +84,34 @@ final class ControlServerWorkspaceCommandsTests: XCTestCase {
         XCTAssertEqual(response.result?.id, empty.id.uuidString)
         XCTAssertEqual(store.selectedSessionID, session.id, "an empty workspace has nothing to select")
         XCTAssertEqual(store.currentWorkspaceID, empty.id)
+    }
+
+    func testPairedCreationAfterSourceDoesNotSelectOrModifySource() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let workspace = try XCTUnwrap(store.currentWorkspaceID)
+        let source = try XCTUnwrap(store.addSession(toWorkspace: workspace, cwd: "/source"))
+        let response = server.createSession(ControlSessionCreateOptions(
+            window: nil, cwd: "/pair", workspace: nil, workspaceName: nil, createWorkspace: nil,
+            command: "left", splitCommand: "right", wait: true, name: nil, after: source.id.uuidString, noSelect: true))
+        XCTAssertTrue(response.ok, response.error ?? "")
+        let id = try XCTUnwrap(response.result?.id.flatMap(UUID.init(uuidString:)))
+        let pair = try XCTUnwrap(store.session(withID: id))
+        let sessions = try XCTUnwrap(store.workspaces.first { $0.id == workspace }?.sessions)
+        let sourceIndex = try XCTUnwrap(sessions.firstIndex { $0.id == source.id })
+        XCTAssertEqual(sessions[sourceIndex + 1].id, id)
+        XCTAssertEqual(store.selectedSessionID, source.id)
+        XCTAssertEqual(source.effectiveCwd, "/source")
+        XCTAssertFalse(source.hasSplit)
+        XCTAssertTrue(pair.isSplit && pair.hasSplit)
+        XCTAssertEqual(pair.initialCommand, "left")
+        XCTAssertEqual(pair.splitInitialCommand, "right")
+        XCTAssertEqual(pair.initialSplitCwd, "/pair")
+        XCTAssertTrue(pair.commandWait)
+        XCTAssertFalse(pair.splitCommandWait)
+        let tree = server.controlTree(window: nil)
+        let node = try XCTUnwrap(tree.result?.tree?.workspaces.flatMap(\.sessions).first { $0.id == id.uuidString })
+        XCTAssertEqual(node.paneID, pair.paneIdentity.uuidString)
+        XCTAssertEqual(node.splitPaneID, pair.splitPaneIdentity?.uuidString)
     }
 
     func testSelectingAFilteredOutEmptyWorkspaceRevealsIt() throws {

@@ -8,17 +8,20 @@ public struct AppIdentity: Codable, Sendable, Equatable {
     public let version: String
     /// The build's git commit, omitted for a build that recorded none.
     public let commit: String?
+    public let capabilities: [String]?
 
-    public init(version: String, commit: String? = nil) {
+    public init(version: String, commit: String? = nil, capabilities: [String]? = nil) {
         self.version = version
         self.commit = commit
+        self.capabilities = capabilities
     }
 
     /// Build from raw bundle values. `commit` is dropped when the build recorded nothing usable — absent,
     /// empty, or the literal `unknown` that `build.sh`/`release.sh` emit when git cannot answer — so no
     /// caller renders `0.24.0 (unknown)`.
-    public init(version: String, recordedCommit: String?) {
+    public init(version: String, recordedCommit: String?, capabilities: [String]? = nil) {
         self.version = version
+        self.capabilities = capabilities
         switch recordedCommit {
         case nil, "", "unknown": self.commit = nil
         default: self.commit = recordedCommit
