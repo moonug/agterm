@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Send one peer-chat message between Claude Code and Codex in an agterm split."""
+"""Send one peer-chat message between Claude Code and a peer agent in agterm.
+
+The peer runs either in the split pane of a split session or in the primary
+pane of a full-pane session; both are addressed as panes.
+"""
 
 from __future__ import annotations
 
@@ -29,15 +33,33 @@ from typing import Any
 # event out of its visible box, so keep each independently observed event small
 # enough to remain readable by the post-write check.
 TYPE_CHUNK_BYTES = 197
+# A body failure whose cleanup provably restored the empty composer is retried
+# with a halved chunk budget, so a size-related loss adapts instead of failing
+# at the same boundary on every attempt.
+MIN_CHUNK_BYTES = 64
 CHUNK_VERIFY_OVERLAP = 32
 CHUNK_SETTLE_DELAY = 0.1
 COMPOSER_SETTLE_DELAY = 0.5
 PROBE_TIMEOUT = 6.0
 PROBE_INTERVAL = 0.05
+# Erasing a draft that only shows its head takes thousands of backspaces; they
+# go out in paced pieces, and the wait for the composer to settle needs longer
+# than a single chunk does.
+BACKSPACE_BATCH = 1024
+BACKSPACE_PAUSE = 0.02
+LONG_CLEANUP_TIMEOUT = 30.0
+# The peer has to render what was submitted and clear its composer; a big
+# draft takes it longer than a probe window.
+ACCEPT_TIMEOUT = 12.0
 RETRY_ATTEMPTS = 5
 RETRY_DELAY = 10.0
 BOX_LINES = 80
 EMPTY_CURSOR_COLUMN = 2
+# The prompt glyph of a composer occupies column 0, so a caret reported there
+# cannot be inside the input area. A build that draws its own caret block and
+# never moves the terminal caret reports this column whatever the composer
+# holds; the value then carries no signal about the composer.
+UNREPORTED_CURSOR_COLUMN = 0
 MAX_MESSAGE_BYTES = 64 * 1024
 # Claude can put a short context label inside the top composer rule, for example `e2e`.
 RULE_RE = re.compile(r"^\s*[─\u2014-]{10,}(?:\s+[^─\u2014-].*?\s+[─\u2014-]+)?\s*$")
@@ -82,18 +104,33 @@ CLAUDE_EMPTY_PROMPTS = {
 # which then reaches the suggestion with its own quotes intact.
 CLAUDE_STARTUP_HINT_RE = re.compile(r'^Try ".+"$')
 # opencode draws its composer as a bordered block: a left border (`│` in older
-# builds, `┃` in newer ones), a status row (`Build · Model · effort`) directly
-# above the bottom border (`╰──╯` or `╹▀▀▀`), and the input rows between one
-# blank separator row and the status row. Idle empty composers may add a lone
-# cursor glyph (`*`) and a right-aligned cwd hint inside the box; a fresh
-# session shows a rotated `Ask anything…` placeholder instead of input rows.
+# builds, `┃` in newer ones), a status row directly above the bottom border
+# (`╰──╯` or `╹▀▀▀`), and the input rows between one blank separator row and
+# the status row. Idle empty composers may add a lone cursor glyph (`*`) and a
+# right-aligned cwd hint inside the box; a fresh session shows a rotated
+# `Ask anything…` placeholder instead of input rows.
+#
+# The status row names the agent and the model, separated by `·`. v1 wrote
+# three segments (`Plan · Model · effort`); v2 writes two (`Build · Model
+# Provider`) and prefixes the agent with its permission mode (`Build auto ·
+# Model Provider`), so the agent part may hold a space of its own. What the
+# row always has is a `·` separator, and where it sits is fixed: it is the
+# last row of the box, right above the bottom border.
 OPENCODE_BORDER_RE = re.compile(r"^\s*[│┃]")
 OPENCODE_BOTTOM_RE = re.compile(r"^\s*[╹╰┗][▀─]*\s*╯?", re.MULTILINE)
-OPENCODE_STATUS_RE = re.compile(r"^\S+ · .+ · \S+$", re.MULTILINE)
-OPENCODE_PLACEHOLDER_RE = re.compile(r'^Ask (?:anything|Codex)[….]?( "[^"]+")?$')
-# opencode renders the session cwd as a bare path row separated from the
-# status row by blank rows. A user draft never has that blank gap, so the
-# hint is dropped only in that exact position.
+OPENCODE_STATUS_RE = re.compile(r"^.+ · .+$", re.MULTILINE)
+# v2 writes the placeholder with three dots and quotes an example in it.
+OPENCODE_PLACEHOLDER_RE = re.compile(
+    r'^(?:Ask (?:anything|Codex)|Run a command)[.…]{1,3}( "[^"]*")?$'
+)
+# The composer footer carries the session cwd as a bare path; the composer
+# box renders the same path (plus the branch) flush right as its hint. The
+# footer is what tells a cwd hint apart from a draft that happens to be a
+# path.
+OPENCODE_FOOTER_CWD_RE = re.compile(r"^\s+(/[^\s]+)")
+OPENCODE_FOOTER_PATH_RE = re.compile(r"(?<![\w~])(/[^\s]*/[^\s]*)")
+# A row that holds nothing but a path is how opencode draws the session cwd
+# on an otherwise empty composer.
 OPENCODE_PATH_HINT_RE = re.compile(r"^[~/]\S*$")
 OPENCODE_GLYPH_ROWS = {"*"}
 # A pending permission dialog replaces the input area entirely; typing into it
@@ -105,14 +142,23 @@ OPENCODE_DIALOG_RE = re.compile(r"△ Permission required|Allow once\s+Allow alw
 OPENCODE_DIALOG_SCAN_ROWS = 24
 # While the agent is thinking, the input area and status row collapse and only
 # the bottom border remains above the footer. The state is transient.
-OPENCODE_TYPE_SLICE = 24
-OPENCODE_TYPE_PAUSE = 0.08
+# A live TUI can lose or reorder characters from a single large write, so
+# every write goes out in small slices with a pause between them.
+TYPE_SLICE = 24
+TYPE_PAUSE = 0.08
+# The marker removal is a short burst of backspaces; it has to land exactly,
+# so it is paced in even smaller pieces.
+BACKSPACE_SLICE = 8
+SHORT_BACKSPACE_BATCH = 64
 MESSAGE_NAME_RE = re.compile(r"peer-chat-[a-z0-9][a-z0-9-]{2,48}\.txt")
 MESSAGE_SPOOL = Path(tempfile.gettempdir()) / f"agterm-peer-chat-{os.getuid()}"
 
 
 KNOWN_KINDS = ("claude", "codex", "opencode")
 KIND_NAMES = {"claude": "Claude", "codex": "Codex", "opencode": "OpenCode"}
+# The two addressable panes of a session and the tree fields naming what runs
+# in them.
+PANE_FIELDS = (("left", "foreground"), ("right", "splitForeground"))
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "agterm" / "peer-chat.json"
 
 
@@ -138,6 +184,10 @@ class Profile:
     socket: str | None = None
     socket_fingerprint: tuple[int, int, int] | None = None
     agtermctl: str | None = None
+    # The agterm tree node of the target session, kept by require_target so
+    # that the composer code can read the target's cwd and executable without
+    # asking the tree a second time.
+    node: dict[str, Any] | None = None
 
 
 def load_agents() -> dict[str, dict[str, str]]:
@@ -173,9 +223,7 @@ class DeliveryProgress:
     """Conservative delivery state shared with the outer CLI boundary."""
 
     phase: str = "not_started"
-
-
-PROFILES_REMOVED = None
+    attempt: int = 0
 
 
 class PromptBlocked(RuntimeError):
@@ -196,7 +244,9 @@ class ComposerDirty(RuntimeError):
 
     `cleared` records that guarded cleanup provably restored the confirmed
     empty pre-write state, so a caller may retry safely without parsing the
-    message text.
+    message text. `input_dead` records that the target showed none of the
+    typed text at all: it is not reading the keyboard, and a smaller chunk
+    budget cannot change that.
     """
 
     def __init__(
@@ -205,11 +255,15 @@ class ComposerDirty(RuntimeError):
         owned_text: str,
         interrupted: bool = False,
         cleared: bool = False,
+        cleanup_reason: str | None = None,
+        input_dead: bool = False,
     ) -> None:
         super().__init__(message)
         self.owned_text = owned_text
         self.interrupted = interrupted
         self.cleared = cleared
+        self.cleanup_reason = cleanup_reason
+        self.input_dead = input_dead
 
 
 class DeliveryAmbiguous(RuntimeError):
@@ -221,6 +275,9 @@ class DeliveryAmbiguous(RuntimeError):
 IDENTITY_BLOCK_REASONS = frozenset(
     {"socket_gone", "socket_replaced", "pane_gone", "pane_changed", "pane_replaced"}
 )
+# Refusals that another attempt cannot fix: a dialog needs the user, and a
+# message longer than the composer can show stays too long.
+FINAL_BLOCK_REASONS = frozenset({"permission_dialog", "message_too_long"})
 
 
 def ctl(*args: str, input_text: str | None = None) -> str:
@@ -360,6 +417,12 @@ def sender_label() -> str:
             for spec in load_agents().values():
                 if runs(foreground, spec["command"]):
                     return f"Chat from {KIND_NAMES[spec['kind']]}: "
+            # A peer that runs through a wrapper answers to no configured
+            # command; the screen it draws names the kind instead.
+            text = pane_capture(info, pane, window)
+            kind = kind_on_screen(text) if text is not None else None
+            if kind is not None:
+                return f"Chat from {KIND_NAMES[kind]}: "
     return "Chat from Claude: "
 
 
@@ -408,26 +471,117 @@ def find_node(sid: str, window: str | None = None) -> dict[str, Any]:
     raise RuntimeError(f"ambiguous session prefix {sid!r}")
 
 
-def pane_candidates(info: dict[str, Any], profile: Profile) -> list[str]:
+def pane_candidates(
+    info: dict[str, Any], profile: Profile, window: str | None = None
+) -> list[str]:
+    """Addressable panes that can host the peer.
+
+    A pane whose foreground runs the configured command always qualifies. A
+    peer that runs through a wrapper (`bun .../cli.js`) answers to no
+    configured command, so its screen is the only thing that identifies it:
+    such a pane qualifies when its command belongs to no other configured
+    agent kind and the pane shows a composer of the requested kind.
+    """
     candidates = []
-    if runs(info.get("foreground"), profile.command):
-        candidates.append("left")
-    if runs(info.get("splitForeground"), profile.command):
-        candidates.append("right")
+    for pane, field in PANE_FIELDS:
+        if runs(info.get(field), profile.command):
+            candidates.append(pane)
+    if candidates:
+        return candidates
+    for pane, field in PANE_FIELDS:
+        foreground = info.get(field) or []
+        if not foreground or runs_other_kind(foreground, profile.agent):
+            continue
+        if pane_shows_kind(info, pane, profile, window):
+            candidates.append(pane)
     return candidates
 
 
-def has_target(info: dict[str, Any], profile: Profile) -> bool:
-    """Any split pane of this session runs the target command."""
-    if not info.get("hasSplit"):
+def runs_other_kind(foreground: Any, kind: str) -> bool:
+    """Whether the foreground identifies an agent of another kind.
+
+    A missing or broken config leaves the exclusion empty: the target comes
+    from the config before any pane is read, so a config problem surfaces
+    there rather than here.
+    """
+    if not isinstance(foreground, list):
         return False
-    return bool(pane_candidates(info, profile))
+    try:
+        agents = load_agents()
+    except RuntimeError:
+        return False
+    for spec in agents.values():
+        if spec["kind"] != kind and runs(foreground, spec["command"]):
+            return True
+    return False
 
 
-def resolve_pane(info: dict[str, Any], profile: Profile) -> str:
-    """Pick which split pane runs the target command."""
-    candidates = pane_candidates(info, profile)
+def pane_capture(
+    info: dict[str, Any], pane: str, window: str | None = None
+) -> str | None:
+    """The visible text of one pane, or None when it cannot be read."""
+    sid = info.get("id")
+    if not sid:
+        return None
+    probe = Profile(agent="claude", command="", label="", submit="\n", pane=pane)
+    try:
+        return _pane_text_unchecked(str(sid), probe, window)
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def pane_shows_kind(
+    info: dict[str, Any],
+    pane: str,
+    profile: Profile,
+    window: str | None = None,
+) -> bool:
+    """Whether the pane's screen shows a composer of the requested kind."""
+    text = pane_capture(info, pane, window)
+    if text is None:
+        return False
+    return shows_kind(profile, text)
+
+
+def shows_kind(profile: Profile, text: str) -> bool:
+    """Whether a screen shows a composer of the requested kind.
+
+    A composer that is busy with a permission dialog shows no live prompt,
+    but it is still the peer: the dialog is the peer's, and refusing to
+    address the pane would hide the reason from the user.
+    """
+    if live_prompt_text(profile, text) is not None:
+        return True
+    return active_modal(profile, text)
+
+
+def kind_on_screen(text: str) -> str | None:
+    """The composer kind a screen shows, whatever runs in it."""
+    for kind in KNOWN_KINDS:
+        probe = Profile(agent=kind, command="", label="", submit="\n")
+        if live_prompt_text(probe, text) is not None:
+            return kind
+    return None
+
+
+def has_target(
+    info: dict[str, Any], profile: Profile, window: str | None = None
+) -> bool:
+    """A pane of this session runs the target command.
+
+    The peer may sit in the split pane of a split session or in the primary
+    pane of a full-pane session; both are addressable panes.
+    """
+    return bool(pane_candidates(info, profile, window))
+
+
+def resolve_pane(
+    info: dict[str, Any], profile: Profile, window: str | None = None
+) -> str:
+    """Pick which pane runs the target command."""
+    candidates = pane_candidates(info, profile, window)
     if len(candidates) == 1:
+        reject_self_target(info, candidates[0])
         return candidates[0]
     if len(candidates) == 2:
         sender = os.environ.get("AGTERM_PANE")
@@ -438,24 +592,36 @@ def resolve_pane(info: dict[str, Any], profile: Profile) -> str:
             "unknown; pass --pane left|right"
         )
     raise RuntimeError(
-        f"{profile.agent} target pane is not running {profile.command!r}; "
-        "for a wrapper, pass --target-command NAME"
+        f"{profile.agent} target pane is not running {profile.command!r} and "
+        "shows no composer of that kind; the peer may live in another session "
+        "— pass --session <id> (agtermctl tree lists them); for a wrapper, "
+        "pass --target-command NAME"
     )
+
+
+def reject_self_target(info: dict[str, Any], pane: str) -> None:
+    sender = os.environ.get("AGTERM_SESSION_ID")
+    if sender and sender.lower() == str(info.get("id", "")).lower():
+        if os.environ.get("AGTERM_PANE") not in ("left", "right"):
+            raise RuntimeError("sending pane is unknown; nothing was typed")
+        if os.environ.get("AGTERM_PANE") == pane:
+            raise RuntimeError("target is the sending pane; nothing was typed")
 
 
 def require_target(
     sid: str, profile: Profile, window: str | None = None
 ) -> str:
     info = find_node(sid, pinned_window(profile, window))
-    if not info.get("hasSplit"):
-        raise RuntimeError(f"session {sid} has no split")
+    profile.node = info
     if profile.pane is None:
-        profile.pane = resolve_pane(info, profile)
-    elif profile.pane not in pane_candidates(info, profile):
+        profile.pane = resolve_pane(info, profile, window)
+    elif profile.pane not in pane_candidates(info, profile, window):
         raise RuntimeError(
             f"{profile.agent} pane {profile.pane} is not running "
-            f"{profile.command!r}; for a wrapper, pass --target-command NAME"
+            f"{profile.command!r} and shows no composer of that kind; for a "
+            "wrapper, pass --target-command NAME"
         )
+    reject_self_target(info, profile.pane)
     return str(info["id"])
 
 
@@ -466,19 +632,24 @@ def resolve_session(
     if sid:
         return require_target(sid, profile, window)
     wanted = checkout_key(os.getcwd())
-    matches = [
-        str(info["id"])
+    candidates = [
+        info
         for info in walk(tree(window))
-        if has_target(info, profile)
-        and info.get("cwd")
+        if info.get("cwd")
         and checkout_key(str(info["cwd"])) == wanted
+        and has_target(info, profile, window)
     ]
+    # A peer in a split pane is the established setup; a peer in the primary
+    # pane of a full-pane session is the fallback.
+    split = [info for info in candidates if info.get("hasSplit")]
+    matches = [str(info["id"]) for info in (split or candidates)]
     if len(matches) == 1:
         return matches[0]
     if not matches:
         raise RuntimeError(
             "no session in this checkout runs "
-            f"{profile.command!r} in a split; for a wrapper, pass --target-command NAME"
+            f"{profile.command!r} or shows a {profile.agent} composer; for a "
+            "wrapper, pass --target-command NAME"
         )
     raise RuntimeError(
         "more than one session shares this checkout; pass --session ID or launch "
@@ -521,13 +692,9 @@ def resolve_target(
         raise RuntimeError(f"no such session: {session}")
     window, info = matches[0]
     sid = str(info["id"])
-    if not info.get("hasSplit"):
-        raise RuntimeError(f"session {sid} has no split")
-    if not has_target(info, profile):
-        raise RuntimeError(
-            f"{profile.agent} target pane is not running {profile.command!r}; "
-            "for a wrapper, pass --target-command NAME"
-        )
+    # Resolve the pane here, not later: the queue guard and the target lock
+    # are keyed on the pane, and a None pane would key them on nothing.
+    require_target(sid, profile, window)
     return window, sid
 
 
@@ -569,15 +736,16 @@ def verify_pinned_identity(
                 "socket_replaced",
             )
     info = find_node(sid, pinned_window(profile, window))
-    if not info.get("hasSplit"):
+    pane = profile.pane
+    if pane == "right" and not info.get("hasSplit"):
+        # A split pane dies with its split; the primary pane does not.
         raise PromptBlocked(
             "target split no longer exists; delivery cancelled", "pane_gone"
         )
-    pane = profile.pane
-    if pane not in pane_candidates(info, profile):
+    if pane not in pane_candidates(info, profile, pinned_window(profile, window)):
         raise PromptBlocked(
-            f"target pane {pane} no longer runs {profile.command!r}; "
-            "delivery cancelled",
+            f"target pane {pane} no longer runs {profile.command!r} and shows "
+            "no composer of that kind; delivery cancelled",
             "pane_changed",
         )
     token = info.get("paneID") if pane == "left" else info.get("splitPaneID")
@@ -662,23 +830,51 @@ def type_text(
             input_text=part,
         )
 
-    # Live sends into a redrawing opencode TUI occasionally lose one character
-    # from a single large write. Pace the event in small slices; verification
-    # and markers stay per whole chunk. Paste is not an alternative here:
+    # A live TUI can lose or reorder characters from a single large write:
+    # the redrawing opencode loses one, and a patched Claude Code build
+    # rotates the text. Pace every write in small slices; verification and
+    # markers stay per whole chunk. Paste is not an alternative here:
     # opencode collapses a bracketed paste into a "[Pasted ~1 lines]" token.
-    # Pure-backspace cleanup events skip the pacing: over-backspacing an empty
-    # composer is harmless and the rounds repeat anyway.
-    if (
-        profile.agent == "opencode"
-        and len(text) > OPENCODE_TYPE_SLICE
-        and text.strip("\x7f")
-    ):
-        for index in range(0, len(text), OPENCODE_TYPE_SLICE):
+    # Long pure-backspace cleanup events skip the pacing: they have their own
+    # pacing, and over-backspacing an empty composer is harmless because the
+    # rounds repeat anyway.
+    if len(text) > TYPE_SLICE and text.strip("\x7f"):
+        for index in range(0, len(text), TYPE_SLICE):
             verify_pinned_identity(sid, profile, window)
-            event(text[index : index + OPENCODE_TYPE_SLICE])
-            time.sleep(OPENCODE_TYPE_PAUSE)
+            event(text[index : index + TYPE_SLICE])
+            time.sleep(TYPE_PAUSE)
+        return
+    if (
+        len(text) > BACKSPACE_SLICE
+        and len(text) <= SHORT_BACKSPACE_BATCH
+        and not text.strip("\x7f")
+    ):
+        # A short burst of backspaces can lose characters too, and the marker
+        # removal has to land exactly; the long cleanup batches keep their
+        # own pacing.
+        for index in range(0, len(text), BACKSPACE_SLICE):
+            verify_pinned_identity(sid, profile, window)
+            event(text[index : index + BACKSPACE_SLICE])
+            time.sleep(TYPE_PAUSE)
         return
     event(text)
+
+
+def type_backspaces(
+    sid: str, profile: Profile, count: int, window: str | None = None
+) -> None:
+    """Send backspaces in bounded, paced pieces.
+
+    A single multi-thousand-character burst can be dropped by the pty input
+    queue, and a lost backspace only under-deletes, so the deletion is paced
+    and the caller verifies the result.
+    """
+    remaining = count
+    while remaining > 0:
+        piece = min(remaining, BACKSPACE_BATCH)
+        type_text(sid, profile, "\x7f" * piece, window)
+        remaining -= piece
+        time.sleep(BACKSPACE_PAUSE)
 
 
 def text_chunks(text: str, max_bytes: int = TYPE_CHUNK_BYTES) -> list[str]:
@@ -806,9 +1002,108 @@ def opencode_inner_text(line: str) -> str | None:
 
 OPENCODE_ROW_SPLIT_RE = re.compile(r" {2,}(?=[│┃] {2}\S)")
 
+# The rule opencode draws at a fixed column of every screen row.
+OPENCODE_ROW_GLYPH_RE = re.compile(r"[│┃]")
+
 # A single screen row fits the pane width; anything longer means rows were
 # glued by the capture.
 UNFLATTEN_MIN_LINE = 165
+
+
+def opencode_rows_at(text: str, width: int) -> list[str]:
+    """Cut a capture into rows of the given width."""
+    rows: list[str] = []
+    for line in text.splitlines():
+        if len(line) > width:
+            rows.extend(line[i : i + width] for i in range(0, len(line), width))
+        else:
+            rows.append(line)
+    return rows
+
+
+def opencode_width_fits(text: str, width: int) -> bool:
+    """Whether cutting the capture at this width yields a usable composer box.
+
+    The box itself is what proves the width, not the screen around it: the
+    bottom border must survive the cut, the row above it must be the status
+    row of the box, and the row above that must be a box row in the same
+    column. Counting box glyphs over the whole screen does not work — a
+    markdown table in the transcript draws pipes of its own, and in v2 those
+    pipes outnumber the box rows and hide the box's own column.
+    """
+    rows = opencode_rows_at(text, width)
+    bottom = next(
+        (
+            index
+            for index in range(len(rows) - 1, -1, -1)
+            if OPENCODE_BOTTOM_RE.match(rows[index])
+        ),
+        None,
+    )
+    if bottom is None or bottom == 0:
+        return False
+    above = rows[bottom - 1]
+    if not OPENCODE_BORDER_RE.match(above):
+        return False
+    column = len(above) - len(above.lstrip())
+    # The rows of the box sit in one column; the run directly above the
+    # status row is the box body. A cut that broke the box apart leaves no
+    # such run.
+    same = 0
+    for row in reversed(rows[: bottom - 1]):
+        if not OPENCODE_BORDER_RE.match(row):
+            break
+        if len(row) - len(row.lstrip()) != column:
+            break
+        same += 1
+    return same >= 1
+
+
+def opencode_row_width(text: str) -> int:
+    """Screen row width of a capture whose rows were glued into one line.
+
+    A capture that kept some rows intact gives the width directly. Otherwise
+    opencode's gutter rule repeats at a fixed column, so the distance between
+    consecutive rule hits is the width — but content draws box glyphs of its
+    own, so every candidate is checked against the shape of the rows it
+    produces. Returns 0 when the capture offers no usable grid.
+    """
+    lines = text.splitlines()
+    counts: dict[int, int] = {}
+    for line in lines:
+        length = len(line)
+        if length >= 20:
+            counts[length] = counts.get(length, 0) + 1
+    if counts:
+        width, hits = max(counts.items(), key=lambda item: (item[1], item[0]))
+        # The rows of a screen are all one width; a capture whose lines have
+        # no common length is not a screen and must not be cut by it. The
+        # longest line counts too: a capture of equal rows has its width in
+        # the very length that used to be skipped.
+        if hits >= len(lines) * 0.6 and opencode_width_fits(text, width):
+            return width
+    positions = [m.start() for m in OPENCODE_ROW_GLYPH_RE.finditer(text)]
+    if len(positions) < 3:
+        return 0
+    # The gutter rule sits at one column of every screen row, so the distance
+    # between two of its hits is a multiple of the row width. Content draws
+    # box glyphs of its own, so the hits in between are ignored and every
+    # pair of hits is tried; only a width that cuts the box into usable rows
+    # survives the check.
+    differences: dict[int, int] = {}
+    for index, first in enumerate(positions):
+        for second in positions[index + 1 :]:
+            delta = second - first
+            if 20 <= delta <= 400:
+                differences[delta] = differences.get(delta, 0) + 1
+    for width, hits in sorted(
+        differences.items(), key=lambda item: (-item[1], -item[0])
+    ):
+        if hits < 3:
+            continue
+        if opencode_width_fits(text, width):
+            return width
+    return 0
 
 
 def opencode_unflatten(text: str) -> list[str]:
@@ -818,7 +1113,15 @@ def opencode_unflatten(text: str) -> list[str]:
     screen rows into a single long line. Rows keep their trailing spaces up to
     the pane width and the next row restarts with its border glyph, so
     splitting before every border run restores them for both border styles.
+
+    opencode's own pane arrives fully glued: the row breaks are gone and only
+    the fixed-width grid survives. The gutter rule repeats on every row, so
+    the width is recovered from the spacing between rule hits and the line is
+    cut back into rows.
     """
+    width = opencode_row_width(text)
+    if width:
+        return opencode_rows_at(text, width)
     lines: list[str] = []
     for line in text.splitlines():
         if len(line) > UNFLATTEN_MIN_LINE:
@@ -834,6 +1137,194 @@ def opencode_unflatten(text: str) -> list[str]:
         else:
             lines.append(line)
     return lines
+
+
+def opencode_cwd_prefixes(lines: list[str], start: int = 0) -> list[str]:
+    """The cwd forms the composer hint may use.
+
+    The footer row carries the session cwd; the composer box shows the same
+    path relative to the home directory, optionally followed by the branch.
+    Only the rows outside the box are read: a draft of its own may well be a
+    path, and taking the cwd out of it would make the draft look like a hint.
+    """
+    for line in reversed(lines[start:]):
+        match = OPENCODE_FOOTER_CWD_RE.match(line) or (
+            OPENCODE_FOOTER_PATH_RE.search(line)
+        )
+        if not match:
+            continue
+        path = match.group(1)
+        home = os.path.expanduser("~")
+        forms = [path]
+        if path == home:
+            forms.append("~")
+        elif path.startswith(home + "/"):
+            forms.append("~" + path[len(home):])
+        return forms
+    return []
+
+
+def opencode_hint_is_cwd(hint: str, prefix: str) -> bool:
+    """Whether a composer hint names the session cwd.
+
+    The hint is the cwd rendered home-relative (`~/dir`), while the footer
+    that proves it names the same directory by its absolute path. The home
+    directory of the machine that reads the capture is not necessarily the
+    home the capture was taken on, so a `~` hint is matched by the tail of
+    the known path instead of by a prefix.
+    """
+    if hint.startswith(prefix):
+        return True
+    if not hint.startswith("~"):
+        return False
+    tail = hint[1:].lstrip("/")
+    if not tail:
+        return False
+    return prefix.endswith(("/" + tail, tail))
+
+
+def opencode_split_cwd_hint(
+    block: list[str], prefixes: list[str], has_input: bool = True
+) -> tuple[list[str], str]:
+    """Split the trailing cwd hint off the composer block.
+
+    opencode renders the session cwd (plus the branch) flush right on the
+    bottom-most box row. It shares that row with the draft, and it wraps onto
+    further rows when the pane is narrow. Returns the block without the hint
+    and the hint text; the block is unchanged when there is no hint.
+
+    ``has_input`` says whether the composer shows an input area. Without a
+    known cwd the only shape that can be dropped safely is a composer that
+    waits for input and holds nothing but a path: that is how opencode draws
+    the session cwd when it has no draft to show.
+    """
+    if not block:
+        return block, ""
+    fragments: list[str] = []
+    index = len(block) - 1
+    while index >= 0 and block[index] and " " not in block[index]:
+        if block[index] in OPENCODE_GLYPH_ROWS:
+            # A lone cursor glyph is a decoration, not the start of the hint.
+            index -= 1
+            continue
+        fragments.insert(0, block[index])
+        index -= 1
+    head = ""
+    if index >= 0:
+        tokens = block[index].split()
+        if tokens and tokens[-1][:1] in ("~", "/"):
+            head = tokens[-1]
+    hint = head + "".join(fragments)
+    if not hint or hint[:1] not in ("~", "/"):
+        return block, ""
+    if not prefixes:
+        # Without the cwd there is no telling the hint from a draft that
+        # happens to end in a path, and stripping the wrong one would hide the
+        # user's own text. The one shape that is safe to drop is the
+        # bottom-most row of a composer without an input area that holds
+        # nothing but a path: that is how opencode draws the session cwd.
+        if has_input or not block:
+            return block, ""
+        if not OPENCODE_PATH_HINT_RE.match(block[-1]):
+            return block, ""
+        return list(block[:-1]), block[-1]
+    if not any(opencode_hint_is_cwd(hint, prefix) for prefix in prefixes):
+        return block, ""
+    kept = list(block[: index + 1])
+    if head:
+        row = kept[-1]
+        kept[-1] = row[: row.rfind(head)].rstrip()
+    return [row for row in kept if row], hint
+
+
+# How long a message may be before it is refused instead of typed.
+#
+# Both versions can leave an unconfirmed partial draft after long input;
+# keep inline messages short and send longer text by file path instead.
+OPENCODE_V1_MESSAGE_LIMIT = 400
+OPENCODE_V2_MESSAGE_LIMIT = 400
+OPENCODE_VERSION_CACHE: dict[str, str] = {}
+
+
+def opencode_binary_path(profile: Profile) -> str | None:
+    """The executable running in the target pane, from the tree node.
+
+    The node is the one require_target already read, so the composer code
+    never asks the tree a second time.
+    """
+    info = profile.node
+    if not info:
+        return None
+    field = "foreground" if profile.pane == "left" else "splitForeground"
+    for part in info.get(field) or []:
+        text = str(part)
+        if os.path.sep in text and runs([text], profile.command):
+            return text
+    return None
+
+
+def opencode_version_major(output: str) -> int | None:
+    """Major version out of what `opencode --version` printed; None if no."""
+    match = re.search(r"(\d+)\.", output)
+    return int(match.group(1)) if match else None
+
+
+def opencode_build_major(path: str | None) -> int | None:
+    """Major version of the opencode build at that path; None when unknown.
+
+    v1 prints "1.18.29", v2 prints "opencode v2.2.0"; the answer is cached
+    per path, because the build does not change under a running peer.
+    """
+    if not path:
+        return None
+    if path not in OPENCODE_VERSION_CACHE:
+        version = ""
+        try:
+            done = subprocess.run(
+                [path, "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            version = (done.stdout or done.stderr or "").strip()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            version = ""
+        OPENCODE_VERSION_CACHE[path] = version
+    return opencode_version_major(OPENCODE_VERSION_CACHE[path])
+
+
+def opencode_message_limit(profile: Profile) -> tuple[int, int | None]:
+    """The longest message the target composer can be trusted to show in full.
+
+    Returns the limit and the build's major version (None when it could not
+    be told). An unknown build is treated as the older one: it keeps the
+    head of an overflowing draft, so the tail can never be confirmed.
+    """
+    major = opencode_build_major(opencode_binary_path(profile))
+    if major is not None and major >= 2:
+        return OPENCODE_V2_MESSAGE_LIMIT, major
+    return OPENCODE_V1_MESSAGE_LIMIT, major
+
+
+def check_message_length(profile: Profile, body: str) -> None:
+    if profile.agent != "opencode" or not body:
+        return
+    limit, major = opencode_message_limit(profile)
+    if len(body) > limit:
+        because = (
+            " (it keeps only the head of a draft that overflows its box)"
+            if major is None or major < 2
+            else ""
+        )
+        raise PromptBlocked(
+            f"target composer takes a message of at most {limit} characters "
+            f"and this message has {len(body)} characters including the sender label "
+            f"({len(body.encode('utf-8'))} UTF-8 bytes){because}; "
+            "write the message to a file and send its path instead; "
+            "nothing was typed",
+            "message_too_long",
+        )
 
 
 def opencode_composer_walk(text: str) -> tuple[str | None, bool]:
@@ -868,31 +1359,42 @@ def opencode_composer_walk(text: str) -> tuple[str | None, bool]:
     index -= 1
     block: list[str] = []
     saw_input = False
+    blank_above = False
+    box_column = len(lines[index]) - len(lines[index].lstrip())
     while index >= 0:
         row_inner = inner(lines[index])
         if row_inner is None:
             break
+        if len(lines[index]) - len(lines[index].lstrip()) != box_column:
+            # A row framed in another column belongs to the transcript above
+            # the box, not to the composer.
+            break
         if row_inner == "":
             if block:
+                blank_above = True
                 break
             saw_input = True
             index -= 1
             continue
         block.insert(0, row_inner)
         index -= 1
-    if not saw_input and block and OPENCODE_PATH_HINT_RE.match(block[-1]):
-        # Wide layout renders the cwd hint unconditionally as the bottom-most
-        # box row (under any draft). The narrow layout has no hint row at all
-        # and always keeps the blank input row below a draft (saw_input).
-        block = block[:-1]
+    block, hint = opencode_split_cwd_hint(
+        block, opencode_cwd_prefixes(lines, bottom + 1), saw_input
+    )
     content = [
         row
         for row in block
         if row
-        and not OPENCODE_STATUS_RE.match(row)
+        # The status row is the one just found above the box body; matching it
+        # by shape would also drop a draft that happens to carry a `·`.
+        and row != status
         and row not in OPENCODE_GLYPH_ROWS
         and not OPENCODE_PLACEHOLDER_RE.match(row)
     ]
+    if not content and hint and blank_above:
+        # The hint was the only box content, so the blank row above it is the
+        # input area: the composer is empty and ready.
+        saw_input = True
     return "\n".join(content), saw_input
 
 
@@ -932,19 +1434,20 @@ def opencode_box_rows(pane: str) -> list[str] | None:
 
 
 def opencode_dialog_rows_signal(rows: list[str]) -> bool:
-    """Signal phrase and choice row together in the given raw rows.
+    """Signal phrase and choice rows together in the given raw rows.
 
     The phrase alone is not enough — a draft or transcript may quote it — so
-    the modal counts only when its choice row (Allow once / Allow always /
-    Reject) sits among the same rows.
+    the modal counts only when the choice rows sit among the same rows. The
+    choices may be drawn on one row or stacked on several.
     """
     texts = []
     for row in rows:
         inner = opencode_inner_text(row)
         texts.append(inner if inner is not None else row.strip())
     has_signal = any(OPENCODE_DIALOG_RE.search(text) for text in texts)
-    has_choice = any("Allow" in text and "Reject" in text for text in texts)
-    return has_signal and has_choice
+    has_allow = any("Allow" in text for text in texts)
+    has_reject = any("Reject" in text for text in texts)
+    return has_signal and has_allow and has_reject
 
 
 def opencode_permission_dialog(pane: str) -> bool:
@@ -970,6 +1473,8 @@ def active_modal(profile: Profile, pane: str) -> bool:
         return opencode_permission_dialog(pane)
     if profile.agent == "claude":
         return claude_permission_dialog(pane)
+    if profile.agent == "codex":
+        return codex_permission_dialog(pane)
     return False
 
 
@@ -1009,6 +1514,19 @@ def codex_placeholder_shown(content: str) -> bool:
     return len(expected) in reached
 
 
+def caret_column_agrees(column: int) -> bool:
+    """Whether the reported caret column is consistent with an empty composer.
+
+    Claude Code parks the terminal caret at the prompt column, just after the
+    prompt glyph, so an empty composer reports that column and a caret
+    anywhere else means the composer is not the live input. A build that
+    draws its own caret block and never moves the terminal caret reports
+    column 0 whatever the composer holds; that value carries no signal, so
+    it is accepted and the emptiness rests on the composer's content.
+    """
+    return column in (EMPTY_CURSOR_COLUMN, UNREPORTED_CURSOR_COLUMN)
+
+
 def composer_is_empty(profile: Profile, content: str) -> bool:
     """Recognise known empty-input content for cleanup, acceptance and preflight."""
     if profile.agent == "codex":
@@ -1031,7 +1549,7 @@ def composer_is_clear(profile: Profile, state: tuple[str, int] | None) -> bool:
     so its emptiness is judged on content alone."""
     if state is None or not composer_is_empty(profile, state[0]):
         return False
-    return profile.agent == "opencode" or state[1] == EMPTY_CURSOR_COLUMN
+    return profile.agent == "opencode" or caret_column_agrees(state[1])
 
 
 def composer_state(
@@ -1094,25 +1612,78 @@ def wait_for_composer_change(
         time.sleep(PROBE_INTERVAL)
 
 
+def composer_overflow_note(
+    sid: str,
+    profile: Profile,
+    owned: str,
+    window: str | None = None,
+) -> str:
+    """Name the cause when the composer shows only part of what was typed.
+
+    The opencode composer keeps the head of a draft that overflows its box,
+    so the tail of a long message can never be confirmed. Say that, instead
+    of leaving the agent to guess at a failed chunk.
+    """
+    if profile.agent != "opencode":
+        return ""
+    try:
+        state = composer_state(sid, profile, window)
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+        return ""
+    if state is None:
+        return ""
+    visible = state[0] or ""
+    if not visible:
+        return ""
+    mode, _, _ = composer_owned_mode(visible, owned)
+    if mode == "foreign":
+        # Not our text at all: a parse problem, not an overflow.
+        return ""
+    tail = owned[-40:] if len(owned) > 40 else owned
+    if visible.rstrip().endswith(tail.rstrip()):
+        # The tail is on screen: an ordinary typing failure.
+        return ""
+    _, major = opencode_message_limit(profile)
+    cause = (
+        "it keeps the head of a draft that overflows its box"
+        if major is None or major < 2
+        else "the composer window scrolled away from the text typed so far"
+    )
+    return (
+        f"the composer shows {len(visible)} of the {len(owned)} characters "
+        f"typed so far ({cause}); write the message to a file and send its "
+        "path instead"
+    )
+
+
 def verify_diag(
     sid: str,
     profile: Profile,
     window: str | None,
     expected_len: int,
     marker: str,
-) -> str:
-    """One-line observation for a failed chunk verify; no message text."""
+) -> tuple[str, bool]:
+    """One-line observation for a failed chunk verify, and whether the target
+    showed nothing of the typed text; no message text."""
     try:
         state = composer_state(sid, profile, window)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
         state = None
     if state is None:
-        return f"expected ~{expected_len} chars; composer state not recognisable"
+        return (
+            f"expected ~{expected_len} chars; composer state not recognisable",
+            False,
+        )
     rows = state[0].splitlines() or [""]
     held = "marker present" if marker and marker in state[0] else "marker absent"
+    dead = not state[0].strip()
+    note = "; the target accepted no input at all" if dead else ""
     return (
-        f"expected ~{expected_len} chars; observed {len(state[0])} chars in "
-        f"{len(rows)} rows; {held}"
+        (
+            f"expected ~{expected_len} chars; observed {len(state[0])} chars in "
+            f"{len(rows)} rows; {held}{note}"
+        ),
+        dead,
     )
 
 
@@ -1123,13 +1694,14 @@ def type_body(
     initial: tuple[str, int],
     window: str | None = None,
     progress: BodyProgress | None = None,
+    chunk_bytes: int = TYPE_CHUNK_BYTES,
 ) -> tuple[str, int]:
     """Type bounded marked chunks, removing each marker before continuing."""
     if progress is None:
         progress = BodyProgress()
     marker = composer_probe_marker(text)
     tolerant = profile.agent == "codex"
-    chunks = text_chunks(text, TYPE_CHUNK_BYTES - len(marker.encode("utf-8")))
+    chunks = text_chunks(text, chunk_bytes - len(marker.encode("utf-8")))
     state = initial
     expected = ""
     for index, chunk in enumerate(chunks):
@@ -1153,21 +1725,32 @@ def type_body(
                     ),
                 )
                 if changed is None:
+                    note = composer_overflow_note(sid, profile, marked, window)
+                    diag, dead = verify_diag(
+                        sid, profile, window, len(marked), marker
+                    )
                     raise ComposerDirty(
                         f"message chunk {index + 1}/{len(chunks)} was typed but the "
                         "target composer did not confirm it "
-                        f"({verify_diag(sid, profile, window, len(marked), marker)}); "
-                        "submit withheld",
+                        f"({diag}); "
+                        + (f"{note}; " if note else "")
+                        + "submit withheld",
                         marked,
+                        input_dead=dead,
                     )
                 if not composer_has_expected_tail(
                     changed[0], marked, chunk + marker, tolerant
                 ):
+                    note = composer_overflow_note(sid, profile, marked, window)
+                    diag, _ = verify_diag(
+                        sid, profile, window, len(marked), marker
+                    )
                     raise ComposerDirty(
                         f"message chunk {index + 1}/{len(chunks)} is incomplete in "
                         "the target composer "
-                        f"({verify_diag(sid, profile, window, len(marked), marker)}); "
-                        "submit withheld",
+                        f"({diag}); "
+                        + (f"{note}; " if note else "")
+                        + "submit withheld",
                         marked,
                     )
                 settle_delay = (
@@ -1443,6 +2026,64 @@ def composer_owned_spans(
     return positions
 
 
+def composer_owned_mode(
+    content: str,
+    owned_text: str,
+    tolerant: bool = False,
+) -> tuple[str, int, int]:
+    """Classify the visible composer text against the text this send typed.
+
+    Returns (mode, start, end). "empty" means the composer holds nothing;
+    "foreign" means the visible text is not part of what was typed; "tail"
+    means the visible rows are the end of our text; "head" means they are its
+    beginning and the caret sits behind them, out of sight; "middle" is the
+    rest. The offsets are positions in ``owned_text``.
+    """
+    if not content:
+        return "empty", 0, 0
+    spans = composer_owned_spans(
+        content, owned_text, set(range(1, len(owned_text) + 1)), tolerant
+    )
+    if not spans:
+        return "foreign", -1, -1
+    start = min(span[0] for span in spans)
+    end = max(span[1] for span in spans)
+    if end == len(owned_text):
+        return "tail", start, end
+    if start == 0:
+        return "head", start, end
+    return "middle", start, end
+
+
+def composer_cleanup_decision(
+    content: str,
+    owned_text: str,
+    initial_empty: bool,
+    tolerant: bool = False,
+) -> tuple[str, int]:
+    """How to erase the composer after a failed send.
+
+    Returns ("done", 0) when it is already empty, ("refuse", 0) when the
+    visible text is not ours to delete, ("delete_exact", 0) when the visible
+    rows are a confirmed piece of our text at the caret, and
+    ("delete_all", n) when only the head of our draft is visible and the
+    caret sits behind it, so n characters have to go.
+    """
+    mode, _, _ = composer_owned_mode(content, owned_text, tolerant)
+    if mode == "empty":
+        return "done", 0
+    if mode == "foreign":
+        return "refuse", 0
+    if mode == "head":
+        # The visible head is ours, but the caret is past it: exact deletion
+        # cannot move the screen, so the whole draft we typed goes at once.
+        # Safe only because the composer was proven empty before we typed.
+        if not initial_empty:
+            return "refuse", 0
+        return "delete_all", len(owned_text)
+    return "delete_exact", 0
+
+
 def wait_for_cleanup_state(
     sid: str,
     profile: Profile,
@@ -1451,9 +2092,10 @@ def wait_for_cleanup_state(
     allowed_ends: set[int],
     window: str | None = None,
     accept_empty: bool = True,
+    timeout: float = PROBE_TIMEOUT,
 ) -> tuple[tuple[str, int], set[tuple[int, int]]] | None:
     """Wait for a backspace batch to reach a stable observable state."""
-    deadline = time.monotonic() + PROBE_TIMEOUT
+    deadline = time.monotonic() + timeout
     tolerant = profile.agent == "codex"
     stable: tuple[int | None, frozenset[tuple[int, int]]] | None = None
     stable_since: float | None = None
@@ -1503,6 +2145,18 @@ def clear_composer(
     On failure appends a short cause (no message text) to ``reason`` when given.
     """
     allowed_ends = set(range(1, len(owned_text) + 1))
+    tolerant = profile.agent == "codex"
+
+    def fail(text: str) -> bool:
+        if reason is not None:
+            reason.append(text)
+        return False
+
+    # An already empty composer is a clean outcome, not a cleanup failure.
+    state = composer_state(sid, profile, window)
+    if state is not None and composer_is_clear(profile, state):
+        return True
+
     settled = wait_for_cleanup_state(
         sid,
         profile,
@@ -1518,11 +2172,6 @@ def clear_composer(
         return False
     state, spans = settled
 
-    def fail(text: str) -> bool:
-        if reason is not None:
-            reason.append(text)
-        return False
-
     def blind_recovery(state, spans):
         """Bounded blind backspacing; only for a proven-empty pre-write.
 
@@ -1532,18 +2181,22 @@ def clear_composer(
         """
         if profile.agent != "opencode" or initial[0] != "":
             return False, state, spans, ""
-        # Blind backspacing assumes every visible character is ours. A draft
-        # that is not a tail of the owned text means foreign content shares
-        # the composer (a mis-parse or user input); refuse to delete it.
-        flat_content = (state[0] or "").replace("\n", "")
-        flat_owned = owned_text.replace("\n", "")
-        if not flat_owned.endswith(flat_content):
+        decision, count = composer_cleanup_decision(
+            state[0] if state else "", owned_text, True, tolerant
+        )
+        if decision == "refuse":
             return False, state, spans, (
-                "visible text is not a confirmed tail of the sent text; "
+                "visible text is not part of the sent text; "
                 "blind deletion refused"
             )
+        if decision == "done":
+            return True, state, spans, ""
+        if decision == "delete_exact":
+            # Exact deletion stalled on a draft we cannot place exactly; the
+            # composer was empty before we typed, so what is left is ours.
+            count = len(owned_text) + 8
         for _ in range(3):
-            type_text(sid, profile, "\x7f" * (len(owned_text) + 8), window)
+            type_backspaces(sid, profile, count, window)
             settled = wait_for_cleanup_state(
                 sid,
                 profile,
@@ -1551,6 +2204,7 @@ def clear_composer(
                 owned_text,
                 set(range(1, len(owned_text) + 1)),
                 window,
+                timeout=LONG_CLEANUP_TIMEOUT,
             )
             if settled is None:
                 return False, state, spans, (
@@ -1559,8 +2213,19 @@ def clear_composer(
             state, spans = settled
             if composer_is_clear(profile, state):
                 return True, state, spans, ""
-            if spans:
+            mode, _, _ = composer_owned_mode(
+                state[0] or "", owned_text, tolerant
+            )
+            if mode == "foreign":
+                return False, state, spans, (
+                    "visible text is not part of the sent text; "
+                    "blind deletion refused"
+                )
+            if mode in ("tail", "middle"):
+                # The draft is fully visible again, so exact deletion can
+                # take over from here.
                 return None, state, spans, ""
+            count = len(owned_text)
         return False, state, spans, "blind recovery did not confirm an empty composer"
 
     # Each confirmed round deletes at most TYPE_CHUNK_BYTES characters, so a
@@ -1571,6 +2236,23 @@ def clear_composer(
     for _ in range(max_rounds):
         if state == initial or composer_is_clear(profile, state):
             return True
+        mode, _, _ = composer_owned_mode(
+            state[0] if state else "", owned_text, tolerant
+        )
+        if mode == "foreign":
+            return fail(
+                "visible text is not part of the sent text; blind deletion refused"
+            )
+        if mode == "head" and initial[0] == "":
+            # The visible rows are the head of our draft and the caret sits
+            # behind them, out of sight: exact deletion cannot move the
+            # screen, so the draft goes in one blind round.
+            outcome, state, spans, why = blind_recovery(state, spans)
+            if outcome is True:
+                return True
+            if outcome is None:
+                continue
+            return fail(why or "cleanup made no confirmed progress")
         if not spans:
             outcome, state, spans, why = blind_recovery(state, spans)
             if outcome is True:
@@ -1621,7 +2303,12 @@ def wait_for_accepted(
     window: str | None = None,
 ) -> bool:
     """Wait until submission clears the composed state and restores column 2."""
-    deadline = time.monotonic() + PROBE_TIMEOUT
+    # A big draft takes the peer a while to render and clear, and the wait
+    # has to outlast that: a slow clear must not be mistaken for a failed
+    # submission.
+    deadline = time.monotonic() + ACCEPT_TIMEOUT + min(
+        10.0, len(composed[0]) / 300
+    )
     stable_since: float | None = None
     while True:
         state = composer_state(sid, profile, window)
@@ -1681,13 +2368,16 @@ def raise_after_composer_dirty(
         ) from cleanup_err
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
         cleared = False
+        reason.append("composer cleanup raised an error")
     detail = "composer cleared" if cleared else "composer cleanup failed"
     if not cleared and reason:
         detail += f" ({'; '.join(reason)})"
     if dirty.interrupted:
         raise KeyboardInterrupt(f"{dirty}; {detail}") from dirty
     raise ComposerDirty(
-        f"{dirty}; {detail}", dirty.owned_text, cleared=cleared
+        f"{dirty}; {detail}", dirty.owned_text, cleared=cleared,
+        cleanup_reason=reason[-1] if not cleared and reason else None,
+        input_dead=dirty.input_dead,
     ) from dirty
 
 
@@ -1708,8 +2398,30 @@ def claude_permission_dialog(pane: str) -> bool:
     return has_choices and not has_prompt
 
 
+def codex_permission_dialog(pane: str) -> bool:
+    """A codex approval chooser replaces the input prompt row.
+
+    Codex numbers its approval options (``1. Yes``), so a tail with numbered
+    options and no live prompt row is a modal waiting for the user. A
+    shortcut overlay looks the same; refusing on it is the safe direction.
+    """
+    tail = [row.strip() for row in pane.splitlines()[-8:]]
+
+    def is_choice(row: str) -> bool:
+        return bool(CODEX_CHOICE_RE.match(row.lstrip("›>❯ ").strip()))
+
+    has_choices = any(is_choice(row) for row in tail)
+    has_prompt = any(
+        CODEX_PROMPT_RE.match(row) and not is_choice(row) for row in tail
+    )
+    return has_choices and not has_prompt
+
+
 def check_composer_ready(
-    sid: str, profile: Profile, window: str | None = None
+    sid: str,
+    profile: Profile,
+    window: str | None = None,
+    message: str = "",
 ) -> tuple[str, int]:
     """Pre-write readiness gates; returns the confirmed initial state.
 
@@ -1747,22 +2459,31 @@ def check_composer_ready(
     # Claude's free-form suggestions look like drafts in plain screen text.
     # opencode renders no fixed prompt column (splash box, status rows), so
     # its cursor position is not a usable emptiness signal and is skipped.
-    if profile.agent in ("codex", "opencode") and not composer_is_empty(
-        profile, empty_text
-    ):
+    empty = composer_is_empty(profile, empty_text)
+    if profile.agent in ("codex", "opencode") and not empty:
         raise PromptBlocked(
             "target composer contains text; nothing was typed",
             "composer_not_empty",
         )
+    check_message_length(profile, message)
     column = (
         EMPTY_CURSOR_COLUMN
         if profile.agent == "opencode"
         else cursor_column(sid, profile, window)
     )
-    if column != EMPTY_CURSOR_COLUMN:
+    if not caret_column_agrees(column):
         raise PromptBlocked(
             "target composer is not confirmably empty; nothing was typed",
             "composer_not_confirmed_empty",
+        )
+    if profile.agent == "claude" and not empty:
+        # The caret check above already refuses a draft for a build that
+        # parks the caret at the prompt column. A build that reports no caret
+        # at all leaves the emptiness to the content, and the draft has to be
+        # caught here.
+        raise PromptBlocked(
+            "target composer contains text; nothing was typed",
+            "composer_not_empty",
         )
     return empty_text, column
 
@@ -1774,6 +2495,7 @@ def send(
     window: str | None = None,
     prepared: str | None = None,
     delivery: DeliveryProgress | None = None,
+    chunk_bytes: int = TYPE_CHUNK_BYTES,
 ) -> int:
     if prepared is None:
         try:
@@ -1786,7 +2508,7 @@ def send(
         typed = prepared
     try:
         verify_pinned_identity(sid, profile, window)
-        initial = check_composer_ready(sid, profile, window)
+        initial = check_composer_ready(sid, profile, window, typed)
     except PromptBlocked:
         raise
     except KeyboardInterrupt as err:
@@ -1799,13 +2521,13 @@ def send(
         ) from err
 
     if delivery is not None:
-        delivery.phase = "started"
+        delivery.phase = "body"
     phase = "body"
     progress = BodyProgress()
     try:
         try:
             composed = type_body(
-                sid, profile, typed, initial, window, progress
+                sid, profile, typed, initial, window, progress, chunk_bytes
             )
             # A particle can hide a wrong character until it moves, so the visible
             # body is verified against the intended text once more with the latest
@@ -1816,7 +2538,7 @@ def send(
             tolerant = profile.agent == "codex"
             final_chunk = text_chunks(
                 typed,
-                TYPE_CHUNK_BYTES
+                chunk_bytes
                 - len(composer_probe_marker(typed).encode("utf-8")),
             )[-1]
             if before_submit is None or not (
@@ -1832,8 +2554,12 @@ def send(
             # Enter the ambiguous phase before Return, so an interrupt at either call
             # boundary cannot be mistaken for a safe pre-submit failure.
             phase = "submit"
+            if delivery is not None:
+                delivery.phase = phase
             type_text(sid, profile, profile.submit, window)
             phase = "accept"
+            if delivery is not None:
+                delivery.phase = phase
             accepted = wait_for_accepted(sid, profile, composed, window)
             if not accepted:
                 raise DeliveryAmbiguous(
@@ -1901,19 +2627,33 @@ def send_with_retry(
         raise KeyboardInterrupt(
             "interrupted during message normalisation; nothing was typed"
         ) from err
+    budget = TYPE_CHUNK_BYTES
     try:
         for attempt in range(1, RETRY_ATTEMPTS + 1):
+            delivery.attempt = attempt
             try:
-                return send(sid, profile, message, window, prepared, delivery)
+                return send(
+                    sid, profile, message, window, prepared, delivery, budget
+                )
             except PromptBlocked as err:
-                if err.reason == "permission_dialog":
-                    # A dialog needs the user, not another attempt.
+                if err.reason in FINAL_BLOCK_REASONS:
+                    # A dialog needs the user, and an over-long message stays
+                    # over-long: another attempt cannot fix either.
                     raise
                 if err.reason in IDENTITY_BLOCK_REASONS:
                     # A destination that stopped matching never matches
                     # again by waiting; retrying would only re-probe a
                     # pane this send must not touch.
                     raise
+                # An unrecognisable prompt is usually a terminal pane state
+                # (shell mode, a modal, a foreign status row), but one retry
+                # has caught transient redraws; after that, escalate instead
+                # of burning attempts and context.
+                if err.reason == "composer_not_recognisable" and attempt >= 2:
+                    raise PromptBlocked(
+                        f"{err} after 2 attempts; report this to the user "
+                        "once and do not build a retry loop", err.reason
+                    ) from err
                 if attempt == RETRY_ATTEMPTS:
                     raise PromptBlocked(
                         f"{err} after {RETRY_ATTEMPTS} attempts", err.reason
@@ -1926,6 +2666,12 @@ def send_with_retry(
                 )
                 time.sleep(RETRY_DELAY)
             except ComposerDirty as err:
+                if err.input_dead:
+                    # The target showed none of the typed text: it is not
+                    # reading the keyboard at all. A smaller chunk budget
+                    # cannot change that, so report it once instead of
+                    # burning attempts.
+                    raise
                 # Submit was withheld, and the structured flag says guarded
                 # cleanup provably restored the confirmed empty pre-write
                 # state, so the target is provably back where it started and
@@ -1936,10 +2682,11 @@ def send_with_retry(
                 # The send never started, so the delivery state returns to
                 # its pre-write value for the retry.
                 delivery.phase = "not_started"
+                budget = max(MIN_CHUNK_BYTES, budget // 2)
                 print(
                     f"peer-chat: attempt {attempt}/{RETRY_ATTEMPTS} failed to "
-                    f"verify but the composer was restored; retrying in "
-                    f"{RETRY_DELAY:g}s: {err}",
+                    f"verify but the composer was restored; retrying with a "
+                    f"{budget}-byte chunk budget in {RETRY_DELAY:g}s: {err}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -2059,10 +2806,14 @@ def queue_connect(create: bool = False) -> sqlite3.Connection:
             sock_ino INTEGER NOT NULL,
             sock_ctime INTEGER NOT NULL,
             agtermctl TEXT NOT NULL,
-            last_block TEXT
+            last_block TEXT,
+            diagnostic TEXT
         )
         """
     )
+    conn.execute("BEGIN IMMEDIATE")
+    if "diagnostic" not in {row[1] for row in conn.execute("PRAGMA table_info(queue)")}:
+        conn.execute("ALTER TABLE queue ADD COLUMN diagnostic TEXT")
     conn.commit()
     return conn
 
@@ -2115,6 +2866,7 @@ def queue_record_public(row) -> dict[str, Any]:
         "pane": row["pane"],
         "session": row["session"],
         "last_block": row["last_block"],
+        "diagnostic": json.loads(row["diagnostic"]) if row["diagnostic"] else None,
     }
 
 
@@ -2326,9 +3078,10 @@ def resolve_defer_target(
 ) -> tuple[str, str, str, tuple[int, int, int], str]:
     """Pin the destination observed right now: pane, token, socket, binary."""
     window, sid = resolve_target(args.session, args.window, profile)
+    require_target(sid, profile, window)
     info = find_node(sid, window)
     if profile.pane is None:
-        profile.pane = resolve_pane(info, profile)
+        profile.pane = resolve_pane(info, profile, window)
     token = (
         info.get("paneID") if profile.pane == "left" else info.get("splitPaneID")
     )
@@ -2361,18 +3114,29 @@ def classify_delivery_error(err: Exception) -> tuple[str, str]:
     if isinstance(err, PromptBlocked):
         if err.reason in IDENTITY_BLOCK_REASONS:
             return "failed", err.reason
+        if err.reason == "message_too_long":
+            # Waiting cannot make an overlong message fit.
+            return "failed", err.reason
+        # A dialog is answered by the user in that pane, so the record stays
+        # queued and goes out once the pane is ready again. A composer that
+        # is momentarily unrecognisable is the same case: a live TUI
+        # repaints, and the capture can land between two frames. The record
+        # keeps its body and the worker tries again, so a redraw does not
+        # destroy a queued message.
         return "pending", err.reason
     if isinstance(err, DeliveryAmbiguous):
         return "uncertain", "ambiguous_submit"
     if isinstance(err, ComposerDirty):
-        return "failed", "cleanup_failed"
+        # The cleanup that provably restored the empty composer means the
+        # draft is gone; the body check is what failed, not the cleanup.
+        return "failed", "body_failed" if err.cleared else "cleanup_failed"
     if isinstance(err, KeyboardInterrupt):
         return "uncertain", "interrupted"
     return "failed", "delivery_error"
 
 
-def deliver_pending_row(row) -> tuple[str, str]:
-    """One delivery attempt for a claimed row; returns (status, last_block)."""
+def deliver_pending_row(row) -> tuple[str, str, dict[str, Any] | None]:
+    """One delivery attempt with payload-free failure metadata."""
     profile = Profile(
         agent=row["agent"],
         command=row["command"],
@@ -2389,9 +3153,10 @@ def deliver_pending_row(row) -> tuple[str, str]:
     os.environ["AGTERMCTL"] = row["agtermctl"]
     os.environ["PEER_CHAT_SOCKET"] = row["socket"]
     lock_fd = acquire_target_lock(queue_dir(), row["session"], row["pane"], True)
+    progress = DeliveryProgress()
     try:
         send_with_retry(
-            row["session"], profile, row["body"], window=row["window"]
+            row["session"], profile, row["body"], window=row["window"], progress=progress
         )
     except Exception as err:  # noqa: BLE001 - classified below, never leaks message text
         status, block = classify_delivery_error(err)
@@ -2403,10 +3168,25 @@ def deliver_pending_row(row) -> tuple[str, str]:
             with open(debug_log, "a", encoding="utf-8") as fh:
                 fh.write(f"--- delivery of {row['id']} -> {status}/{block}\n")
                 traceback.print_exc(file=fh)
-        return status, block
+        causes = []
+        cause = err.__cause__
+        while cause is not None and len(causes) < 4:
+            causes.append(type(cause).__name__)
+            cause = cause.__cause__
+        diagnostic = {
+            "phase": progress.phase,
+            "exception": type(err).__name__,
+            "causes": causes,
+            "reason": block,
+            "cleanup_cleared": err.cleared if isinstance(err, ComposerDirty) else None,
+            "attempt": progress.attempt,
+        }
+        if isinstance(err, ComposerDirty) and not err.cleared and err.cleanup_reason:
+            diagnostic["cleanup_reason"] = err.cleanup_reason
+        return status, block, diagnostic
     finally:
         release_target_lock(lock_fd)
-    return "sent", ""
+    return "sent", "", None
 
 
 def run_queue_worker() -> int:
@@ -2453,7 +3233,7 @@ def run_queue_worker() -> int:
                 with coord:
                     claimed = conn.execute(
                         "UPDATE queue SET status = 'delivering', "
-                        "updated_at = ?, attempts = attempts + 1 "
+                        "updated_at = ?, attempts = attempts + 1, diagnostic = NULL "
                         "WHERE id = ? AND status = 'pending' RETURNING id",
                         (now, row["id"]),
                     ).fetchall()
@@ -2464,22 +3244,24 @@ def run_queue_worker() -> int:
                     conn.commit()
                 if not claimed:
                     continue
-                status, last_block = deliver_pending_row(row)
+                status, last_block, diagnostic = deliver_pending_row(row)
                 with coord:
                     purge_terminal_records(conn, time.time())
                     if status in TERMINAL_STATUSES:
                         conn.execute(
                             "UPDATE queue SET status = ?, body = NULL, "
-                            "updated_at = ?, last_block = ? WHERE id = ?",
-                            (status, time.time(), last_block or None, row["id"]),
+                            "updated_at = ?, last_block = ?, diagnostic = ? WHERE id = ?",
+                            (status, time.time(), last_block or None,
+                             json.dumps(diagnostic) if diagnostic else None, row["id"]),
                         )
                     else:
                         # A blocked head returns to pending with its body
                         # intact: the next pass retries the delivery.
                         conn.execute(
                             "UPDATE queue SET status = 'pending', "
-                            "updated_at = ?, last_block = ? WHERE id = ?",
-                            (time.time(), last_block or None, row["id"]),
+                            "updated_at = ?, last_block = ?, diagnostic = ? WHERE id = ?",
+                            (time.time(), last_block or None,
+                             json.dumps(diagnostic) if diagnostic else None, row["id"]),
                         )
                     conn.commit()
         # Re-check under the coordination lock so an enqueue racing this
@@ -2568,6 +3350,7 @@ def defer_message(args: argparse.Namespace, profile: Profile) -> int:
         raise KeyboardInterrupt(
             "interrupted during message normalisation; nothing was queued"
         ) from err
+    check_message_length(profile, body)
     conn = queue_connect(create=True)
     try:
         record, worker = enqueue_message(
@@ -2915,6 +3698,8 @@ def run_main(progress: DeliveryProgress) -> int:
         finally:
             conn.close()
         return 0
+    if not os.environ.get("AGTERM_SESSION_ID") or os.environ.get("AGTERM_PANE") not in ("left", "right"):
+        raise RuntimeError("sending pane identity is unavailable; nothing was typed")
     profile = target_profile(
         args.to, args.target_command, args.queue, args.pane
     )
