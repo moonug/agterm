@@ -340,7 +340,9 @@ public final class AppStore {
                                           realized: session.surface?.isRealized ?? false,
                                           context: session.context, remoteHost: session.remoteHost,
                                           splitCwd: session.hasSplit ? session.cwd(for: .right) : nil,
-                                          liveAttribution: mainAttribution?.rawValue, splitLiveAttribution: splitAttribution?.rawValue)
+                                          liveAttribution: mainAttribution?.rawValue, splitLiveAttribution: splitAttribution?.rawValue,
+                                          paneID: session.paneIdentity.uuidString,
+                                          splitPaneID: session.hasSplit ? session.splitPaneIdentity?.uuidString : nil)
             }
             return ControlWorkspaceNode(id: workspace.id.uuidString, name: workspace.name,
                                         active: workspace.id == activeWorkspaceID,
@@ -423,7 +425,7 @@ public final class AppStore {
     /// appends, else inserts at the clamped index (`0...count`), backing `--after`/`--before`. Nil if no
     /// workspace matches.
     @discardableResult
-    public func addSession(toWorkspace workspaceID: UUID, cwd: String, command: String? = nil,
+    public func addSession(toWorkspace workspaceID: UUID, cwd: String, command: String? = nil, splitCommand: String? = nil,
                            name: String? = nil, wait: Bool = false, at index: Int? = nil, select: Bool = true,
                            remoteHost: String? = nil) -> Session? {
         guard let wsIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) else { return nil }
@@ -435,6 +437,14 @@ public final class AppStore {
                               remoteHost: remoteHost)
         session.initialCommand = command
         session.commandWait = wait
+        if let splitCommand {
+            session.splitInitialCommand = splitCommand
+            session.initialSplitCwd = session.initialCwd
+            session.splitPaneIdentity = UUID()
+            session.hasSplit = true
+            session.isSplit = true
+            session.splitAxis = .leftRight
+        }
         if let index {
             let destination = max(0, min(index, workspaces[wsIndex].sessions.count))
             workspaces[wsIndex].sessions.insert(session, at: destination)

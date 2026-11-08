@@ -191,6 +191,9 @@ Run `agtermctl <area> <cmd> --help` for exact flags. Full detail in **reference.
 examples in **examples.md**; installable community workflows in **cookbook.md**.
 
 **tree** — print the workspace/session tree (`--json` for structured). Each session node carries
+`paneID`/`splitPaneID` (stable model UUIDs for the primary/split pane; the split token is omitted without
+a split). These tokens do not prove surface realization; use them to assert positional identity with guarded typing.
+Each session node also carries
 `foreground`/`splitForeground` (the live argv of each pane's foreground process, omitted when the pane
 is at its shell prompt, or running a setuid/setgid program like `top` or `sudo` whose argv macOS won't
 expose) — i.e. what each pane is currently running — `foregroundShell`/`splitForegroundShell` (the shell
@@ -227,7 +230,7 @@ turn one off. While a HUD is up the node's `overlay` reads `false` and `overlayS
 poll for "is a program covering this session" cannot mistake a message for one; HUD state is poll-only,
 no event announces it),
 `realized` (whether the session's MAIN pane has a live terminal; `false` means no shell was spawned.
-`session text` then answers `session not realized` without realizing anything; `session type` brings up a
+`session text` then answers `session not realized` without realizing anything; `session type` without `--expect-pane-id` brings up a
 restored main pane still waiting its turn in a launch that replays commands, while any other unrealized
 cause can still exhaust its poll and fail the same way. `session new` returns `ok` for a model
 entry, which is weaker — libghostty will not create a surface while the display is asleep, so a session
@@ -292,14 +295,18 @@ read the open/closed state back from the tree workspace node's `collapsed` flag,
 omitted when expanded).
 
 **session**
-- `session new [--cwd DIR] [--workspace W] [--workspace-name NAME] [--create-workspace] [--command CMD] [--wait] [--name NAME] [--after SID | --before SID] [--no-select]` —
+- `session new [--cwd DIR] [--workspace W] [--workspace-name NAME] [--create-workspace] [--command CMD] [--split-command CMD] [--wait] [--name NAME] [--after SID | --before SID] [--no-select]` —
   create (and focus) a session. Target the workspace by id/prefix (`--workspace`) OR by name
   (`--workspace-name`, mutually exclusive); add `--create-workspace` to reuse-or-create the named
   workspace when absent. `--command` runs that program as the session process instead of a login shell
   (argv-only, and with the app's GUI `PATH` — a Homebrew/non-default binary needs an absolute path or a
   `zsh -lc '…'` wrapper, else exit 127; same caveat for `session scratch --command` and `session overlay
   open` below);
-  `--wait` (with `--command`, else an error) HOLDS the session open after the command exits, showing the
+  `--split-command` requires `--command` and creates a visible right pane with an independent command
+  and identity, seeded in the same cwd as left. Both commands must be nonblank and contain no NUL.
+  This is an unreleased local extension: require `session.new.split-command` in the serving app's
+  `capabilities` from `version --socket PATH --json`, plus a CLI that supports the flag; v0.28 alone is insufficient.
+  `--wait` (with `--command`, else an error) HOLDS only the primary pane open after its command exits, showing the
   press-any-key prompt with the final output intact instead of closing (persists across restart, unlike an
   overlay's live-only wait; read back on `tree`'s `commandWait`);
   `--name` seeds the sidebar label (default: the auto basename). `--after`/`--before` place it directly
@@ -329,7 +336,7 @@ omitted when expanded).
 - Shared pane selectors accept `primary`/`left`/`top` for the primary pane and
   `split`/`right`/`bottom` for the split pane. Commands supporting scratch also accept `scratch`.
   Syntax and read-back use canonical `left`/`right`/`scratch`; the invalid-value error keeps those names.
-- `session type <text> [--stdin] [--select] [--pane left|right|scratch]` — inject keystrokes (real typing, Enter
+- `session type <text> [--stdin] [--select] [--pane left|right|scratch] [--expect-pane-id UUID]` — inject keystrokes (real typing, Enter
   included) into the main pane, the split pane with `--pane right`, or the scratch terminal (even hidden)
   with `--pane scratch`. Pass `--target "$AGTERM_SESSION_ID"` to type into YOUR session, not the user's
   active one (see Addressing). Like `session text`, every `--pane` addresses the surface UNDER a covering
@@ -340,6 +347,12 @@ omitted when expanded).
   keystroke does, under Settings ▸ Agent Status ▸ Status reset: on the first key by default, only when the
   text carries a newline under On Enter, never when Disabled; another pane's glyph, an `active` one, and an
   empty payload are left alone.
+  With `--expect-pane-id UUID`, require explicit `--pane left|right` (not scratch): the app atomically checks
+  both that positional slot and its realized surface token before delivery. A swapped/replaced pane
+  returns `pane identity mismatch`; an unrealized surface returns `session not realized`.
+  Unlike status/restore, this token asserts the slot, never redirects to its new position.
+  The guarded branch never selects, realizes or polls, even with `--select`; no-token behavior is unchanged.
+  Require the unreleased `session.type.expect-pane-id` serving-app capability and a matching native CLI.
 - `session copy` — print the session's selected text (does NOT touch the system clipboard).
 - `session paste` — paste the system clipboard into the session (the socket analogue of ⌘V; read it back with
   `session text`). `--pane left|right|scratch` picks the pane, with the usual role and position aliases;
@@ -618,7 +631,7 @@ the far side needs `agtermctl` installed by the cask or the Help action: a machi
 has no CLI an ssh command can find. Every zmx command needs a running agterm.
 
 **version** — `agtermctl version` — which agterm is serving this socket, as `result.app` (`version`, plus
-`commit` when the build recorded one). App-global: no target, no `--window`, no window need be open, so it
+`commit` when the build recorded one, and optional `capabilities`). App-global: no target, no `--window`, no window need be open, so it
 works as a preflight from a keymap-launched script, which has no `$TERM_PROGRAM_VERSION`. Address the
 socket explicitly (`--socket "$AGTERM_SOCKET"`, or `"$AGT_SOCKET"` in a keymap child): a bare call
 resolves the DEFAULT socket, which may be another app. The same identity is on the tree top level as

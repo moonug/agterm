@@ -180,6 +180,38 @@ agtermctl session new --command "zsh -lc 'htop'"     # Homebrew/non-default bina
 agtermctl session new --command "zsh -lc 'make test'" --wait   # HOLD the row open after the command exits (press any key to close) so its final output stays readable; --wait needs --command
 ```
 
+Create a paired command session without typing into either pane (unreleased local extension).
+Set `AGTERMCTL` to the matching native CLI, `SOCKET` to the explicit app socket, `WINDOW` and `SOURCE`
+to full UUIDs, `CWD` to the common directory, and `LEFT_COMMAND`/`RIGHT_COMMAND` to trusted commands.
+First inspect `result.app.capabilities`; proceed only if it contains `session.new.split-command`.
+An app labelled v0.28 without that marker is unsupported.
+
+```bash
+"$AGTERMCTL" version --socket "$SOCKET" --json
+# Only after the capability check and authorization to create the pair:
+"$AGTERMCTL" session new --command "$LEFT_COMMAND" --split-command "$RIGHT_COMMAND" \
+  --cwd "$CWD" --after "$SOURCE" --no-select --window "$WINDOW" --socket "$SOCKET" --json
+```
+
+Both panes start with the same cwd and independent identities; `--wait`, if added, holds only left.
+The returned ID is creation acknowledgement, not proof that either program is ready.
+For one-shot agent tasks, use the `agent-pair-next` cookbook recipe rather than putting task bodies in persisted commands.
+That recipe requires BOTH `session.new.split-command` and `session.type.expect-pane-id` and guards each peer-chat type call with the original peer token.
+
+For an already-running program, guarded typing asserts its original positional pane and token together.
+After verifying `session.type.expect-pane-id` with the native version preflight above, set `SESSION` to the exact
+session UUID, `PANE` to `left` or `right`, and `PANE_ID` to its original tree `paneID` or `splitPaneID`.
+With `TEXT` containing authorized input (not a launch line):
+
+```bash
+"$AGTERMCTL" session type "$TEXT" --target "$SESSION" --pane "$PANE" --expect-pane-id "$PANE_ID" \
+  --window "$WINDOW" --socket "$SOCKET" --json
+```
+
+A swap/replacement fails rather than redirecting input; do not refresh the token to bypass that failure.
+The guarded call requires a realized surface and never selects, realizes or polls, even with `--select`.
+It cannot target scratch. For agent-pair-next chat, use the generated peer-chat relay command instead of this raw CLI example.
+
 Create a session pre-named (label set at creation, no follow-up rename):
 
 ```bash

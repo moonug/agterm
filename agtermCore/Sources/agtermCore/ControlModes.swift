@@ -1,3 +1,5 @@
+import Foundation
+
 /// Host-facing `events.read` options after dispatcher validation and normalization.
 public struct ControlEventReadOptions: Equatable, Sendable {
     public let cursor: ControlEventCursor?
@@ -124,12 +126,23 @@ public enum ControlSplitResize: Equatable, Sendable {
 
 /// Host-facing `session.new` options after dispatcher-level guard validation.
 public struct ControlSessionCreateOptions: Equatable, Sendable {
+    public static func commandValidationError(command: String?, splitCommand: String?) -> String? {
+        if splitCommand != nil, command == nil { return "--split-command requires --command" }
+        for value in [command, splitCommand].compactMap({ $0 }) {
+            if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || value.contains("\0") {
+                return "commands must be nonblank and contain no NUL"
+            }
+        }
+        return nil
+    }
+
     public let window: String?
     public let cwd: String?
     public let workspace: String?
     public let workspaceName: String?
     public let createWorkspace: Bool?
     public let command: String?
+    public let splitCommand: String?
     /// Hold the surface after `--command` exits; the dispatcher rejects `--wait` without a `--command`.
     public let wait: Bool?
     public let name: String?
@@ -142,7 +155,7 @@ public struct ControlSessionCreateOptions: Equatable, Sendable {
     public let noSelect: Bool
 
     public init(window: String?, cwd: String?, workspace: String?, workspaceName: String?,
-                createWorkspace: Bool?, command: String?, wait: Bool? = nil, name: String?,
+                createWorkspace: Bool?, command: String?, splitCommand: String? = nil, wait: Bool? = nil, name: String?,
                 after: String? = nil, before: String? = nil, noSelect: Bool = false) {
         self.window = window
         self.cwd = cwd
@@ -150,6 +163,7 @@ public struct ControlSessionCreateOptions: Equatable, Sendable {
         self.workspaceName = workspaceName
         self.createWorkspace = createWorkspace
         self.command = command
+        self.splitCommand = splitCommand
         self.wait = wait
         self.name = name
         self.after = after

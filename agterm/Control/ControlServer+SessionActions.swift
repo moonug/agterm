@@ -12,6 +12,9 @@ extension ControlServer: ControlActions {
         case .failure(let response):
             return response
         case .success(let (store, id)):
+            if let expectedPaneID = options.expectedPaneID {
+                return injectGuardedText(options.text, into: id, store: store, pane: options.pane, expectedPaneID: expectedPaneID)
+            }
             return await injectText(options.text, into: id, store: store, select: options.select,
                                     pane: options.pane)
         }

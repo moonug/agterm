@@ -53,7 +53,8 @@ struct agtermApp: App {
     static let appIdentity: AppIdentity = {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
         return AppIdentity(version: version,
-                           recordedCommit: Bundle.main.infoDictionary?["GitCommit"] as? String)
+                           recordedCommit: Bundle.main.infoDictionary?["GitCommit"] as? String,
+                           capabilities: ["session.new.split-command", "session.type.expect-pane-id"])
     }()
 
     /// The version paired with agterm's `TERM_PROGRAM` identity in every spawned terminal.
@@ -383,7 +384,8 @@ struct agtermApp: App {
         let disposition = ZmxLaunch.disposition(requested: ghostty.requestedRestoreMode,
                                                 active: ghostty.launchRestoreMode, configuration: zmx)
         if disposition.backedByZmx { services.zmxForegroundResolver?.noteLifecycleChange() }
-        let view = GhosttySurfaceView(workingDirectory: session.initialCwd, fontSize: session.fontSize.map(Float.init),
+        let cwd = session.localWorkingDirectory(reported: session.effectiveCwd, homeDirectory: NSHomeDirectory())
+        let view = GhosttySurfaceView(workingDirectory: cwd, fontSize: session.fontSize.map(Float.init),
                                       env: Self.surfaceEnv(disposition: disposition, fallback: env),
                                       backedByZmx: disposition.backedByZmx)
         let provider = LaunchSeedProvider.pane(session: session, pane: .left, disposition: disposition,

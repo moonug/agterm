@@ -210,6 +210,9 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     /// `session.restore` and `session.hud.*` diverge: an unresolvable token with NO explicit `pane` errors
     /// rather than silently choosing session-wide or main placement. See `Session.paneRole(forToken:)`, #199.
     public var paneID: String?
+    /// Strict guard for `session.type`: the UUID must name the explicit `pane` slot AND its realized surface
+    /// token, never a redirect to wherever that token moved. Unlike `paneID`, a mismatch is an error.
+    public var expectedPaneID: String?
     /// Absolute primary-pane split fraction (0...1) of the pane area below the titlebar band, for
     /// `session.resize`, clamped server-side to `AppStore.splitRatioMin...splitRatioMax`. Mutually exclusive
     /// with `ratioDelta`.
@@ -247,6 +250,7 @@ public struct ControlArgs: Codable, Sendable, Equatable {
     /// The program the overlay terminal runs for `session.overlay.open` (e.g. `revdiff`); also the shell
     /// line `session.restore` pins for the next launch (mode `set` only, typed verbatim — never re-quoted).
     public var command: String?
+    public var splitCommand: String?
     /// Whether a command surface keeps its "press any key to close" prompt after the command exits instead of
     /// closing: `session.overlay.open --wait`, and `session.new --command … --wait` (the primary session
     /// surface, held via `Session.commandWait`).
@@ -348,13 +352,13 @@ public struct ControlArgs: Codable, Sendable, Equatable {
                 force: Bool? = nil, host: String? = nil,
                 noSelect: Bool? = nil,
                 text: String? = nil, select: Bool? = nil, mode: String? = nil, axis: String? = nil,
-                command: String? = nil, wait: Bool? = nil, sizePercent: Int? = nil, full: Bool? = nil,
+                command: String? = nil, splitCommand: String? = nil, wait: Bool? = nil, sizePercent: Int? = nil, full: Bool? = nil,
                 follow: Bool? = nil, message: String? = nil, detail: String? = nil, spinner: String? = nil,
                 items: [ControlPickItem]? = nil, prompt: String? = nil,
                 query: String? = nil, allowCustom: Bool? = nil,
                 buttons: [ControlAskButton]? = nil, defaultButton: String? = nil,
                 destructiveButton: String? = nil, style: String? = nil, align: String? = nil, window: String? = nil,
-                pane: String? = nil, paneID: String? = nil, to: String? = nil,
+                pane: String? = nil, paneID: String? = nil, expectedPaneID: String? = nil, to: String? = nil,
                 after: String? = nil, before: String? = nil, run: String? = nil,
                 kinds: [String]? = nil, limit: Int? = nil,
                 title: String? = nil, body: String? = nil,
@@ -382,6 +386,7 @@ public struct ControlArgs: Codable, Sendable, Equatable {
         self.mode = mode
         self.axis = axis
         self.command = command
+        self.splitCommand = splitCommand
         self.wait = wait
         self.sizePercent = sizePercent
         self.full = full
@@ -401,6 +406,7 @@ public struct ControlArgs: Codable, Sendable, Equatable {
         self.window = window
         self.pane = pane
         self.paneID = paneID
+        self.expectedPaneID = expectedPaneID
         self.to = to
         self.after = after
         self.before = before

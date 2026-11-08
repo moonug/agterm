@@ -826,7 +826,7 @@ final class ControlServer {
                              options: ControlSessionCreateOptions, at index: Int? = nil) -> ControlResponse {
         let cwd = options.cwd ?? FileManager.default.homeDirectoryForCurrentUser.path
         guard let session = store.addSession(toWorkspace: workspaceID, cwd: cwd,
-                                             command: options.command, name: options.name,
+                                             command: options.command, splitCommand: options.splitCommand, name: options.name,
                                              wait: options.wait ?? false, at: index, select: !options.noSelect) else {
             return ControlResponse(ok: false, error: "could not create session")
         }

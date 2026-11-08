@@ -96,6 +96,9 @@ public struct ControlSessionAsk: Codable, Sendable, Equatable {
 /// A session as projected into the `tree` response.
 public struct ControlSessionNode: Codable, Sendable, Equatable {
     public let id: String
+    /// Stable identities of the current pane slots, including panes not yet mounted.
+    public let paneID: String?
+    public let splitPaneID: String?
     public let name: String
     public let cwd: String
     /// The split pane's last reported or fallback directory, including hidden splits; omitted without one.
@@ -260,8 +263,11 @@ public struct ControlSessionNode: Codable, Sendable, Equatable {
                 fontSize: Double? = nil, splitFontSize: Double? = nil, scratchFontSize: Double? = nil,
                 surfaces: [ControlSurfaceNode]? = nil, realized: Bool? = nil,
                 context: String? = nil, remoteHost: String? = nil, splitCwd: String? = nil,
-                liveAttribution: String? = nil, splitLiveAttribution: String? = nil) {
+                liveAttribution: String? = nil, splitLiveAttribution: String? = nil,
+                paneID: String? = nil, splitPaneID: String? = nil) {
         self.id = id
+        self.paneID = paneID
+        self.splitPaneID = splitPaneID
         self.name = name
         self.cwd = cwd
         self.title = title

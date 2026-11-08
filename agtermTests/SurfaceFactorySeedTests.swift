@@ -35,6 +35,32 @@ final class SurfaceFactorySeedTests: XCTestCase {
         paneID: "pane"
     )
 
+    func testPairedFactoriesKeepInitialDirectoryAndIndependentSeeds() throws {
+        let workspace = store.addWorkspace(name: "pair")
+        let session = try XCTUnwrap(store.addSession(toWorkspace: workspace.id, cwd: "/pair",
+                                                     command: "left", splitCommand: "right", wait: true))
+        let primary = primarySurface(for: session)
+        XCTAssertEqual(primary.workingDirectory, "/pair")
+        XCTAssertEqual(primary.resolveLaunchSeed(), LaunchSeed(command: "left", initialInput: nil, waitAfterCommand: true))
+        session.currentCwd = "/changed"
+        let split = splitSurface(for: session)
+        XCTAssertEqual(split.workingDirectory, "/pair")
+        XCTAssertEqual(split.resolveLaunchSeed(), LaunchSeed(command: "right", initialInput: nil, waitAfterCommand: false))
+    }
+
+    func testPromotedUnmountedSplitFactoryUsesSurvivorDirectoryAndCommand() throws {
+        let workspace = store.addWorkspace(name: "pair")
+        let session = try XCTUnwrap(store.addSession(toWorkspace: workspace.id, cwd: "/pair",
+                                                     command: "left", splitCommand: "right", wait: true))
+        let identity = session.splitPaneIdentity
+        session.currentCwd = "/changed"
+        store.closePrimaryPane(session.id)
+        let promoted = primarySurface(for: session)
+        XCTAssertEqual(session.paneIdentity, identity)
+        XCTAssertEqual(promoted.workingDirectory, "/pair")
+        XCTAssertEqual(promoted.resolveLaunchSeed(), LaunchSeed(command: "right", initialInput: nil, waitAfterCommand: false))
+    }
+
     func testWrappedPrimaryConsumesReplayOnceWithoutTouchingStickyOverride() throws {
         let session = restoredSession()
         session.pendingForegroundCommand = ["/usr/bin/tail", "-f", "/tmp/log file"]
