@@ -141,6 +141,60 @@ final class SidebarCopyNameTests: XCTestCase {
         XCTAssertEqual(NSPasteboard.general.string(forType: .string), "keep me")
     }
 
+    func testCopyIDFollowsCopyNameAndCopiesTheClickedSessionsID() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let ws = try XCTUnwrap(store.workspaces.first)
+        let active = try XCTUnwrap(store.activeSession)
+        let other = try XCTUnwrap(store.addSession(toWorkspace: ws.id, cwd: "/tmp/other"))
+        store.selectSession(active.id)
+        buildSidebar(for: store)
+
+        let row = try XCTUnwrap(rowIndex { $0.kind == .session && $0.id == other.id })
+        let menu = try XCTUnwrap(coordinator.menu(forRow: row))
+        let nameIndex = try XCTUnwrap(menu.items.firstIndex { $0.title == "Copy Name" })
+        let idIndex = try XCTUnwrap(menu.items.firstIndex { $0.title == "Copy ID" })
+        XCTAssertEqual(idIndex, nameIndex + 1)
+
+        let item = menu.items[idIndex]
+        coordinator.perform(item.action, with: item)
+        XCTAssertEqual(NSPasteboard.general.string(forType: .string), other.id.uuidString,
+                       "the clicked row's id, not the active session's")
+    }
+
+    func testCopyIDIsAbsentForBatchesAndWorkspaceRows() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let ws = try XCTUnwrap(store.workspaces.first)
+        let first = try XCTUnwrap(store.addSession(toWorkspace: ws.id, cwd: "/tmp/one"))
+        let second = try XCTUnwrap(store.addSession(toWorkspace: ws.id, cwd: "/tmp/two"))
+        store.selectSession(first.id)
+        store.setSidebarSelection([first.id, second.id])
+        buildSidebar(for: store)
+
+        let sessionRow = try XCTUnwrap(rowIndex { $0.kind == .session && $0.id == first.id })
+        let sessionMenu = try XCTUnwrap(coordinator.menu(forRow: sessionRow))
+        XCTAssertTrue(sessionMenu.items.contains { $0.title == "Close 2 Sessions" },
+                      "the batch must have formed, or the absence below proves nothing")
+        XCTAssertFalse(sessionMenu.items.contains { $0.title == "Copy ID" })
+
+        let workspaceRow = try XCTUnwrap(rowIndex { $0.kind == .workspace && $0.id == ws.id })
+        let workspaceMenu = try XCTUnwrap(coordinator.menu(forRow: workspaceRow))
+        XCTAssertFalse(workspaceMenu.items.contains { $0.title == "Copy ID" })
+    }
+
+    func testAVanishedSessionLeavesTheClipboardAloneForCopyID() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let ws = try XCTUnwrap(store.workspaces.first)
+        let doomed = try XCTUnwrap(store.addSession(toWorkspace: ws.id, cwd: "/tmp/doomed"))
+        buildSidebar(for: store)
+        let item = try menuItem(titled: "Copy ID", onRowFor: doomed.id)
+        store.closeSession(doomed.id)
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("keep me", forType: .string)
+        coordinator.perform(item.action, with: item)
+        XCTAssertEqual(NSPasteboard.general.string(forType: .string), "keep me")
+    }
+
     // MARK: - Helpers
 
     private func invokeCopyName(onRowFor sessionID: UUID) throws {

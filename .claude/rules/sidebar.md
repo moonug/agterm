@@ -90,7 +90,9 @@ paths:
   clear-status, and mark-for-attention operate on all targets.
 - Copy Name writes `Session.displayName`, or the workspace name, to `NSPasteboard.general`. A blank
   workspace name and a vanished row both count as absent, and nothing to copy leaves the pasteboard
-  untouched rather than clearing it. No control form — see `control-api.md`.
+  untouched rather than clearing it. Copy ID follows it on a single session row and writes that
+  session's full UUID, the same id control `--target` takes; a vanished row leaves the pasteboard alone.
+  No control form — see `control-api.md`.
 - Rename, Copy Name, Duplicate Session, New Companion, Duplicate as Companion, Convert to Companion, and Reveal in
   Finder appear only for one target. Duplicate as Companion is omitted on a page row; Convert to Companion is omitted
   on a companion row and disabled on a remote one. Duplicate inserts a fresh

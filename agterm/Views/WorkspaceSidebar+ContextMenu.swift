@@ -99,6 +99,13 @@ extension WorkspaceSidebar.Coordinator {
             menu.addItem(copyName)
         }
 
+        if node.kind == .session, sessionCount == 1 {
+            let copyID = NSMenuItem(title: "Copy ID", action: #selector(menuCopyID(_:)), keyEquivalent: "")
+            copyID.target = self
+            copyID.representedObject = node
+            menu.addItem(copyID)
+        }
+
         switch node.kind {
         case .session:
             // "Duplicate Session" opens a fresh shell in this session's directory, right after it.
@@ -264,6 +271,15 @@ extension WorkspaceSidebar.Coordinator {
         guard let name else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(name, forType: .string)
+    }
+
+    /// Copies the clicked session's stable UUID — the id `agtermctl tree` reports and `--target` takes — to the
+    /// general pasteboard.
+    @objc private func menuCopyID(_ sender: NSMenuItem) {
+        guard let node = sender.representedObject as? SidebarNode,
+              let session = store.session(withID: node.id) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(session.id.uuidString, forType: .string)
     }
 
     @objc private func menuMove(_ sender: NSMenuItem) {
