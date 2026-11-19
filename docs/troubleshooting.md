@@ -136,7 +136,7 @@ Reload with **File ▸ Reload Config** or `agtermctl config reload`. The keybind
 - **Agent-status glyph does not update.** Install the hooks from Help ▸ Install Agent Status Hooks…. For shell-integrated agents, start a fresh shell so the `source` line added to your shell rc takes effect. For Pi, restart it or run `/reload` so it loads `~/.pi/agent/extensions/agterm-status.ts`; Pi status is only installed when `~/.pi/agent` already exists. For OpenCode, re-run the installer after switching majors, then restart OpenCode. V1 uses `~/.config/opencode`; v2 respects the login shell's `OPENCODE_CONFIG_DIR` and `XDG_CONFIG_HOME`. See the [OpenCode installation guide](https://agterm.com/docs#status) for paths, version selection, and v1 cleanup. The v2 plugin reports the CLI's selected session and its descendants, not background tabs or headless runs. The hooks call `agtermctl session status`, so `agtermctl` must resolve first (see above).
 - **Agent-status glyph updates the wrong session.** One session's glyph blinks while the work happens in another — typically when agents run inside tmux (or a tmux-backed session manager such as agent-deck). The working process inherited another session's `AGTERM_SESSION_ID`: the status hooks target whatever id is in their environment, and a long-lived daemon started from inside an agterm session (a tmux server is the usual carrier) captures that session's `AGTERM_*` variables into its global environment and passes them to every child it ever creates. Check `tmux show-environment -g | grep AGTERM` — if present, clear them with `tmux set-environment -g -r AGTERM_SESSION_ID` (and the other `AGTERM_*` names), then restart the affected panes. To avoid it, start such daemons with the variables scrubbed (`env -u AGTERM_SESSION_ID … <command>`) or from a terminal outside agterm.
 - **Codex status lands on another session, or on none.** By default, Codex 0.160.1 CLI sessions share a background app-server daemon, started by the first `codex` that needs it. The server launches hooks using its inherited environment, so every daemon-backed session reports to the session that started the server, or to none when the server was started outside agterm or that session has since closed. Scrubbing the variables prevents wrong-session updates but does not restore status reporting. Run `codex --no-daemon` to keep the session and its hooks in its own process; that running session is unavailable for control through the shared server from the Codex desktop or mobile app. To make that the default for plain `codex`, run `codex features disable daemon_auto_start` once, then `codex app-server daemon stop`; later plain launches start no shared daemon and report to their own session. Disabling auto-start alone still joins a daemon that is already running, and stopping it disconnects the CLI sessions attached to it. A daemon-backed conversation can stay locked after its TUI exits: if `codex --no-daemon resume <id>` shows "This conversation is open in another app", stop the shared daemon and press R to retry. agterm has no automatic mapping from the hook payload's Codex session id to the pane displaying it.
-- **Claude Code background sessions have no status.** A session started with `claude --bg` runs under Claude Code's supervisor, which does not pass the launching pane's `AGTERM_*` variables, so its status hooks find no session and exit quietly. `--settings` carries over into a background session and its hooks inherit the `env` block, so pass the variables there. With the hooks installed, launch from the pane that should show the status:
+- **Claude Code background session status lands on another session, or on none.** A session started with `claude --bg` or from `claude agents` runs under Claude Code's supervisor, which starts on demand from the first shell that needs it. By default the session can inherit `AGTERM_*` from that supervisor rather than the pane that launched or shows it, so its status hooks can report to the session that started the supervisor, or exit quietly if the supervisor has no session id. `--settings` carries over into a background session, and its `env` block reaches both the session and its hooks, so `cbg` explicitly passes the launch session, socket and pane. With the hooks installed, launch from the pane that should show the status:
 
   ```bash
   cbg() {
@@ -148,7 +148,7 @@ Reload with **File ▸ Reload Config** or `agtermctl config reload`. The keybind
   cbg "your prompt"
   ```
 
-  The status stays with the launching pane; `claude attach` from another pane does not move it. Verified hook routing with Claude Code 2.1.311.
+  The status stays with the launching pane; `claude attach` from another pane does not move it. `cbg` does not set `AGTERM_WINDOW_ID` or `AGTERM_WORKSPACE_ID`. On Claude Code 2.1.327, the four `cbg` values reached the Bash tool and a Stop hook.
 
 ## Every session restores to the directory it was created in
 
@@ -343,8 +343,9 @@ the pane becomes `orphaned`; the same happens to panes whose session host dies. 
 `orphaned` pane remain responsible for themselves until the pane is replaced. Restarting agterm does not
 repair this.
 
-Agterm ▸ Reset Live Sessions… replaces every `orphaned` and `app` pane at once, and every pane whose daemon
-was created before the recorded first launch with this zmx build, whatever its attribution. The dialog says how many
+Agterm ▸ Reset Live Sessions… replaces every `orphaned` and `app` pane at once, every pane whose daemon
+was created before the recorded first launch with this zmx build, whatever its attribution, and every
+`supervisor` pane whose session host is from an earlier agterm build or login. The dialog says how many
 live sessions it resets; on Reset, agterm quits, ends those sessions' processes at the next launch and
 reopens itself with the same sessions and layout, starting each captured command again where possible.
 Other work running in those sessions stops, and agent conversations may need to be resumed by hand.
@@ -357,6 +358,38 @@ System Settings ▸ Privacy & Security ▸ Full Disk Access; the
 [folder-access section](#a-command-cannot-read-downloads-desktop-or-documents) explains the scope of that grant.
 Full Disk Access does not grant the microphone. Its permission is controlled separately under
 System Settings ▸ Privacy & Security ▸ Microphone.
+
+## A live session started before an update or a logout cannot reach the local network
+
+A command in a live session fails to reach a host on your network (`No route to host`, `EHOSTUNREACH`)
+while the same command works in a new session, or, after macOS forced a logout, a command in an older
+session reports `No user exists for uid 501`.
+
+A live session whose pane reads `supervisor` was started through a small helper process, the session
+host, and stays tied to the host that started it. Since [#971](https://github.com/umputun/agterm/issues/971)
+a changed helper build or a new login gets its own host, so new sessions always start under the current
+one; a session that was already running keeps its earlier host, because macOS cannot move a running
+process to another.
+
+`agtermctl tree --json` marks such a pane with `liveHostStale` (or `splitLiveHostStale`). Agterm ▸ Reset
+Live Sessions… moves those sessions to the current host, as described in the previous section. At every
+launch agterm asks each earlier host to stop, and one stops once no live session runs under it. The single
+shared host that agterm used before #971 counts as an earlier host.
+
+## Live sessions close when macOS force-quits a program started in one
+
+About 30 seconds after a GUI program starts from a live session, macOS force-quits it, and live sessions
+close with it. This happens when the program is switched off in the Allow in the Background list under
+System Settings ▸ General ▸ Login Items, and agterm was quit and opened again since those sessions started.
+
+macOS ends such a program together with the group of processes it was started in. A session host started
+from an earlier run of agterm put its sessions in that run's group
+([#985](https://github.com/umputun/agterm/issues/985)). On macOS 27 and later agterm starts the session host
+as its own background job, so the force-quit reaches only the program. Sessions under a host started by an
+earlier agterm build stay exposed until Agterm ▸ Reset Live Sessions… moves them. When macOS refuses to start
+the host as a job, agterm starts it the earlier way and logs `session host job ... failed` under the
+`com.umputun.agterm` subsystem; sessions under that host stay exposed, and a reset does not move them.
+Switching the program on in Allow in the Background stops the force-quit in every case.
 
 ## Reporting a problem
 

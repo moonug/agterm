@@ -120,7 +120,7 @@ extension Msg {
             let rejected = reply.response.result?.rejected ?? []
             if json { return MessageOutput(stdout: reply.line + "\n", failed: !rejected.isEmpty) }
             return MessageOutput(stdout: (reply.response.result?.messageID ?? "") + "\n",
-                                 stderr: rejected.map { "rejected \($0.address): \($0.reason.rawValue)\n" }.joined(),
+                                 stderr: rejected.map { "rejected \($0.address): \($0.detail ?? $0.reason.rawValue)\n" }.joined(),
                                  failed: !rejected.isEmpty)
         }
     }
@@ -166,7 +166,7 @@ extension Msg {
             let watchdog = timeout.map { seconds in
                 SessionWaitWatchdog(seconds: seconds) {
                     Self.reportTimeout()
-                    Darwin.exit(Self.timeoutExitCode)
+                    Foundation.exit(Self.timeoutExitCode)
                 }
             }
             defer { watchdog?.cancel() }

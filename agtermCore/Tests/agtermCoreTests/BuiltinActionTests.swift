@@ -43,10 +43,11 @@ struct BuiltinActionTests {
         #expect(BuiltinAction.previousWindow.rawValue == "previous_window")
         #expect(BuiltinAction.nextWindow.rawValue == "next_window")
         #expect(BuiltinAction.attachRemote.rawValue == "attach_remote")
+        #expect(BuiltinAction.newRemoteSession.rawValue == "new_remote_session")
         #expect(BuiltinAction.editFlaggedSessions.rawValue == "edit_flagged_sessions")
         #expect(BuiltinAction.editFocusedWorkspaces.rawValue == "edit_focused_workspaces")
         #expect(BuiltinAction.openLinkAtCursor.rawValue == "open_link_at_cursor")
-        #expect(BuiltinAction.allCases.count == 56)
+        #expect(BuiltinAction.allCases.count == 59)
     }
 
     @Test func rejectsUnknownName() {
@@ -144,6 +145,9 @@ struct BuiltinActionTests {
             .showAttention: Chord(mods: [.control, .shift], key: "i"),
             .dashboard: Chord(mods: [.command, .shift], key: "g"),
             .attachRemote: Chord(mods: [.command, .shift], key: "r"),
+            .openRemoteWindow: nil,
+            .detachedSessions: nil,
+            .newRemoteSession: nil,
             .editFlaggedSessions: nil,
             .editFocusedWorkspaces: nil,
         ]
@@ -205,7 +209,8 @@ struct BuiltinActionTests {
             .convertCompanion,
             .clearStatus, .firstSession, .lastSession, .selectTheme, .toggleFlaggedView, .focusWorkspace,
             .toggleWorkspaceFilter, .previousWorkspace, .nextWorkspace, .toggleWorkspaceCollapse,
-            .previousWindow, .nextWindow, .editFlaggedSessions, .editFocusedWorkspaces, .openLinkAtCursor,
+            .previousWindow, .nextWindow, .editFlaggedSessions, .editFocusedWorkspaces, .openRemoteWindow, .detachedSessions,
+            .newRemoteSession, .openLinkAtCursor,
         ]
         for action in keyless {
             #expect(action.defaultChord == nil, "expected nil default for \(action.rawValue)")

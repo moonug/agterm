@@ -15,6 +15,7 @@ public enum ControlEventKind: String, Codable, CaseIterable, Sendable, Equatable
     case remoteClosed = "remote.closed"
     case appLaunched = "app.launched"
     case message
+    case openerRun = "opener.run"
 }
 
 /// Kind-specific event data. Optional fields keep the encoded payload compact while preserving one
@@ -46,12 +47,22 @@ public struct ControlEventPayload: Codable, Sendable, Equatable {
     public var from: String?
     /// The `message` event's message id; the body is never carried.
     public var messageID: String?
+    /// The `remote.opened` / `remote.closed` row's session id on its origin, the id `zmx attach` takes.
+    public var remoteSessionID: String?
+    /// The `opener.run` file the rule's command received.
+    public var path: String?
+    /// The `opener.run` rule's selector list as `keymap.conf` wrote it.
+    public var selector: String?
 
     public init(name: String? = nil, status: String? = nil, pane: String? = nil,
                 blink: Bool? = nil, color: String? = nil, shape: String? = nil,
                 previous: String? = nil, title: String? = nil, body: String? = nil,
                 host: String? = nil, paneID: String? = nil, parent: String? = nil,
-                from: String? = nil, messageID: String? = nil) {
+                from: String? = nil, messageID: String? = nil, remoteSessionID: String? = nil,
+                path: String? = nil, selector: String? = nil) {
+        self.remoteSessionID = remoteSessionID
+        self.path = path
+        self.selector = selector
         self.parent = parent
         self.from = from
         self.messageID = messageID
@@ -205,12 +216,12 @@ public final class ControlEventRing {
         guard let cursor else { return .batch(anchor) }
         guard cursor.run == runID else { return .failure(.runChanged, anchor: anchor) }
         guard cursor.after <= currentSequence else { return .failure(.cursorAhead, anchor: anchor) }
-        if let oldest = entries.first?.seq, cursor.after < oldest - 1 {
-            return .failure(.cursorExpired, anchor: anchor)
-        }
+        guard cursor.after < currentSequence, let oldest = entries.first?.seq else { return .batch(anchor) }
+        guard cursor.after >= oldest - 1 else { return .failure(.cursorExpired, anchor: anchor) }
 
+        // subtract the boundary first to avoid UInt64 underflow at after == oldest - 1
         var items: [ControlEvent] = []
-        for event in entries where event.seq > cursor.after {
+        for event in entries[Int(cursor.after - (oldest - 1))...] {
             guard kinds == nil || kinds!.contains(event.kind) else { continue }
             items.append(event)
             if items.count == limit {
@@ -218,5 +229,15 @@ public final class ControlEventRing {
             }
         }
         return .batch(ControlEventBatch(run: runID, next: currentSequence, items: items))
+    }
+
+    /// readResponse is `read` as the `events.read` reply: a failure still carries the anchor to resume from.
+    public func readResponse(_ options: ControlEventReadOptions) -> ControlResponse {
+        switch read(cursor: options.cursor, kinds: options.kinds, limit: options.limit) {
+        case .batch(let batch):
+            return ControlResponse(ok: true, result: ControlResult(events: batch))
+        case .failure(let error, let anchor):
+            return ControlResponse(ok: false, result: ControlResult(events: anchor), error: error.rawValue)
+        }
     }
 }

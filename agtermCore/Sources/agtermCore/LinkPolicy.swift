@@ -68,15 +68,26 @@ public enum LinkPolicy {
     /// markdownExtensions lists the local file extensions rendered as Markdown.
     public static let markdownExtensions: Set<String> = ["md", "markdown"]
 
-    /// Whether a web view of this app can load plain http from `host`. The app allows local networking
-    /// only, and App Transport Security reads "local" off the host's SYNTAX, never off where it resolves:
-    /// an unqualified name, a `.local` name, or an IP literal, a public one included.
+    /// loadsPlainHTTP says whether a web view of this app can load plain http from `host`: an unqualified or
+    /// `.local` name, or a loopback, private or link-local IP literal. ATS can refuse any other literal, even
+    /// one reached through a tunnel, so those open in the browser.
     static func loadsPlainHTTP(host: String) -> Bool {
         let host = normalizedHost(host)
         guard !host.isEmpty else { return false }
         if host.hasSuffix(".local") || !host.contains(where: { $0 == "." || $0 == ":" }) { return true }
-        var v4 = in_addr(), v6 = in6_addr()
-        return inet_pton(AF_INET, host, &v4) == 1 || inet_pton(AF_INET6, host, &v6) == 1
+        var v4 = in_addr()
+        if inet_pton(AF_INET, host, &v4) == 1 {
+            let b = withUnsafeBytes(of: v4) { Array($0) }
+            switch (b[0], b[1]) {
+            case (127, _), (10, _), (172, 16...31), (192, 168), (169, 254): return true
+            default: return false
+            }
+        }
+        var v6 = in6_addr()
+        guard inet_pton(AF_INET6, host, &v6) == 1 else { return false }
+        let b = withUnsafeBytes(of: v6) { Array($0) }
+        let loopback = b.dropLast().allSatisfy { $0 == 0 } && b[15] == 1
+        return loopback || b[0] & 0xfe == 0xfc || (b[0] == 0xfe && b[1] & 0xc0 == 0x80)
     }
 
     /// Whether a session web overlay can show `url`: https, or plain http from a host `loadsPlainHTTP`
@@ -120,15 +131,17 @@ public enum LinkPolicy {
         /// forwardRemote hands a path clicked in a pane attached from another Mac, as typed, to that Mac, which
         /// resolves and opens it; this Mac never reads or reveals it.
         case forwardRemote(String, session: UUID)
+        /// selectSession selects the row a session link names, read in the clicked pane's namespace.
+        case selectSession(UUID)
         case ignore
 
         /// localFile is the file a local route names, which a reveal chord selects in Finder instead; nil for a
-        /// web route, a forwarded one and an ignored link.
+        /// web route, a forwarded one, a session link and an ignored link.
         public var localFile: URL? {
             switch self {
             case .image(let url, _), .markdown(let url, _, _), .document(let url, _, _), .reveal(let url): return url
             case .text(let link): return link.url
-            case .browser, .overlay, .forwardRemote, .ignore: return nil
+            case .browser, .overlay, .forwardRemote, .selectSession, .ignore: return nil
             }
         }
     }
@@ -179,11 +192,18 @@ public enum LinkPolicy {
     /// deliberately unlisted, backing every real file. The path must already be dot-normalized.
     static func isAutomountPath(_ path: String) -> Bool {
         let lower = path.lowercased()
-        return ["/net", "/network", "/home",
-                "/system/volumes/data/home",
-                "/system/volumes/data/net",
-                "/system/volumes/data/network/servers"].contains { lower == $0 || lower.hasPrefix($0 + "/") }
+        return automountRoots.contains { lower == $0 || lower.hasPrefix($0 + "/") }
     }
+
+    // /home is auto_home only on macOS; on Linux it holds every user's files
+    private static let automountRoots: [String] = {
+        var roots = ["/net", "/network", "/system/volumes/data/home", "/system/volumes/data/net",
+                     "/system/volumes/data/network/servers"]
+        #if os(macOS)
+        roots.append("/home")
+        #endif
+        return roots
+    }()
 
     /// Collapse `.`/`..` in an ABSOLUTE path with a purely LEXICAL, string-only normalizer — no filesystem
     /// access (unlike `URL.standardizedFileURL`, which stats the target) and no symlink resolution, so the
@@ -289,6 +309,45 @@ public enum LinkPolicy {
         return found
     }
 
+    /// candidateNames lists the file names a link clicked in a remote pane may resolve to on its origin: the last
+    /// component of the literal path and of each spelling `locations` would try, with any `:line` suffix also split
+    /// off. Empty for a link naming no file. The origin's resolution picks one of them, which is what a viewer checks
+    /// a returned snapshot's name against.
+    public static func candidateNames(for raw: String) -> [String] {
+        guard forwardsRemotely(raw) else { return [] }
+        let path: String
+        if isBarePath(raw) || isRelativeSpelling(raw) {
+            path = raw
+        } else if let url = URL(string: raw) {
+            path = url.path(percentEncoded: false)
+        } else {
+            return []
+        }
+        var names: [String] = []
+        let add = { (spelling: String) in
+            let name = String(spelling.reversed().prefix { $0 != "/" }.reversed())
+            if !name.isEmpty, name != ".", name != "..", !names.contains(name) { names.append(name) }
+        }
+        for spelling in [path] + trimmedSpellings(path) {
+            add(spelling)
+            if let suffix = lineSuffix(spelling) { add(suffix.path) }
+        }
+        return names
+    }
+
+    /// previewBytes is the byte cap of the page a file named `name` opens as, nil for a file no page shows; it also caps
+    /// a remote snapshot.
+    public static func previewBytes(forFileName name: String) -> Int? {
+        guard !name.contains("/") else { return nil }
+        switch localPath("/" + name) {
+        case .image: return ImagePage.maxBytes
+        case .markdown: return MarkdownPage.maxBytes
+        case .document: return DocumentPage.maxBytes
+        case .text: return TextPage.maxBytes
+        case .open, .reveal, .ignore: return nil
+        }
+    }
+
     /// trailingPunctuation ends a sentence after a printed path; libghostty's path rule keeps it in the link.
     /// A comma or a closing bracket already ends the link, and a detected one never ends in a colon.
     static let trailingPunctuation: Set<Character> = [".", "?", "!", ";"]
@@ -364,6 +423,24 @@ public enum LinkPolicy {
         case normal, browser, reveal
     }
 
+    /// ClickSource says what produced an opened link. `detected` is text libghostty recognized as a link and the
+    /// user clicked; `osc8` is a hyperlink whose target the printing program chose and the screen need not show;
+    /// `other` is anything else: a detected link opened outside a mouse release, or a kind this build does not know.
+    public enum ClickSource: Equatable, Sendable {
+        case detected, osc8, other
+    }
+
+    /// openerFile is the file a user `open` rule may take for a click: a detected link clicked with the plain chord
+    /// whose route opens a built-in page. nil leaves the click to its route.
+    public static func openerFile(for route: Route, source: ClickSource, intent: ClickIntent) -> URL? {
+        guard source == .detected, intent == .normal else { return nil }
+        switch route {
+        case .image(let url, _), .markdown(let url, _, _), .document(let url, _, _): return url
+        case .text(let link): return link.url
+        case .browser, .overlay, .reveal, .forwardRemote, .selectSession, .ignore: return nil
+        }
+    }
+
     /// clickIntent reads a link click's chord. ⌘⇧ asks for the browser over an overlay setting, except under
     /// mouse capture, where ⌘⇧ is the only link click and so follows the setting. ⌘⌥ reveals a local path in
     /// Finder from any origin; under capture, where Shift is the bypass, ⌘⌥⇧ does.
@@ -383,7 +460,8 @@ public enum LinkPolicy {
         clickIntent(modifiers: modifiers, mode: mode, origin: origin, mouseCaptured: mouseCaptured) == .browser
     }
 
-    /// Maps a raw link to its route: `disposition` decides first. A web link the overlay can show
+    /// Maps a raw link to its route: a session link (`sessionLink`) decides first, then remote forwarding, then
+    /// `disposition`. A web link the overlay can show
     /// (`overlayCanShow`), clicked in a pane or the scratch terminal, goes to that session's overlay at the
     /// mode's size when `mode` is an overlay one; an image from there shows over the session in every mode, and a
     /// markdown or HTML file renders there at the mode's size, 95% in browser mode, since a browser would get the raw file.
@@ -391,8 +469,22 @@ public enum LinkPolicy {
     /// local file. Whether the overlay is free right now is the caller's check.
     public static func route(for raw: String, mode: LinkOpenMode, origin: ClickOrigin,
                              localHosts: Set<String> = localHostNames, home: String = NSHomeDirectory()) -> Route {
+        if let id = sessionLink(raw) {
+            switch origin {
+            case .pane, .remotePane, .scratch: return .selectSession(id)
+            case .hud, .programOverlay, .quick: return .ignore
+            }
+        }
         if case .remotePane(let session) = origin, forwardsRemotely(raw) { return .forwardRemote(raw, session: session) }
         return route(disposition(for: raw, localHosts: localHosts, home: home), mode: mode, origin: origin)
+    }
+
+    private static let sessionLinkPrefix = "agterm://session/"
+
+    /// sessionLink accepts only the raw session authority and a hyphenated UUID, without URL normalization.
+    public static func sessionLink(_ raw: String) -> UUID? {
+        guard raw.count == sessionLinkPrefix.count + 36, raw.prefix(sessionLinkPrefix.count).lowercased() == sessionLinkPrefix else { return nil } // 36: a hyphenated UUID
+        return UUID(uuidString: String(raw.dropFirst(sessionLinkPrefix.count)))
     }
 
     /// Maps a location `locations` offered, and the caller found on disk, to its route by the same origin rules.

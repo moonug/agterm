@@ -137,13 +137,13 @@ extension AppActions {
         guard session.remotePresentation?.statusOwnerUnknown != true else { focusActiveSession(); return }
         let pane = indicator.statusPane
         // a shown scratch masks a non-scratch block; overlays are deliberately left alone.
-        if pane != .scratch, session.scratchActive { store?.toggleScratch(session.id) }
+        if pane != .scratch, session.scratchActive, let store { setScratchShown(false, of: session, in: store) }
         switch pane {
         case .right where session.splitSurface != nil:
             session.splitFocused = true
             focusSplitPane(session, wantSplit: true)
         case .scratch:
-            if !session.scratchActive { store?.toggleScratch(session.id) }
+            if !session.scratchActive, let store { setScratchShown(true, of: session, in: store) }
             focusActiveSession()
         case .left, .right, .none:
             session.splitFocused = false
@@ -161,6 +161,31 @@ extension AppActions {
     /// is not the active one so `store` resolves there. A raise that fails (the window still attaching)
     /// drops the pick as a window step does.
     func selectAttention(windowID: WindowInfo.ID, sessionID: UUID) {
+        raiseAndSelect(windowID: windowID, sessionID: sessionID) { revealActiveBlockedPane(captured: $0) }
+    }
+
+    /// followSessionLink selects in the clicked pane's namespace and focuses without revealing a pane.
+    func followSessionLink(_ id: UUID, from origin: LinkPolicy.ClickOrigin, pane: UUID?) {
+        guard let target = library.sessionLinkTarget(id, from: origin, pane: pane) else { return }
+        raiseAndSelect(windowID: target.windowID, sessionID: target.sessionID) { _ in focusActiveSession() }
+    }
+
+    /// openSessionLink selects a session link another app opened, by this instance's row id. Returns false while
+    /// the row or its window is still loading, so the delegate retries; a refused link is settled.
+    func openSessionLink(_ id: UUID) -> Bool {
+        let owners = library.openIDs().filter { library.store(for: $0)?.session(withID: id) != nil }
+        guard owners.count < 2 else { return true }
+        guard let windowID = owners.first, WindowRegistry.shared.isRegistered(windowID) else { return false }
+        guard canSelectAttention(windowID: windowID, sessionID: id) else { return true }
+        NSApp.activate()
+        // raiseAndSelect skips the raise for the active window, which an outside click can find minimized
+        guard WindowRegistry.shared.raise(windowID) else { return false }
+        takeFrontmost(windowID)
+        raiseAndSelect(windowID: windowID, sessionID: id) { _ in focusActiveSession() }
+        return true
+    }
+
+    private func raiseAndSelect(windowID: WindowInfo.ID, sessionID: UUID, focus: (AgentIndicator?) -> Void) {
         guard canSelectAttention(windowID: windowID, sessionID: sessionID),
               let target = library.store(for: windowID) else { return }
         if windowID != library.activeWindowID {
@@ -169,7 +194,7 @@ extension AppActions {
         }
         target.noteUserActivity()
         let indicator = target.selectSession(sessionID)
-        revealActiveBlockedPane(captured: indicator)
+        focus(indicator)
     }
 
     /// revealRestoredWindow fronts the window a recent-closed reopen restored into. It publishes the id

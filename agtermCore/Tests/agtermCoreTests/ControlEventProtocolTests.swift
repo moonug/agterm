@@ -24,9 +24,9 @@ struct ControlEventProtocolTests {
             ControlEvent(seq: 8, ts: 8.5, kind: .status, window: "win", workspace: "work", session: "sess",
                          payload: ControlEventPayload(name: "api", status: "blocked", previous: "active")),
             ControlEvent(seq: 9, ts: 9.5, kind: .remoteOpened, window: "win", workspace: "work", session: "sess",
-                         payload: ControlEventPayload(name: "far", host: "buildbox")),
+                         payload: ControlEventPayload(name: "far", host: "buildbox", remoteSessionID: "r1")),
             ControlEvent(seq: 10, ts: 10.5, kind: .remoteClosed, window: "win", workspace: "work", session: "sess",
-                         payload: ControlEventPayload(name: "far", host: "buildbox")),
+                         payload: ControlEventPayload(name: "far", host: "buildbox", remoteSessionID: "r1")),
             ControlEvent(seq: 11, ts: 11.5, kind: .sessionSelected, window: "win", workspace: "work", session: "sess",
                          payload: ControlEventPayload(name: "api", previous: "before")),
             ControlEvent(seq: 12, ts: 12.5, kind: .appLaunched),
@@ -34,6 +34,9 @@ struct ControlEventProtocolTests {
                          payload: ControlEventPayload(name: "api", pane: "right", paneID: "tok")),
             ControlEvent(seq: 14, ts: 14.5, kind: .message, window: "win", workspace: "work", session: "sess",
                          payload: ControlEventPayload(name: "api", paneID: "tok", from: "S:Q", messageID: "m1")),
+            ControlEvent(seq: 15, ts: 15.5, kind: .openerRun, window: "win", workspace: "work", session: "sess",
+                         payload: ControlEventPayload(name: "api", pane: "left", host: "box",
+                                                      path: "/a.md", selector: "*.md")),
         ]
 
         let data = try JSONEncoder().encode(events)
@@ -65,9 +68,9 @@ struct ControlEventProtocolTests {
             ControlEvent(seq: 8, ts: 8.5, kind: .status, window: "win", workspace: "work", session: "sess",
                          payload: ControlEventPayload(name: "api", status: "blocked", previous: "active")),
             ControlEvent(seq: 9, ts: 9.5, kind: .remoteOpened, window: "win", workspace: "work", session: "sess",
-                         payload: ControlEventPayload(name: "far", host: "buildbox")),
+                         payload: ControlEventPayload(name: "far", host: "buildbox", remoteSessionID: "r1")),
             ControlEvent(seq: 10, ts: 10.5, kind: .remoteClosed, window: "win", workspace: "work", session: "sess",
-                         payload: ControlEventPayload(name: "far", host: "buildbox")),
+                         payload: ControlEventPayload(name: "far", host: "buildbox", remoteSessionID: "r1")),
             ControlEvent(seq: 11, ts: 11.5, kind: .sessionSelected, window: "win", workspace: "work", session: "sess",
                          payload: ControlEventPayload(name: "api", previous: "before")),
             ControlEvent(seq: 12, ts: 12.5, kind: .appLaunched),
@@ -75,6 +78,9 @@ struct ControlEventProtocolTests {
                          payload: ControlEventPayload(name: "api", pane: "right", paneID: "tok")),
             ControlEvent(seq: 14, ts: 14.5, kind: .message, window: "win", workspace: "work", session: "sess",
                          payload: ControlEventPayload(name: "api", paneID: "tok", from: "S:Q", messageID: "m1")),
+            ControlEvent(seq: 15, ts: 15.5, kind: .openerRun, window: "win", workspace: "work", session: "sess",
+                         payload: ControlEventPayload(name: "api", pane: "left", host: "box",
+                                                      path: "/a.md", selector: "*.md")),
         ]
         let expected = [
             ##"{"kind":"status","payload":{"blink":true,"color":"#aabbcc","name":"api","pane":"right","##
@@ -86,12 +92,13 @@ struct ControlEventProtocolTests {
             ##"{"kind":"pane.split","payload":{"name":"api","status":"shown"},"seq":6,"session":"sess","ts":6.5,"window":"win","workspace":"work"}"##,
             ##"{"kind":"pane.scratch","payload":{"name":"api","status":"hidden"},"seq":7,"session":"sess","ts":7.5,"window":"win","workspace":"work"}"##,
             ##"{"kind":"status","payload":{"name":"api","previous":"active","status":"blocked"},"seq":8,"session":"sess","ts":8.5,"window":"win","workspace":"work"}"##,
-            ##"{"kind":"remote.opened","payload":{"host":"buildbox","name":"far"},"seq":9,"session":"sess","ts":9.5,"window":"win","workspace":"work"}"##,
-            ##"{"kind":"remote.closed","payload":{"host":"buildbox","name":"far"},"seq":10,"session":"sess","ts":10.5,"window":"win","workspace":"work"}"##,
+            ##"{"kind":"remote.opened","payload":{"host":"buildbox","name":"far","remoteSessionID":"r1"},"seq":9,"session":"sess","ts":9.5,"window":"win","workspace":"work"}"##,
+            ##"{"kind":"remote.closed","payload":{"host":"buildbox","name":"far","remoteSessionID":"r1"},"seq":10,"session":"sess","ts":10.5,"window":"win","workspace":"work"}"##,
             ##"{"kind":"session.selected","payload":{"name":"api","previous":"before"},"seq":11,"session":"sess","ts":11.5,"window":"win","workspace":"work"}"##,
             ##"{"kind":"app.launched","payload":{},"seq":12,"ts":12.5}"##,
             ##"{"kind":"pane.focused","payload":{"name":"api","pane":"right","paneID":"tok"},"seq":13,"session":"sess","ts":13.5,"window":"win","workspace":"work"}"##,
             ##"{"kind":"message","payload":{"from":"S:Q","messageID":"m1","name":"api","paneID":"tok"},"seq":14,"session":"sess","ts":14.5,"window":"win","workspace":"work"}"##,
+            ##"{"kind":"opener.run","payload":{"host":"box","name":"api","pane":"left","path":"\/a.md","selector":"*.md"},"seq":15,"session":"sess","ts":15.5,"window":"win","workspace":"work"}"##,
         ]
 
         #expect(try events.map(canonicalJSON) == expected)

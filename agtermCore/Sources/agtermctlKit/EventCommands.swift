@@ -110,11 +110,16 @@ enum EventFormatter {
             return "\(time) \(event.kind.rawValue) \(name) \(event.payload.pane ?? "") pane-id=\(event.payload.paneID ?? "-")"
         case .remoteOpened, .remoteClosed:
             return "\(time) \(event.kind.rawValue) \(name) host=\(event.payload.host ?? "")"
+                + " remote-session-id=\(event.payload.remoteSessionID ?? "-")"
         case .appLaunched:
             return "\(time) \(event.kind.rawValue)"
         case .message:
             return "\(time) \(event.kind.rawValue) \(name) pane-id=\(event.payload.paneID ?? "-")"
                 + " from=\(event.payload.from ?? "-") id=\(event.payload.messageID ?? "-")"
+        case .openerRun:
+            return "\(time) \(event.kind.rawValue) \(name) \(event.payload.pane ?? "-")"
+                + " selector=\(event.payload.selector ?? "-") path=\(event.payload.path ?? "-")"
+                + (event.payload.host.map { " host=\($0)" } ?? "")
         }
     }
 }

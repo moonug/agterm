@@ -37,7 +37,7 @@ final class ControlServerLiveResetTests: XCTestCase {
         try await super.tearDown()
     }
 
-    private static let orphanProbe = LiveAttributionProbe(responsible: { .live($0) }, hostPID: { _ in nil }, appPID: 300)
+    private static let orphanProbe = LiveAttributionProbe(responsible: { .live($0) }, hosts: { _ in .init() }, appPID: 300)
 
     private func makeCoordinator(active: RestoreMode = .live, configured: RestoreMode = .live) -> LiveResetCoordinator {
         XCTAssertTrue(settingsModel.setRestoreMode(configured))
@@ -50,7 +50,7 @@ final class ControlServerLiveResetTests: XCTestCase {
                             remoteRunner: (any RemoteCommandRunner)? = nil,
                             responseWriter: @escaping ControlServer.ResponseWriter = ControlServer.writeResponse) -> ControlServer {
         let client = ZmxClient(executablePath: "/tmp/zmx", socketDirectory: "/tmp/zmx-dir", runner: runner)
-        let resolver = ZmxForegroundResolver(leaderProvider: { _ in [:] }, leaderProbe: { .foreground($0) })
+        let resolver = ZmxForegroundResolver(leaderProvider: { [:] }, leaderProbe: { .foreground($0) })
         let server = ControlServer(library: library, actions: AppActions(library: library), settingsModel: settingsModel,
                                    identity: AppIdentity(version: "test", commit: "test"), zmxForegroundResolver: resolver,
                                    zmxClient: client, zmxOutdatedBefore: outdatedBefore, liveAttributionProbe: probe,
@@ -79,7 +79,7 @@ final class ControlServerLiveResetTests: XCTestCase {
             "name=\(ZmxSupport.daemonName(for: supervised.paneIdentity))\tpid=210\tclients=1",
         ].joined(separator: "\n")
         let probe = LiveAttributionProbe(responsible: { pid in pid == 210 ? .live(100) : .live(pid) },
-                                         hostPID: { _ in 100 }, appPID: 300)
+                                         hosts: { _ in .current(100) }, appPID: 300)
 
         let selection = try XCTUnwrap(makeServer(liveReset: makeCoordinator(), runner: { _ in rows }, probe: probe).liveResetSelection())
 
@@ -98,7 +98,7 @@ final class ControlServerLiveResetTests: XCTestCase {
             "name=\(ZmxSupport.daemonName(for: outdated.paneIdentity))\tpid=210\tclients=1\tcreated=999",
             "name=\(ZmxSupport.daemonName(for: current.paneIdentity))\tpid=220\tclients=1\tcreated=1000",
         ].joined(separator: "\n")
-        let supervised = LiveAttributionProbe(responsible: { _ in .live(100) }, hostPID: { _ in 100 }, appPID: 300)
+        let supervised = LiveAttributionProbe(responsible: { _ in .live(100) }, hosts: { _ in .current(100) }, appPID: 300)
         let server = makeServer(liveReset: makeCoordinator(), runner: { _ in rows }, probe: supervised,
                                 outdatedBefore: Date(timeIntervalSince1970: 1000))
 
@@ -114,7 +114,7 @@ final class ControlServerLiveResetTests: XCTestCase {
         let workspace = try XCTUnwrap(store.workspaces.first)
         let session = try XCTUnwrap(store.addSession(toWorkspace: workspace.id, cwd: "/tmp"))
         let rows = "name=\(ZmxSupport.daemonName(for: session.paneIdentity))\tpid=210\tclients=1\tcreated=999"
-        let supervised = LiveAttributionProbe(responsible: { _ in .live(100) }, hostPID: { _ in 100 }, appPID: 300)
+        let supervised = LiveAttributionProbe(responsible: { _ in .live(100) }, hosts: { _ in .current(100) }, appPID: 300)
         let server = makeServer(liveReset: makeCoordinator(), runner: { _ in rows }, probe: supervised,
                                 outdatedBefore: Date(timeIntervalSince1970: 1000))
 
@@ -123,6 +123,30 @@ final class ControlServerLiveResetTests: XCTestCase {
         XCTAssertTrue(response.ok)
         XCTAssertEqual(response.result?.liveReset, ControlLiveResetStatus(sessions: 1, panes: 1, pending: true, outdated: 1))
         XCTAssertTrue(response.result?.text?.contains("It predates the last Live sessions update") == true)
+    }
+
+    func testResetSelectsAPaneOnAnEarlierHostAndNamesIt() throws {
+        let store = try XCTUnwrap(library.activeStore)
+        let workspace = try XCTUnwrap(store.workspaces.first)
+        let earlier = try XCTUnwrap(store.addSession(toWorkspace: workspace.id, cwd: "/tmp"))
+        let current = try XCTUnwrap(store.addSession(toWorkspace: workspace.id, cwd: "/tmp"))
+        let rows = [
+            "name=\(ZmxSupport.daemonName(for: earlier.paneIdentity))\tpid=210\tclients=1",
+            "name=\(ZmxSupport.daemonName(for: current.paneIdentity))\tpid=220\tclients=1",
+        ].joined(separator: "\n")
+        let probe = LiveAttributionProbe(responsible: { .live([210: 101, 220: 100][$0] ?? $0) },
+                                         hosts: { _ in .init(pids: ["current": 100, "earlier": 101], current: "current") },
+                                         appPID: 300)
+        let server = makeServer(liveReset: makeCoordinator(), runner: { _ in rows }, probe: probe)
+
+        XCTAssertEqual(server.liveResetSelection()?.targets,
+                       [LiveReset.Target(paneIdentity: earlier.paneIdentity, sessionID: earlier.id,
+                                         daemon: ZmxSupport.daemonName(for: earlier.paneIdentity), leaderPID: 210, reason: .staleHost)])
+        let response = server.resetLiveSessions()
+
+        XCTAssertTrue(response.ok)
+        XCTAssertEqual(response.result?.liveReset, ControlLiveResetStatus(sessions: 1, panes: 1, pending: true, staleHost: 1))
+        XCTAssertTrue(response.result?.text?.contains("It runs under a helper from an earlier agterm version or login") == true)
     }
 
     func testZmxListMarksAnOutdatedDaemon() throws {

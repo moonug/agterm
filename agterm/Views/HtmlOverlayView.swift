@@ -34,6 +34,7 @@ struct HtmlOverlayView: View {
                 .background(backgroundColor.flatMap { NSColor(agtermHex: $0) }.map { Color(nsColor: $0) } ?? background)
                 .overlay {
                     if overlay.loadState == .failed { failure }
+                    if overlay.awaitsFirstContent { loading }
                 }
         }
     }
@@ -138,6 +139,23 @@ struct HtmlOverlayView: View {
         .background(backgroundColor.flatMap { NSColor(agtermHex: $0) }.map { Color(nsColor: $0) } ?? background)
     }
 
+    // a slow remote load must not look like an ignored click
+    private var loading: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text(session.remoteHost.map { "Loading \(overlay.identity) from \($0)" } ?? "Loading \(overlay.identity)")
+                .font(.system(size: 12))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("htmlOverlay.loading")
+        .foregroundStyle(foreground.opacity(0.7))
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(backgroundColor.flatMap { NSColor(agtermHex: $0) }.map { Color(nsColor: $0) } ?? background)
+    }
+
     private var sourceText: String {
         switch overlay.source {
         case .file(let path, _), .replica(let path, _), .image(let path), .markdown(let path), .text(let path, _), .document(let path): path
@@ -218,7 +236,7 @@ struct HtmlWebViewHost: NSViewRepresentable {
             if view.holdsFocus { view.window?.makeFirstResponder(nil) }
             return
         }
-        // focus once per activation and never over a text field editor, as `TerminalView.focusIfNeeded` does
+        // focus once per activation and never over a text field editor, as `TerminalSurfaceHost.focusIfNeeded` does
         guard let window = view.window, !context.coordinator.didFocus, !view.holdsFocus,
               !(window.firstResponder is NSText), !view.deferFocusToAsk(in: session) else { return }
         context.coordinator.didFocus = true
