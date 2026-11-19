@@ -25,6 +25,7 @@ struct ServerCommandPolicyTests {
         "Mac selection and clipboard": [.sessionCopy, .sessionPaste, .sessionSelectAll, .sessionSearch, .sessionOverlayCopy, .sessionOverlayText],
         "moves what a Mac shows": [.sessionFocus, .sessionSelect, .sessionGo, .sessionLead, .sessionResize, .workspaceSelect, .workspaceGo],
         "Finder on the Mac": [.sessionReveal],
+        "mouse cursor in a Mac terminal": [.sessionOpenLinkAtCursor],
         "Mac app relaunch": [.restoreMode, .restoreCapture, .restoreClear, .zmxReset, .sessionRestore],
         "the Mac app's own updater": [.updateCheck],
         "makes a Mac viewer": [.zmxAttach, .zmxAttachGroup, .sessionRemoteNew],
