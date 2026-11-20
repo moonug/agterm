@@ -17,7 +17,7 @@ What it does:
 - **Splits, scratch, and overlays.** Split a session into two shells side by side or top and bottom, open a scratch terminal over it, or run a program in a full or floating overlay without disturbing the shell underneath.
 - **Companions.** Keep a log tail, a watcher, a second shell, or an HTML page pinned under a session in the sidebar: companions move, fold, and close with it. Duplicate as Companion copies a session's split layout and starts another copy of each pane's program. They work on sessions attached from another Mac too. An HTML page can also be a session of its own, holding companions and coming back after a relaunch.
 - **Live sessions.** Quit, update, or relaunch agterm while the processes in primary and split panes keep running, an agent mid-turn included. The next launch reattaches to them with their text and TUI state. It is one of three restore modes in Settings ▸ General ▸ Restore sessions, next to fresh shells and re-running the commands captured at quit. Live mode takes effect after restarting agterm and requires zsh or fish as the macOS login shell, or as the absolute path in the ghostty `command` agterm loads.
-- **Remote sessions.** Open a session running on another Mac as a row in this sidebar, split and companions included, from File ▸ Attach Remote… or with `agtermctl zmx attach --companions`. Its status, notifications, HUD, and title-bar context follow it to this Mac, and its panes take this Mac's size. The other Mac runs agterm in Live sessions mode and is reached over key-based ssh. The menu item lists the Macs named in `remotes.conf`; [Remote sessions](https://agterm.com/docs#remote-sessions) covers the setup.
+- **Remote sessions.** Work in sessions running on another machine over key-based ssh, from another Mac or from a Linux server. A session on another Mac running agterm in Live sessions mode opens as a row in this sidebar, split and companions included, from File ▸ Attach Remote… or with `agtermctl zmx attach --companions`; its status, notifications, HUD, and title-bar context follow it to this Mac ([setup](https://agterm.com/docs#remote-sessions)). A Linux host runs sessions under agterm-server, installed with `agtermctl server install HOST`, and shows them in a remote window; every shell keeps running there when the Mac sleeps or the network drops ([setup](https://agterm.com/docs#remote-server)).
 - **Agent skill.** An installable skill (Help ▸ Install Agent Skill…) teaches Claude Code or Codex the control model and the `agtermctl` commands, so an agent running inside agterm can build its own layout, run overlays, manage windows, and show images inline without you explaining the API.
 - **Agent status.** A coding agent reports its state (active, blocked, or completed) onto its session's row, so you can see which of many running agents needs you. Status hooks for Claude Code, Codex, Pi, OpenCode, and other agents install from Help ▸ Install Agent Status Hooks….
 
@@ -79,17 +79,23 @@ The Homebrew cask already installs the `agtermctl` command-line tool; from the D
 
 The skill is also published as a plugin from this repository, which puts it wherever your agent looks for one:
 
+### Claude Code
+
 ```sh
-# Claude Code
 claude plugin marketplace add umputun/agterm
 claude plugin install agterm@agterm
+```
 
-# Codex
+### Codex
+
+```sh
 codex plugin marketplace add umputun/agterm
 codex plugin add agterm@agterm
 ```
 
 Install the skill by one route or the other, never both: two copies leave it undefined which one the agent picks.
+
+The Help menu installers honor an exported `CODEX_HOME`; [Agent status](https://agterm.com/docs#status) has the details.
 
 ## Scripting agterm
 

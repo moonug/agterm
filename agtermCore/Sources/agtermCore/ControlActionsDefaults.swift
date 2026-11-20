@@ -27,6 +27,10 @@ public extension ControlActions {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.companion.convert"))
     }
 
+    func moveCompanion(_: String?, parent _: String, index _: Int?, window _: String?) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.companion.move"))
+    }
+
     func createPageCompanion(_: String?, window _: String?, options _: ControlSessionOverlayOpenOptions) -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.companion.page"))
     }
@@ -37,6 +41,10 @@ public extension ControlActions {
 
     func createCompanion(_: String?, options _: CompanionOptions, window _: String?) -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.companion.new"))
+    }
+
+    func newRemoteSession(_: RemoteSessionCreate) async -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.remote.new"))
     }
 
     func setSessionExpansion(_: String?, window _: String?, expanded: Bool) -> ControlResponse {
@@ -62,8 +70,18 @@ public extension ControlActions {
     }
 
     func setSessionOverlayFollow(_: String?, window _: String?, pane _: OverlayPane?,
-                                 mode _: ControlToggleMode) -> ControlResponse {
+                                 mode _: ControlToggleMode) async -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.follow"))
+    }
+
+    func setSessionOverlayWrap(_: String?, window _: String?, pane _: OverlayPane?,
+                               mode _: ControlToggleMode) async -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.wrap"))
+    }
+
+    func setSessionOverlayExpand(_: String?, window _: String?, pane _: OverlayPane?,
+                                 mode _: ControlToggleMode) async -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.expand"))
     }
 
     func searchSessionOverlay(_: String?, window _: String?, pane _: OverlayPane?,
@@ -74,6 +92,10 @@ public extension ControlActions {
     func stepSessionOverlayChanges(_: String?, window _: String?, pane _: OverlayPane?,
                                    forward _: Bool) async -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.changes"))
+    }
+
+    func goSessionOverlayFiles(_: String?, window _: String?, pane _: OverlayPane?, to _: String) async -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("session.overlay.files"))
     }
 
     // outcomes live in agtermCore, so every host answers the read the same way and owes no conformance
@@ -123,6 +145,10 @@ public extension ControlActions {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("browser.clear"))
     }
 
+    func checkForUpdates() async -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("update.check"))
+    }
+
     func linkOpenMode(_: LinkOpenMode?) -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("browser.links"))
     }
@@ -151,6 +177,10 @@ public extension ControlActions {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.screen"))
     }
 
+    func killZmxPane(target _: String, window _: String?, pane _: ZmxPaneRole, paneID _: String) -> ControlResponse {
+        ControlResponse(ok: false, error: "zmx.kill.pane is not supported by this control host")
+    }
+
     func killZmxDaemon(target _: String, window _: String?, pane _: ZmxPaneRole) -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.kill"))
     }
@@ -161,6 +191,40 @@ public extension ControlActions {
 
     func openPresentation(session _: String) -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.present"))
+    }
+
+    // only a headless server owns a catalog; a remote window must never bind to a live Mac's windows
+    func catalogSubscribe() -> ControlResponse {
+        ControlResponse(ok: false, error: "catalog.subscribe is not served by this agterm")
+    }
+
+    func detachSessions(_: [String], window _: String?) -> ControlResponse { Self.remoteWindowOnly("session.detach") }
+    func reattachSession(_: String, window _: String?) -> ControlResponse { Self.remoteWindowOnly("session.reattach") }
+    func detachWorkspace(_: String?, window _: String?) -> ControlResponse { Self.remoteWindowOnly("workspace.detach") }
+    func reattachWorkspace(_: String, window _: String?) -> ControlResponse { Self.remoteWindowOnly("workspace.reattach") }
+    func dismissRemoteUnknown(window _: String?) -> ControlResponse { Self.remoteWindowOnly("window.remote.dismiss") }
+
+    static func remoteWindowOnly(_ command: String) -> ControlResponse {
+        ControlResponse(ok: false, error: "\(command) acts only on a remote window")
+    }
+
+    func catalogOperation(_: String, sent _: CatalogPosition?, window _: String?) -> ControlResponse {
+        ControlResponse(ok: false, error: "catalog.op is not served by this agterm")
+    }
+
+    var takesOperationReceipts: Bool { false }
+
+    func windowRemoteOpen(host _: String) async -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("window.remote.open"))
+    }
+
+    func windowRemoteOpen(host: String, originWindow: String?) async -> ControlResponse {
+        guard originWindow == nil else { return ControlResponse(ok: false, error: ControlActionsUnsupported.message("--origin-window")) }
+        return await windowRemoteOpen(host: host)
+    }
+
+    func claimOverlayJob(_ job: String, token: String?) -> ControlResponse {
+        token == nil ? claimOverlayJob(job) : ControlResponse(ok: false, error: "job not claimable")
     }
 
     func claimOverlayJob(_: String) -> ControlResponse {
@@ -182,6 +246,10 @@ public extension ControlActions {
         return await attachRemoteSession(host: host, session: session)
     }
 
+    func openPick(_: PendingPick, session _: String, window _: String?, follow _: Bool) -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("pick.open --session"))
+    }
+
     func readSurfaceCursor(_ target: String?, window: String?, paneID: String?) -> ControlResponse {
         guard paneID?.isEmpty != false else {
             return ControlResponse(ok: false, error: ControlActionsUnsupported.message("surface.cursor --pane-id"))
@@ -195,6 +263,20 @@ public extension ControlActions {
 
     func attachRemoteGroup(host _: String, session _: String, window _: String?) async -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.attach.group"))
+    }
+
+    func attachRemoteSession(host: String, session: String, window: String?, workspace: ControlAttachWorkspace?) async -> ControlResponse {
+        guard workspace == nil else {
+            return ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.attach --workspace"))
+        }
+        return await attachRemoteSession(host: host, session: session, window: window)
+    }
+
+    func attachRemoteGroup(host: String, session: String, window: String?, workspace: ControlAttachWorkspace?) async -> ControlResponse {
+        guard workspace == nil else {
+            return ControlResponse(ok: false, error: ControlActionsUnsupported.message("zmx.attach.group --workspace"))
+        }
+        return await attachRemoteGroup(host: host, session: session, window: window)
     }
 
     func splitSession(_ target: String?, window: String?, mode: String?, axis _: SplitAxis?) -> ControlResponse {
@@ -238,6 +320,14 @@ public extension ControlActions {
             return ControlResponse(ok: false, error: "session.close --undoable is not supported by this control host")
         }
         return closeSessions(targets, window: window)
+    }
+
+    func terminateSessions(_: [String], window _: String?, undoable _: Bool) -> ControlResponse {
+        ControlResponse(ok: false, error: "session.terminate is not supported by this control host")
+    }
+
+    func undoClose(_: String) -> ControlResponse {
+        ControlResponse(ok: false, error: "session.undo is not supported by this control host")
     }
 
     func resizeSessionOverlay(_ target: String?, window: String?, sizePercent: Int?,
@@ -303,6 +393,16 @@ public extension ControlActions {
 
     func clearRecentClosed() -> ControlResponse {
         ControlResponse(ok: false, error: ControlActionsUnsupported.message("recent.clear"))
+    }
+
+    func listRecentClosed(window: String?) -> ControlResponse {
+        guard window == nil else { return ControlResponse(ok: false, error: "recent.list takes no --window on this control host") }
+        return listRecentClosed()
+    }
+
+    func clearRecentClosed(window: String?) -> ControlResponse {
+        guard window == nil else { return ControlResponse(ok: false, error: "recent.clear takes no --window on this control host") }
+        return clearRecentClosed()
     }
 
     func openRecentClosed(_: String?, window _: String?) -> ControlResponse {

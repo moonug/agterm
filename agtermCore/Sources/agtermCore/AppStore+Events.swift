@@ -15,8 +15,17 @@ extension AppStore {
         ))
     }
 
+    /// emitOpenerRun records an `open` rule launched for a click in `session`'s `pane`; `path` is the file the
+    /// command received and `host` the origin a remote click's copy came from.
+    public func emitOpenerRun(session: Session, pane: String, path: String, selector: String, host: String? = nil) {
+        emitControlEvent(.openerRun, workspace: workspace(forSession: session.id)?.id, session: session.id,
+                         payload: ControlEventPayload(name: session.displayName, pane: pane, host: host,
+                                                      path: path, selector: selector))
+    }
+
     func scheduleTreeChanged() {
         emitControlEvent(.treeChanged)
+        scheduleCompanionsFlush()
     }
 
     func emitSessionCreated(_ session: Session, workspace: UUID) {
@@ -32,7 +41,8 @@ extension AppStore {
         guard let host = session.remoteHost else { return }
         onRemoteRowVisibility?(session, kind == .remoteOpened)
         emitControlEvent(kind, workspace: workspace, session: session.id,
-                         payload: ControlEventPayload(name: session.displayName, host: host))
+                         payload: ControlEventPayload(name: session.displayName, host: host,
+                                                      remoteSessionID: session.remoteSessionID))
     }
 
     /// `pane.split` / `pane.scratch` carry `shown`/`hidden`; callers emit only on a real transition.

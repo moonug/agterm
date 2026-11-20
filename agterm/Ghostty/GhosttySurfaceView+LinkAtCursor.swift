@@ -49,7 +49,7 @@ extension GhosttySurfaceView {
         let rules = LinkRules.load(configDirectory: configDir).rules
         guard let raw = LinkRules.urlAtCursor(rules: rules, lines: lines, cols: grid.cols, row: row, col: col) else { return nil }
         guard LinkPolicy.disposition(for: raw) != .ignore else { return nil }
-        openLink(raw, intent: .normal)
+        openLink(raw, intent: .normal, source: .detected)
         return raw
     }
 }

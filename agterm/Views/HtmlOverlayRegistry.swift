@@ -311,7 +311,9 @@ final class HtmlOverlayPage: NSObject, WKNavigationDelegate, WKUIDelegate {
             webView.observe(\.canGoBack) { [weak self] _, _ in Task { @MainActor in self?.reportPage() } },
             webView.observe(\.canGoForward) { [weak self] _, _ in Task { @MainActor in self?.reportPage() } },
         ]
-        textPage = TextPageBridge.make(for: overlay, webView: webView, store: store, world: Self.markdownWorld) { [weak self] in self?.fail($0) }
+        textPage = textReads().flatMap {
+            TextPageBridge(for: overlay, reads: $0, webView: webView, store: store, world: Self.markdownWorld) { [weak self] in self?.fail($0) }
+        }
         loadOriginal()
     }
 
@@ -526,6 +528,8 @@ final class HtmlOverlayPage: NSObject, WKNavigationDelegate, WKUIDelegate {
                 return fail(OverlayHtmlError.remoteFile)
             }
             webView.load(URLRequest(url: url))
+        case .replica(_, .text) where textPage != nil:
+            textPage?.loadDocument(fresh: true)
         case .replica(let path, let content):
             guard replica != nil else { return fail(OverlayHtmlError.remoteFile) }
             textLoad += 1
@@ -578,11 +582,12 @@ final class HtmlOverlayPage: NSObject, WKNavigationDelegate, WKUIDelegate {
     // a file can change between the origin's check and this fetch
     private func replicaContentPage(path: String, content: ReplicaContent) async -> Result<String, ReplicaContentFailure> {
         switch content {
-        case .html:
+        // an html page loads through the scheme handler and a text page through its bridge
+        case .html, .text:
             return .failure(ReplicaContentFailure(message: OverlayHtmlError.remoteFile))
         case .image:
             let fetched = await fetchReplica(path, limit: ImagePage.maxBytes,
-                                             local: (ImageProbe.Failure.tooLarge(path).description, ImageProbe.Failure.unreadable(path).description))
+                                             local: (ImageFile.Failure.tooLarge(path).description, ImageFile.Failure.unreadable(path).description))
             guard case .success(let data) = fetched else { return fetched.map { _ in "" } }
             return await Task.detached(priority: .userInitiated) {
                 ImageProbe.probe(data, path: path).map { ImagePage.html(data: data, mimeType: $0.mimeType) }
@@ -590,27 +595,50 @@ final class HtmlOverlayPage: NSObject, WKNavigationDelegate, WKUIDelegate {
             }.value
         case .markdown:
             let fetched = await fetchReplica(path, limit: MarkdownPage.maxBytes,
-                                             local: (MarkdownProbe.Failure.tooLarge(path).description, MarkdownProbe.Failure.unreadable(path).description))
+                                             local: (MarkdownFile.Failure.tooLarge(path).description, MarkdownFile.Failure.unreadable(path).description))
             guard case .success(let data) = fetched else { return fetched.map { _ in "" } }
             let fetch: @Sendable (String, Int) async -> Data? = { [weak self] path, limit in
                 try? await self?.fetchReplica(path, limit: limit, local: ("", "")).get()
             }
             return await MarkdownPageSource.replica(markdown: data, path: path, fetch: fetch)
                 .mapError { ReplicaContentFailure(message: $0.description) }
-        case .text(let line):
-            let fetched = await fetchReplica(path, limit: TextPage.maxBytes,
-                                             local: (TextProbe.Failure.tooLarge(path).description, TextProbe.Failure.unreadable(path).description))
-            guard case .success(let data) = fetched else { return fetched.map { _ in "" } }
-            let style = MarkdownAssets.shared.textStyle
-            return await Task.detached(priority: .userInitiated) {
-                TextProbe.text(data, path: path)
-                    .map { TextPage.html(text: $0, language: TextPage.language(forFile: path), line: line, style: style) }
-                    .mapError { ReplicaContentFailure(message: $0.description) }
-            }.value
         case .document:
             let fetched = await fetchReplica(path, limit: DocumentPage.maxBytes, local: (DocumentProbe.Failure.tooLarge(path).description, DocumentProbe.Failure.unreadable(path).description))
             guard case .success(let data) = fetched else { return fetched.map { _ in "" } }
             return await Task.detached(priority: .userInitiated) { DocumentProbe.html(data, path: path).mapError { ReplicaContentFailure(message: $0.description) } }.value
+        }
+    }
+
+    // a replica's text comes over its channel, judged here as a local file's would be; its log end arrives raw and is
+    // cut into lines here, so a log over the text cap still opens
+    private func textReads() -> TextPageBridge.Reads? {
+        switch overlay.source {
+        case .text(let path, _):
+            return .local(path)
+        case .replica(let path, .text):
+            guard let logTail = replica?.logTail else { return nil }
+            let text: @MainActor () async -> Result<String, ReplicaContentFailure> = { [weak self] in
+                guard let self else { return .failure(ReplicaContentFailure(message: OverlayHtmlError.remoteFile)) }
+                let fetched = await fetchReplica(path, limit: TextPage.maxBytes,
+                                                 local: (TextProbe.Failure.tooLarge(path).description, TextProbe.Failure.unreadable(path).description))
+                guard case .success(let data) = fetched else { return fetched.map { _ in "" } }
+                return await Task.detached(priority: .userInitiated) {
+                    TextProbe.text(data, path: path).mapError { ReplicaContentFailure(message: $0.description) }
+                }.value
+            }
+            // a read cancelled by a hide is no answer about the file, so it never marks the page waiting
+            return TextPageBridge.Reads(text: text, log: { _, tail, stamp in
+                do {
+                    guard let read = try await logTail(stamp) else { return .success(nil) }
+                    return .success(TextProbe.LogRead(read, tail: tail))
+                } catch is CancellationError {
+                    return .success(nil)
+                } catch {
+                    return .failure(.unreadable(path))
+                }
+            })
+        default:
+            return nil
         }
     }
 

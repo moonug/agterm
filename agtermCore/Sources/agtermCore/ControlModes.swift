@@ -14,7 +14,7 @@ public struct ControlEventReadOptions: Equatable, Sendable {
 }
 
 /// Parsed binary control mode with the shared default/toggle semantics used by mode-bearing commands.
-public enum ControlToggleMode: Equatable, Sendable {
+public enum ControlToggleMode: String, Codable, Equatable, Sendable {
     case on
     case off
     case toggle
@@ -206,6 +206,13 @@ public struct ControlSessionCreateOptions: Equatable, Sendable {
     }
 }
 
+/// ControlAttachWorkspace is the workspace a `zmx.attach` row goes into instead of the window's current one:
+/// `id` takes an id, unique prefix or `active`; `name` an exact sidebar name, created when `create` is set.
+public enum ControlAttachWorkspace: Equatable, Sendable {
+    case id(String)
+    case name(String, create: Bool)
+}
+
 /// Parsed `session.status` payload. Sound validation and playback stay host-side; the dispatcher
 /// hex-validates the per-call `#rrggbb` `color`, and both overrides thread onto the ephemeral
 /// `AgentIndicator`.
@@ -226,10 +233,12 @@ public struct ControlSessionStatusUpdate: Equatable, Sendable {
     /// app-side. A resolved token OVERRIDES the stale role `pane` (a promoted-then-re-split pane, #199);
     /// nil/empty/unknown falls back to `pane`.
     public let paneID: String?
+    /// `ifIdle` applies the write only while the session's status is idle; otherwise it is an ok no-op.
+    public let ifIdle: Bool
 
     public init(status: AgentStatus, blink: Bool?, autoReset: Bool?, sound: String?,
                 color: String? = nil, shape: StatusShape? = nil,
-                pane: StatusPane? = nil, paneID: String? = nil) {
+                pane: StatusPane? = nil, paneID: String? = nil, ifIdle: Bool = false) {
         self.status = status
         self.blink = blink
         self.autoReset = autoReset
@@ -238,6 +247,7 @@ public struct ControlSessionStatusUpdate: Equatable, Sendable {
         self.shape = shape
         self.pane = pane
         self.paneID = paneID
+        self.ifIdle = ifIdle
     }
 }
 

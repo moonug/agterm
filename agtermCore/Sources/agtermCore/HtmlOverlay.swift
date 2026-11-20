@@ -122,7 +122,7 @@ struct HtmlOrigin: Equatable {
 }
 
 /// TextLog is a text page's request to show only a log's last `tail` lines, following its end when `follow` is set.
-public struct TextLog: Equatable, Sendable {
+public struct TextLog: Codable, Equatable, Sendable {
     public let tail: Int
     public let follow: Bool
 
@@ -134,7 +134,7 @@ public struct TextLog: Equatable, Sendable {
 
 /// TextLogReport is what the app last read for a log page: the lines shown, a clipped first line, a file that is
 /// missing (`waiting`) or turned binary (`unreadable`, the last good text still shown).
-public struct TextLogReport: Equatable, Sendable {
+public struct TextLogReport: Codable, Equatable, Sendable {
     public var lines = 0
     public var clipped = false
     public var waiting = false
@@ -161,7 +161,7 @@ public struct TextLogState: Equatable, Sendable {
 
 /// TextChanges is a diff page's count of changes, a change being one run of removed and added lines, and the one it
 /// last stepped to, from 1 and 0 before any step.
-public struct TextChanges: Equatable, Sendable {
+public struct TextChanges: Codable, Equatable, Sendable {
     public let count: Int
     public let current: Int
 
@@ -171,9 +171,27 @@ public struct TextChanges: Equatable, Sendable {
     }
 }
 
+/// TextFiles is a diff page's count of files and the one in view, from 1, with the path the page shows for it.
+public struct TextFiles: Codable, Equatable, Sendable {
+    /// maxPath bounds a path sent between Macs, which a hostile patch could make as long as the file.
+    public static let maxPath = 4096
+    public let count: Int
+    public let current: Int
+    public let path: String
+
+    public init(count: Int, current: Int, path: String) {
+        self.count = count
+        self.current = current
+        self.path = path
+    }
+}
+
 /// TextSearch is a text page's search: the query and the page's last report on it, `current` counted from 1 and 0
 /// with no match.
 public struct TextSearch: Equatable, Sendable {
+    /// maxQuery bounds a query in characters; `setTextSearch` cuts a longer one, so the page searches what is stored.
+    public static let maxQuery = 16384
+
     public let query: String
     public var matches: Int
     public var current: Int
@@ -245,8 +263,24 @@ public struct HtmlOverlay: Equatable, Sendable {
     public internal(set) var searchRevision = 0
     /// textChanges is a diff page's last report on its changes, nil until it reports and on any other page.
     public internal(set) var textChanges: TextChanges?
+    /// textFiles is a diff page's last report on the file in view, nil until it reports and on any other page.
+    public internal(set) var textFiles: TextFiles?
+    /// textWrap is whether a text page wraps long lines.
+    public internal(set) var textWrap = false
+    /// textExpand is whether a JSON Lines page lays each record out over indented rows.
+    public internal(set) var textExpand = false
+    /// imagePixels is an image page's probed size, which it needs to be handed to another Mac.
+    public let imagePixels: ImagePixels?
     public var loadState: HtmlLoadState = .loading
     public var loadError: String?
+    /// loadFailurePinned keeps a failure the page cannot load past, such as its port forward ending, over every
+    /// later load report and reload.
+    public internal(set) var loadFailurePinned = false
+    /// contentShown is set by the first finished load and kept through reloads and navigation, which keep the shown
+    /// document on screen while they load; `current` cannot tell this, a provisional report setting it early.
+    public internal(set) var contentShown = false
+    /// awaitsFirstContent is a replica waiting for its first successful load.
+    public var awaitsFirstContent: Bool { replicaOf != nil && loadState == .loading && !contentShown }
     /// current is what the web view shows now, as the adapter last reported it; nil until the first load
     /// finishes and after a reload of the original file.
     public var current: HtmlPageInfo?
@@ -255,12 +289,19 @@ public struct HtmlOverlay: Equatable, Sendable {
     public var reloadRevision = 0
     public var reloadTarget = HtmlReloadTarget.original
 
+    public init(pageRow source: HtmlSource, options: ControlSessionOverlayOpenOptions) {
+        self.init(source: source, navigation: options.navigation, javascript: options.javascript, chromeless: options.chromeless,
+                  persistent: options.persistent, browse: options.browse)
+    }
+
     /// init drops navigation from a markdown page without `markdownLinks`, so its strip never offers Back and
     /// Forward its links cannot use.
     public init(source: HtmlSource, navigation: Bool = false, javascript: Bool = false, chromeless: Bool = false,
                 persistent: Bool = false, browse: Bool = false, clicked: Bool = false, id: UUID = UUID(),
-                replicaOf: UUID? = nil, textLog: TextLog? = nil, markdownLinks: MarkdownLinkGrant? = nil) {
+                replicaOf: UUID? = nil, textLog: TextLog? = nil, markdownLinks: MarkdownLinkGrant? = nil,
+                imagePixels: ImagePixels? = nil) {
         self.id = id
+        self.imagePixels = imagePixels
         self.textLog = textLog
         logState = textLog.map { TextLogState(following: $0.follow) }
         self.clicked = clicked
@@ -273,6 +314,23 @@ public struct HtmlOverlay: Equatable, Sendable {
         self.chromeless = chromeless
         self.persistent = persistent
         self.browse = browse
+    }
+
+    /// mirror takes the text state the presenting Mac reported for this origin record of a page it shows; true when
+    /// following, the query, the wrap or the expand changed.
+    mutating func mirror(_ text: PresentationTextState) -> Bool {
+        let before = (logState?.following, textSearch?.query, textWrap, textExpand)
+        if let following = text.following { logState?.following = following }
+        if let log = text.log { logState?.report = log }
+        searchRevision = text.revision
+        textSearch = text.query.flatMap {
+            $0.isEmpty ? nil : TextSearch(query: $0, matches: text.matches ?? 0, current: text.current ?? 0)
+        }
+        textWrap = text.wrap
+        textExpand = text.expand ?? false
+        textChanges = text.changes
+        textFiles = text.files
+        return before != (logState?.following, textSearch?.query, textWrap, textExpand)
     }
 
     /// grantError says why `file` cannot be opened under `grantRoot`, nil when it can. Both must be absolute, and the file
@@ -499,6 +557,11 @@ public final class HtmlOverlayReleases {
     func release(_ overlay: HtmlOverlay?) {
         guard let overlay else { return }
         HtmlPageOutcomes.shared.dismiss(overlay.id)
+        moved(overlay)
+    }
+
+    /// moved frees what showed `overlay` here once it left its slot for another Mac, its outcome still open.
+    func moved(_ overlay: HtmlOverlay) {
         onRelease?(overlay.id)
         onServedRelease?(overlay.id)
         if let origin = overlay.replicaOf { onReplicaRelease?(overlay.id, origin) }

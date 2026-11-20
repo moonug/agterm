@@ -57,19 +57,31 @@ jobs:
         run: |
           zmx=$(sed -nE 's/^ZMX_REV="([^"]+)".*/\1/p' scripts/setup.sh)
           zmx_target=$(sed -nE 's/^ZMX_TARGET="([^"]+)".*/\1/p' scripts/setup.sh)
-          [ -n "$zmx" ] && [ -n "$zmx_target" ]
+          ghostty=$(sed -nE 's/^GHOSTTY_REV="([^"]+)".*/\1/p' scripts/setup.sh)
+          [ -n "$zmx" ] && [ -n "$zmx_target" ] && [ -n "$ghostty" ]
           echo "zmx=$zmx" >> "$GITHUB_OUTPUT"
           echo "zmx_target=$zmx_target" >> "$GITHUB_OUTPUT"
+          echo "ghostty=$ghostty" >> "$GITHUB_OUTPUT"
       - name: Cache zmx
         uses: actions/cache@v6
         with:
           path: |
             agterm/Resources/zmx
             .zmx-build-stamp
-          key: zmx-v1-${{ steps.revisions.outputs.zmx }}-${{ steps.revisions.outputs.zmx_target }}-${{ hashFiles('scripts/zmx-patches/**/*.patch') }}
+          key: zmx-v2-${{ steps.revisions.outputs.zmx }}-${{ steps.revisions.outputs.zmx_target }}-${{ hashFiles('scripts/zmx-patches/**/*.patch') }}
       # the session-host fixtures attach to a real zmx daemon; a cache miss builds it here
       - name: Stage zmx
         run: scripts/setup.sh --zmx-only
+      - name: Cache the shell integration
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/linux/ghostty
+            build/linux/.shell-integration-stamp
+          key: shell-integration-macos-v1-${{ steps.revisions.outputs.ghostty }}
+      # the server's real-daemon panes load it; this job builds no libghostty, so it comes from ghostty's source at the pin
+      - name: Stage the shell integration
+        run: scripts/setup-zmx-linux.sh --shell-integration
       - name: Install fish
         run: brew install fish
       - name: Verify fish
@@ -84,8 +96,17 @@ jobs:
         env:
           AGTERM_REQUIRE_FISH: "1"
           AGTERM_REQUIRE_ZMX: "1"
+          AGTERM_SHELL_INTEGRATION: ${{ github.workspace }}/build/linux/ghostty/shell-integration
           WATCHDOG_SECONDS: "600"
           DIAG_DIR: ${{ github.workspace }}/test-hang
+      # the server logs why it closed each presentation stream only to the unified log
+      - name: save the agterm log
+        if: failure()
+        continue-on-error: true
+        run: |
+          mkdir -p test-hang
+          perl -e 'alarm shift; exec @ARGV' 120 log show --style compact --last 45m \
+            --predicate 'subsystem == "com.umputun.agterm"' > test-hang/agterm.log 2>&1
       - name: upload hang diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -151,6 +172,80 @@ jobs:
       - name: swiftlint (strict)
         run: swiftlint lint --strict
 
+  linux:
+    name: Linux core tests
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
+    runs-on: ubuntu-24.04
+    # build, then the watchdog's 10-minute test cap and its diagnostics
+    timeout-minutes: 45
+    container:
+      image: swift:6.3.2-noble
+      # the watchdog's lldb attaches, as root, to the test runner owned by agterm-test
+      options: --cap-add=SYS_PTRACE
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install jq, zsh, fish and tcsh
+        # jq: the codex status hook reads its JSON with it where plutil does not exist; the shells: tests run
+        # scripts under each login shell the remote commands must survive, and server panes run zsh, fish and bash
+        run: apt-get update && apt-get install -y --no-install-recommends jq zsh fish tcsh xz-utils curl ca-certificates
+      - name: Read the pinned zmx and ghostty revisions
+        id: zmx
+        run: |
+          echo "rev=$(sed -nE 's/^ZMX_REV="([^"]+)".*/\1/p' scripts/setup.sh)" >> "$GITHUB_OUTPUT"
+          echo "ghostty=$(sed -nE 's/^GHOSTTY_REV="([^"]+)".*/\1/p' scripts/setup.sh)" >> "$GITHUB_OUTPUT"
+      - name: Cache the Linux shell integration
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/linux/ghostty
+            build/linux/.shell-integration-stamp
+          key: shell-integration-linux-v1-${{ steps.zmx.outputs.ghostty }}
+      - name: Stage the Linux shell integration
+        # the zsh, fish and bash integration agterm-server panes load, from ghostty's source at the pin
+        run: scripts/setup-zmx-linux.sh --shell-integration
+      - name: Cache the Linux zmx
+        id: zmx-cache
+        uses: actions/cache@v6
+        with:
+          path: build/linux/x86_64
+          key: zmx-linux-v2-${{ steps.zmx.outputs.rev }}-x86_64-${{ hashFiles('scripts/zmx-patches/**/*.patch') }}
+      - name: Build the Linux zmx
+        # the musl zmx agterm-server runs; AgtermServerTests drive real daemons with it
+        if: steps.zmx-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ -C /opt
+          AGTERM_ZMX_ZIG=/opt/zig-x86_64-linux-0.16.0/zig AGTERM_ZMX_TARGET=x86_64-linux-musl \
+            AGTERM_ZMX_STAGE_DIR=build/linux/x86_64/zmx AGTERM_ZMX_STAMP_FILE=build/linux/x86_64/.zmx-build-stamp \
+            scripts/setup.sh --zmx-only
+      - name: Create the test user
+        # root passes the permission checks several tests rely on failing
+        run: |
+          useradd --create-home agterm-test
+          chown -R agterm-test "$GITHUB_WORKSPACE"
+      - name: swift build
+        working-directory: agtermCore
+        run: runuser --user agterm-test -- env HOME=/home/agterm-test swift build --build-tests
+      - name: swift test
+        working-directory: agtermCore
+        # the server's real-daemon suite and the fish cases fail rather than skip without zmx or fish
+        run: >-
+          ../scripts/watchdog.sh runuser --user agterm-test --
+          env HOME=/home/agterm-test AGTERM_REQUIRE_ZMX=1 AGTERM_REQUIRE_FISH=1 swift test --skip-build
+        env:
+          WATCHDOG_SECONDS: "600"
+          WATCHDOG_DIAG_SECONDS: "300"
+          WATCHDOG_RUNNER: agtermCorePackageTests.xctest
+          # relative: in a container job github.workspace names the host path, not the mounted one
+          DIAG_DIR: ../test-hang
+      - name: upload hang diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-hang-linux
+          path: test-hang
+          if-no-files-found: ignore
+
   build:
     name: Build app
     needs: changes
@@ -178,18 +273,18 @@ jobs:
             agterm/Resources/ghostty
             agterm/Resources/terminfo
             .ghostty-build-stamp
-          key: ghosttykit-v2-${{ steps.revisions.outputs.ghostty }}-${{ hashFiles('scripts/ghostty-patches/*.patch') }}
+          key: ghosttykit-v3-${{ steps.revisions.outputs.ghostty }}-${{ hashFiles('scripts/ghostty-patches/*.patch') }}
       - name: Cache zmx
         uses: actions/cache@v6
         with:
           path: |
             agterm/Resources/zmx
             .zmx-build-stamp
-          key: zmx-v1-${{ steps.revisions.outputs.zmx }}-${{ steps.revisions.outputs.zmx_target }}-${{ hashFiles('scripts/zmx-patches/**/*.patch') }}
+          key: zmx-v2-${{ steps.revisions.outputs.zmx }}-${{ steps.revisions.outputs.zmx_target }}-${{ hashFiles('scripts/zmx-patches/**/*.patch') }}
       - name: Install xcodegen
         run: brew install xcodegen
       - name: Build libghostty + app (Release)
-        run: scripts/build.sh
+        run: scripts/with-helper-prebuild.sh scripts/build.sh
       - name: Surface teardown under mailbox pressure
         run: python3 scripts/test-surface-teardown.py build/DerivedData/Build/Products/Release/agterm.app --evidence surface-teardown
       - name: Upload surface teardown diagnostics
@@ -214,10 +309,11 @@ jobs:
               exit 1
             fi
           done
-      # the Debug-only hardened-runtime exceptions (allow-jit, allow-unsigned-executable-memory,
-      # disable-library-validation) must never reach a shipped build, and the TCC set must not shrink
-      # either — losing one silently removes the user's only path to granting that permission (#396).
-      # Pin the exact Release set; adding or dropping a key is a deliberate act that edits this list.
+      # this ad-hoc Release build carries the TCC set plus disable-library-validation, which it needs to load
+      # Sparkle.framework; allow-jit and allow-unsigned-executable-memory stay Debug-only, and the TCC set must
+      # not shrink either — losing one silently removes the user's only path to granting that permission (#396).
+      # Pin the exact set; adding or dropping a key is a deliberate act that edits this list. The notarized app's
+      # strict set is checked by scripts/release.sh after its Developer ID re-sign.
       - name: Verify the app's Release entitlements
         shell: bash
         run: |
@@ -228,6 +324,7 @@ jobs:
           # accepts <string>true</string>, which renders as bare true without the tojson below.
           expected=$(printf '%s=true\n' \
             com.apple.security.automation.apple-events \
+            com.apple.security.cs.disable-library-validation \
             com.apple.security.device.audio-input \
             com.apple.security.device.camera \
             com.apple.security.personal-information.addressbook \
@@ -249,7 +346,7 @@ jobs:
       # added to the shipping file and missed here leaves Debug unable to prompt for it, with every job
       # green — the failure surfaces only when someone verifies the new permission by hand in a Debug
       # instance. Derive Debug's expected content from the shipping file so the two cannot drift.
-      - name: Verify the Debug entitlements are the shipping set plus the exceptions
+      - name: Verify the Debug and ad-hoc entitlements are the shipping set plus their exceptions
         shell: bash
         run: |
           keys() { plutil -convert json -o - -- "$1" | jq -r 'to_entries[] | "\(.key)=\(.value|tojson)"' | sort; }
@@ -263,6 +360,13 @@ jobs:
           if [ "$debug" != "$expected" ]; then
             echo "agterm-debug.entitlements is not the shipping set plus the three exceptions." >&2
             diff <(echo "$expected") <(echo "$debug") >&2 || true
+            exit 1
+          fi
+          adhoc=$(keys agterm/agterm-adhoc.entitlements)
+          expected=$(printf '%s\ncom.apple.security.cs.disable-library-validation=true\n' "$release" | sort)
+          if [ "$adhoc" != "$expected" ]; then
+            echo "agterm-adhoc.entitlements is not the shipping set plus disable-library-validation." >&2
+            diff <(echo "$expected") <(echo "$adhoc") >&2 || true
             exit 1
           fi
 
@@ -293,14 +397,14 @@ jobs:
             agterm/Resources/ghostty
             agterm/Resources/terminfo
             .ghostty-build-stamp
-          key: ghosttykit-v2-${{ steps.revisions.outputs.ghostty }}-${{ hashFiles('scripts/ghostty-patches/*.patch') }}
+          key: ghosttykit-v3-${{ steps.revisions.outputs.ghostty }}-${{ hashFiles('scripts/ghostty-patches/*.patch') }}
       - name: Cache zmx
         uses: actions/cache@v6
         with:
           path: |
             agterm/Resources/zmx
             .zmx-build-stamp
-          key: zmx-v1-${{ steps.revisions.outputs.zmx }}-${{ steps.revisions.outputs.zmx_target }}-${{ hashFiles('scripts/zmx-patches/**/*.patch') }}
+          key: zmx-v2-${{ steps.revisions.outputs.zmx }}-${{ steps.revisions.outputs.zmx_target }}-${{ hashFiles('scripts/zmx-patches/**/*.patch') }}
       - name: Install xcodegen
         run: brew install xcodegen
       # The zsh plain-login seam needs zsh here; the fish seam switches the runner shell below.
@@ -316,7 +420,7 @@ jobs:
       - name: Build hosted tests
         run: |
           xcodegen generate
-          xcodebuild build-for-testing \
+          scripts/with-helper-prebuild.sh xcodebuild build-for-testing \
             -project agterm.xcodeproj \
             -scheme agtermTests \
             -destination 'platform=macOS' \
@@ -349,7 +453,7 @@ jobs:
           TEST_RUNNER_AGTERM_REQUIRE_FISH: "1"
         run: |
           sudo dscl . -create "/Users/$(id -un)" UserShell "$(which fish)"
-          xcodebuild test \
+          xcodebuild test-without-building \
             -project agterm.xcodeproj \
             -scheme agtermTests \
             -destination 'platform=macOS' \

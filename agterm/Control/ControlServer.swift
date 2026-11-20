@@ -24,7 +24,9 @@ final class ControlServer {
     let statusSoundPlayer: StatusSoundPlayer
     let launchRestoreMode: RestoreMode
     let zmxForegroundResolver: ZmxForegroundResolver?
-    private let socketPath: String
+    /// zmxDaemonForeground reads a wrapped pane's foreground for `restore.capture`; nil only in hosted tests.
+    let zmxDaemonForeground: ZmxDaemonForeground?
+    let socketPath: String
 
     /// The target-resolution query layer: owns the `emptyStore`/`store` frontmost-fallback and wraps the
     /// pure `ControlResolve` matcher with app-side store scoping and the pinned wire-error strings.
@@ -76,6 +78,10 @@ final class ControlServer {
     /// here because an extension cannot hold it. Main-actor only.
     let presentationHub = PresentationHub(staleTimeout: 30)
     var presentationStreams: [PresentationStream] = []
+    lazy var mailRelay = PresentationMailRelay { [unowned self] in
+        publishPresentationMail()
+        for catalog in originCatalogs.values { catalog.publisher.markDirty() }
+    }
     /// Remote overlay jobs this Mac handed to presenters.
     let overlayJobs = OverlayJobs()
     var overlayJobStreams: [String: OverlayJobStream] = [:]
@@ -83,27 +89,73 @@ final class ControlServer {
     var pendingJobCancels: Set<String> = []
     /// pageServeStreams are the channels presenters opened for pages this Mac handed over, by page id.
     var pageServeStreams: [UUID: PageServeStream] = [:]
-    /// pendingPageClaims are pages whose claim was answered ok and whose connection is not adopted yet, with the
-    /// page each serves as it was handed over.
-    var pendingPageClaims: [UUID: HtmlOverlay] = [:]
+    /// pendingPageClaims are claims answered ok whose connection is not adopted yet, by the token that claimed.
+    var pendingPageClaims: [String: PendingPageClaim] = [:]
     var presentationHeartbeat: Task<Void, Never>?
     /// How long an adopted stream may stay silent before its first hello.
     var presentationHelloDeadline: TimeInterval = 10
 
-    /// This Mac as a VIEWER: one client per attached session. `ControlServer+RemotePresentation` owns the
-    /// logic. The transport is injectable so a hosted test needs no ssh.
+    /// this Mac's windows served as remote windows; `ControlServer+MacCatalog` owns the logic.
+    var catalogStreams: [CatalogStream] = []
+    var catalogHeartbeat: Task<Void, Never>?
+    var originCatalogs: [UUID: OriginCatalog] = [:]
+    var originSignatures: [UUID: Set<String>] = [:]
+    /// restartHolds counts, per pane, the restarts that killed its daemon and have not yet confirmed or given up on
+    /// the new one; the catalog lists a held pane as running.
+    var restartHolds: [UUID: Int] = [:]
+    /// originConfirmations stamps panes a restart saw run, for an inventory read begun before that.
+    var originConfirmations = OriginConfirmations()
+    /// restartFollows is each pane's restart still waiting for its new shell; a later restart's confirmed kill
+    /// replaces it.
+    var restartFollows: [UUID: RestartFollow] = [:]
+    /// restartWaits bounds a restart's waits for its new shell: before the reply, and before its viewers are told,
+    /// counted from the launch.
+    var restartWaits = (shell: Duration.seconds(10), follow: Duration.seconds(60), poll: Duration.milliseconds(100))
+    /// restartLeader reads the named daemon's shell pid from the kernel; nil only without a zmx client.
+    var restartLeader: (@Sendable (String) -> pid_t?)?
+    /// originRead is the inventory read in flight, answering whether it succeeded; a request during it rereads.
+    var originRead: Task<Bool, Never>?
+    var originRereads = false
+    /// originEvidence is the last inventory read's evidence, which a window's new catalog starts from.
+    var originEvidence: CatalogPaneEvidence?
+    var originEventsWired = false
+    /// originLiveActive is whether this launch runs Live sessions, which serving a window needs; hosted tests set it.
+    var originLiveActive: () -> Bool = { GhosttyApp.shared.launchRestoreMode == .live }
+
+    /// This Mac as a VIEWER: one client per attached session. `ControlServer+RemotePresentation` owns the logic. The transport is injectable so a hosted test needs no ssh.
     var remoteClients: [UUID: RemotePresentationClient] = [:]
+    var companionFollow = CompanionFollowState()
+    /// restoredOriginChecks is each host whose restored rows are being checked, with its failures in a row.
+    var restoredOriginChecks: [String: Int] = [:]
     var remoteTransport: RemotePresentationTransport = RemotePresentationProcess()
     var remoteTick: Task<Void, Never>?
+    /// remoteCatalogs holds one catalog stream per open remote window; `ControlServer+RemoteCatalog` owns them.
+    var remoteCatalogs: [UUID: RemoteCatalogLink] = [:]
     /// replicaPages are the pages this Mac shows for origins, by local page id; `ControlServer+RemotePage` owns them.
     var replicaPages: [UUID: ReplicaPageRecord] = [:]
     /// remoteLinkRefusalHuds are the slot generations of the refusal panels a forwarded click opened, which a mirrored
     /// HUD may replace; `ControlServer+RemoteLinkClick` owns them.
     var remoteLinkRefusalHuds: [UUID: Int] = [:]
-    /// pageLauncher starts a file page's channel helper; injectable so a hosted test needs no ssh.
+    /// remoteOpeners are the `open` rules this Mac runs on files another host offers, by the stream each click was
+    /// made on (`remoteConnectionIDs`); `ControlServer+RemoteOpener` owns them.
+    lazy var remoteOpeners = RemoteOpeners()
+    var remoteConnectionIDs: [UUID: UUID] = [:]
+    /// snapshotBook holds the files this Mac offered for viewers' `open` rules.
+    lazy var snapshotBook = SnapshotOfferBook(clock: { [unowned self] in hudClock() })
+    /// pageLauncher and forwardLauncher start a page's channel helper and port forward; injectable so a hosted test needs no ssh.
     var pageLauncher: RemotePageLauncher = RemotePageProcess()
+    /// catalogPageClaims are the remote page rows a claim runs for; `ControlServer+CatalogPage` owns them.
+    var catalogPageClaims: Set<UUID> = []
+    /// forwardedPages names the server each page a remote window created lives on, so its result is read there after
+    /// that window is gone; `ControlServer+RemoteActions` owns them.
+    var forwardedPages: [UUID: String] = [:]
+    /// catalogPagePause is the wait before a remote page row's claim is tried again.
+    var catalogPagePause: () async -> Void = { try? await Task.sleep(for: .seconds(2)) }
+    var forwardLauncher: RemoteForwardLauncher = RemoteForwardProcessLauncher()
+    let linkForwards = LinkForwards()
     var pendingReplicaStates: Set<UUID> = []
     var replicaFlushScheduled = false
+    var openWorkTracking = 0
 
     nonisolated private func cachedWindows() -> [ControlWindowNode] {
         cacheLock.lock(); defer { cacheLock.unlock() }
@@ -189,12 +241,9 @@ final class ControlServer {
     var liveReset: LiveResetCoordinator?
     /// The scheduler's rows for `hooks.list`, wired by `agtermApp` once the controller exists.
     var hookStatus: () -> [ControlHookEntry] = { [] }
-    /// companionPageTokens are page-companion attachments handed to another Mac and not claimed yet, by token.
-    var companionPageTokens: [String: CompanionPageToken] = [:]
-    /// pendingCompanionClaims are claimed attachments whose channel is not adopted yet, by claim id.
-    var pendingCompanionClaims: [UUID: CompanionPageServing] = [:]
-    /// companionPageStreams are the live channels of page-companion attachments, by claim id.
-    var companionPageStreams: [UUID: PageServeStream] = [:]
+    /// pageAttachments are this Mac's page rows handed to other Macs.
+    lazy var pageAttachments = PageAttachmentBook(clock: { [unowned self] in hudClock() },
+                                                  servedPage: { [unowned self] in servedPage(session: $0, page: $1) })
     /// originEpoch names this app run in respawn counts, so a viewer never reads a restarted counter as older.
     let originEpoch = UUID().uuidString
     /// respawnGenerations counts each session's pane respawns by daemon name, for the presentation snapshot.
@@ -207,7 +256,8 @@ final class ControlServer {
     init(library: WindowLibrary, actions: AppActions, settingsModel: SettingsModel, identity: AppIdentity,
          bundleURL: URL = Bundle.main.bundleURL,
          launchRestoreMode: RestoreMode = GhosttyApp.shared.launchRestoreMode,
-         zmxForegroundResolver: ZmxForegroundResolver? = nil, zmxClient: ZmxClient? = nil,
+         zmxForegroundResolver: ZmxForegroundResolver? = nil, zmxDaemonForeground: ZmxDaemonForeground? = nil,
+         zmxClient: ZmxClient? = nil,
          zmxOutdatedBefore: Date? = nil,
          liveAttributionProbe: LiveAttributionProbe = LiveAttributionProbe(),
          remoteRunner: (any RemoteCommandRunner)? = nil,
@@ -222,7 +272,12 @@ final class ControlServer {
         self.statusSoundPlayer = statusSoundPlayer
         self.launchRestoreMode = launchRestoreMode
         self.zmxForegroundResolver = zmxForegroundResolver
+        self.zmxDaemonForeground = zmxDaemonForeground
         self.zmxClient = zmxClient
+        restartLeader = zmxClient.map { client in
+            let directory = client.endpoint.socketDirectory
+            return { ZmxDaemonForeground.leaderPID(directory: directory, name: $0) }
+        }
         self.zmxOutdatedBefore = zmxOutdatedBefore
         self.liveAttributionProbe = liveAttributionProbe
         self.identity = identity
@@ -247,9 +302,12 @@ final class ControlServer {
             MainActor.assumeIsolated { self?.refreshWindowCache() }
         }
         // a GUI-only sidebar toggle runs no control command, so window.list's cached copy would lag. queue
-        // nil (NOT .main) delivers synchronously on the posting @MainActor thread, so the refresh lands
-        // before the toggle returns; an async .main hop leaves a window for a stale fast-path read.
+        // nil delivers on the posting @MainActor thread, so the refresh lands before the toggle returns.
         NotificationCenter.default.addObserver(forName: .agtermSidebarVisibilityChanged, object: nil, queue: nil) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshWindowCache() }
+        }
+        // refresh before a catalog-changing GUI action returns
+        NotificationCenter.default.addObserver(forName: .agtermWindowCatalogChanged, object: nil, queue: nil) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshWindowCache() }
         }
         // window.list carries LIVE NSWindow geometry + fullscreen/zoom read at cache-build time, which a user
@@ -295,6 +353,9 @@ final class ControlServer {
     /// Bind and start listening. Idempotent — the scene `.task` re-runs when a window is recreated and a
     /// second `bind` must not be attempted. Any failure logs and returns, leaving the app to launch.
     func start() {
+        // ahead of the socket: a remote window mirrors its server whether or not this instance serves control
+        wireRemoteCatalogs()
+        wireOriginEvents()
         guard listener == nil else { return }
 
         guard socketPath.utf8.count < 104 else {
@@ -358,7 +419,12 @@ final class ControlServer {
         // outside the guard: the lock is taken in `init`, so an instance that never bound (path too long,
         // or a bind that failed) still holds one and would otherwise keep it for the whole process.
         defer { releaseOwnership() }
+        mailRelay.stop()
         shutdownPresentationStreams()
+        shutdownCatalogStreams()
+        pageAttachments.shutdown()
+        snapshotBook.shutdown()
+        stopRemoteCatalogs()
         stopRemotePresentations()
         guard let loop = listener else { return }
         loop.stop()
@@ -401,6 +467,9 @@ final class ControlServer {
     /// instance create a fresh inode and lock that instead, which excludes nobody.
     private func releaseOwnership() {
         guard lockFD >= 0 else { return }
+        // a child spawned on another thread holds a copy of the descriptor until it execs,
+        // so close alone keeps the lock
+        flock(lockFD, LOCK_UN)
         close(lockFD)
         lockFD = -1
     }
@@ -489,6 +558,15 @@ final class ControlServer {
             return
         }
 
+        // a catalog stream is handed off the same way; its hello names the window it mirrors
+        if request.cmd == .catalogSubscribe {
+            let response = runBlocking { await server.dispatch(request) }
+            guard server.responseWriter(conn, response), response.ok else { return }
+            handedOff = true
+            runBlocking { await server.adoptCatalogStream(descriptor: conn) }
+            return
+        }
+
         // a claimed job's helper keeps its connection the same way, and a claim whose reply never reached
         // the helper leaves nobody to run the job
         if request.cmd == .sessionOverlayJobRun {
@@ -508,13 +586,44 @@ final class ControlServer {
         if request.cmd == .sessionOverlayPageServe {
             let response = runBlocking { await server.dispatch(request) }
             let written = server.responseWriter(conn, response)
-            guard response.ok, let page = response.result?.id.flatMap(UUID.init(uuidString:)) else { return }
+            guard response.ok, let page = response.result?.id.flatMap(UUID.init(uuidString:)), let token = request.target else { return }
             guard written else {
-                runBlocking { await server.pageClaimUnanswered(page) }
+                runBlocking { await server.pageClaimUnanswered(page, token: token) }
                 return
             }
             handedOff = true
-            runBlocking { await server.adoptPageServeStream(descriptor: conn, page: page) }
+            runBlocking { await server.adoptPageServeStream(descriptor: conn, page: page, token: token) }
+            return
+        }
+
+        // an operation from a window mirroring one of this Mac's waits on zmx reads and a new row's panes, so it
+        // runs from a worker and never reaches the remote route below
+        if request.args?.opID != nil {
+            handedOff = true
+            let worker = Thread {
+                defer { close(conn) }
+                let response = runBlocking { await server.originOperation(request) }
+                _ = server.responseWriter(conn, response ?? ControlResponse(ok: false, error: "no operation id"))
+            }
+            worker.name = "com.umputun.agterm.control.catalog"
+            worker.start()
+            return
+        }
+
+        // a remote window's structural command is decided here and sent from a worker, so the accept thread
+        // never waits on ssh while local structural commands keep their inline order
+        if let route = runBlocking({ await server.remoteRoute(request) }) {
+            if case .refused = route {
+                _ = server.responseWriter(conn, runBlocking { await server.runRemoteRoute(route) })
+                return
+            }
+            handedOff = true
+            let worker = Thread {
+                defer { close(conn) }
+                _ = server.responseWriter(conn, runBlocking { await server.runRemoteRoute(route) })
+            }
+            worker.name = "com.umputun.agterm.control.remote"
+            worker.start()
             return
         }
 
@@ -551,9 +660,15 @@ final class ControlServer {
     /// carries the same wait; local `zmx.list` blocks too, but bounded, and stays inline to keep cache order.
     /// `session.restart` waits on process exits for seconds, while the shell it starts calls this socket.
     nonisolated private static func waitsOnNetwork(_ cmd: Command) -> Bool {
-        // companion creation may ssh to a remote parent's origin, which can be this Mac's own socket
+        // companion creation may ssh to a remote parent's origin, which can be this Mac's own socket;
+        // update.check waits on the feed, and session.paste may copy files to an origin
         [.zmxTree, .zmxAttach, .zmxAttachGroup, .sessionRestart, .sessionCompanionNew, .sessionCompanionDuplicate,
-         .sessionCompanionPage].contains(cmd)
+         .sessionCompanionPage, .sessionRemoteNew, .windowRemoteOpen, .updateCheck, .sessionPaste].contains(cmd)
+    }
+
+    // these polling reads cannot change window nodes; skip the AppKit rebuild
+    nonisolated private static func leavesWindowsUnchanged(_ cmd: Command) -> Bool {
+        cmd == .eventsRead || cmd == .msgRead
     }
 
     /// Read bytes from `conn` up to (and excluding) the first newline. Returns nil on EOF-before-newline, a
@@ -600,10 +715,11 @@ final class ControlServer {
 
     /// Run an async closure on a fresh task, blocking the calling background thread until it finishes —
     /// bridges the synchronous read loop to the main-actor dispatch without hopping the loop thread itself.
-    nonisolated private static func runBlocking<T: Sendable>(_ body: @escaping @Sendable () async -> T) -> T {
+    nonisolated static func runBlocking<T: Sendable>(_ body: @escaping @Sendable () async -> T) -> T {
         let semaphore = DispatchSemaphore(value: 0)
         let box = ResultBox<T>()
-        Task {
+        // above the default: a same-priority task waits behind every task already queued on the shared pool
+        Task(priority: .high) {
             box.value = await body()
             semaphore.signal()
         }
@@ -620,22 +736,24 @@ final class ControlServer {
 
     /// Execute a request against the store/actions seam. Never throws across the socket: any failure is a
     /// `{"ok":false,"error":…}` response.
-    private func dispatch(_ request: ControlRequest) async -> ControlResponse {
+    func dispatch(_ request: ControlRequest) async -> ControlResponse {
         // refresh the read cache in this same main-actor execution, so the background fast path sees the new
         // state without a separate, stallable hop.
-        defer { refreshWindowCache() }
+        defer { if !Self.leavesWindowsUnchanged(request.cmd) { refreshWindowCache() } }
+        // every entry, a page's bridge included, reaches a remote window's server the one way the socket does
+        if let route = remoteRoute(request) { return await runRemoteRoute(route) }
         if let refusal = pageCompanionRefusal(request) { return refusal }
         if let response = await ControlDispatcher(actions: self).dispatch(request) {
             return response
         }
         switch request.cmd {
-        case .tree, .eventsRead, .sessionNew, .sessionDuplicate, .sessionSelect, .sessionGo, .sessionClose, .sessionRename,
-                .sessionReveal, .sessionMove,
+        case .tree, .eventsRead, .sessionNew, .sessionDuplicate, .sessionSelect, .sessionGo, .sessionClose, .sessionTerminate, .sessionUndo,
+                .sessionRename, .sessionReveal, .sessionMove,
                 .workspaceNew, .workspaceSelect, .workspaceGo, .workspaceRename, .workspaceDelete, .workspaceMove,
                 .workspaceFocus,
                 .workspaceFilter, .workspaceCollapse, .workspaceExpand, .workspaceFlag,
                 .sessionCollapse, .sessionExpand, .sessionCompanionNew, .sessionCompanionPage, .sessionPage, .sessionCompanionDuplicate,
-                .sessionCompanionConvert, .sessionCompanionPageAttach,
+                .sessionCompanionConvert, .sessionCompanionMove, .sessionCompanionPageAttach,
                 .sessionSplit, .sessionSplitClose, .sessionSwap, .sessionLead, .sessionRestart, .sessionScratch, .sessionFocus,
                 .sessionResize, .surfaceZoom,
                 .surfaceCursor,
@@ -650,14 +768,15 @@ final class ControlServer {
                 .sessionOverlayReload, .sessionOverlayNavigate,
                 .sessionOverlayResult, .sessionOverlaySubmit, .sessionOverlayCopy, .sessionOverlayText,
                 .sessionOverlayHide, .sessionOverlayShow, .sessionOverlayToggle, .sessionOverlayFollow, .sessionOverlaySearch,
-                .sessionOverlayChanges,
+                .sessionOverlayChanges, .sessionOverlayFiles, .sessionOverlayWrap, .sessionOverlayExpand,
                 .sessionBackground, .sessionText, .quick, .quickType, .quickText,
                 .windowNew, .windowList, .windowSelect, .windowGo,
                 .windowClose, .windowRename, .windowDelete, .windowResize, .windowMove, .windowZoom,
-                .windowFullscreen, .windowMinimize,
-                .restoreClear, .restoreCapture, .restoreMode, .zmxList, .zmxPrune, .zmxKill, .zmxReset, .zmxTree,
-                .zmxAttach, .zmxAttachGroup, .zmxPresent, .zmxScreen, .sessionOverlayJobRun, .sessionOverlayPageServe, .dashboard, .version,
-                .recentList, .recentOpen, .recentClear:
+                .windowFullscreen, .windowMinimize, .windowRemoteOpen, .windowRemoteDismiss,
+                .sessionDetach, .sessionReattach, .workspaceDetach, .workspaceReattach,
+                .restoreClear, .restoreCapture, .restoreMode, .zmxList, .zmxPrune, .zmxKill, .zmxKillPane, .zmxReset, .zmxTree,
+                .zmxAttach, .zmxAttachGroup, .zmxPresent, .zmxScreen, .catalogSubscribe, .catalogOp, .sessionOverlayJobRun, .sessionOverlayPageServe, .dashboard, .version, .updateCheck,
+                .recentList, .recentOpen, .recentClear, .sessionRemoteNew:
             return ControlResponse(ok: false, error: "control dispatcher did not handle \(request.cmd.rawValue)")
         case .debugAppearance:
             return setDebugAppearance(args: request.args)
@@ -701,167 +820,6 @@ final class ControlServer {
         return ControlResponse(ok: true, result: ControlResult(text: isDark ? "dark" : "light"))
     }
 
-    /// Clear every open session's captured foreground command and persist, so the next launch restores plain
-    /// shells. The live fields are usually already nil (consumed at restore); the SAVE is what wipes the
-    /// on-disk copy from the last quit, closing the force-quit re-fire window. App-global like
-    /// `keymap.reload`: no `--window` selector, every open window is cleared.
-    ///
-    /// Also disarms the PENDING capture slots, where a launch restore parks the argv until each surface
-    /// mounts: the socket binds before the later windows' decks do, so a clear arriving in that gap would
-    /// answer ok and then watch those windows run the commands anyway. The `session.restore` pins are
-    /// deliberately untouched — they are sticky, and this command clears captures.
-    func clearRestoreCommands() -> ControlResponse {
-        for session in library.allOpenSessions() { session.clearCapturedForegroundCommands() }
-        // the ack waits on the write for the same reason `restore.capture`'s does: the save IS the clear, and
-        // the slots are not readable, so an ok over a failed write leaves a stale capture nothing can detect.
-        guard library.saveAllOpenChecked() else {
-            return ControlResponse(ok: false, error: "cleared every open pane but at least one window's save "
-                + "failed; those windows keep their captured commands on disk until they save successfully")
-        }
-        return ControlResponse(ok: true)
-    }
-
-    /// The restore-mode policy: settings, this launch's request, and what it got.
-    func readRestoreMode() -> ControlResponse {
-        ControlResponse(ok: true, result: ControlResult(restore: restoreStatus()))
-    }
-
-    /// Persist the mode for the NEXT launch; a pane is wrapped or not at creation, so this process keeps
-    /// the mode it started with.
-    func setRestoreMode(_ mode: RestoreMode) -> ControlResponse {
-        guard settingsModel.setRestoreMode(mode) else {
-            return ControlResponse(ok: false, error: "could not save the restore mode; settings keep "
-                + settingsModel.settings.effectiveRestoreMode.rawValue)
-        }
-        return ControlResponse(ok: true, result: ControlResult(restore: restoreStatus()))
-    }
-
-    func restoreStatus() -> ControlRestoreStatus {
-        let decision = GhosttyApp.shared.restoreLaunchDecision
-        return ControlRestoreStatus(configured: settingsModel.settings.effectiveRestoreMode,
-                                    requestedAtLaunch: decision.requested, active: decision.active,
-                                    unavailableReason: decision.liveUnavailableReason)
-    }
-
-    /// Capture every open pane's live foreground command NOW, filling the same slots the quit-time capture
-    /// fills, then persist them. The point is the exit that never runs `applicationWillTerminate`: a crash, a
-    /// SIGKILL, a hard reset, or a restart that outruns the app's termination window. Run this from a
-    /// scheduled job or a keybind and such an exit restores like a ⌘Q.
-    ///
-    /// App-global like `clearRestoreCommands`, its inverse over the same slots: no `--window` selector, every
-    /// open window. Consumption stays one-shot and launch-only, so nothing here changes replay.
-    ///
-    /// Available only when rerun is configured for the next launch. It refuses in the other two modes,
-    /// unlike `session.restore`, which saves future rerun policy with a note.
-    func captureRestoreCommands() -> ControlResponse {
-        let configuredMode = settingsModel.settings.effectiveRestoreMode
-        guard configuredMode == .rerun else {
-            return ControlResponse(ok: false, error: "restore.capture requires rerun mode; configured restore mode is "
-                + configuredMode.rawValue)
-        }
-        let sessions = library.allOpenSessions()
-        let captured = AppDelegate.captureForegroundCommands(
-            sessions: sessions, zmxResolver: zmxForegroundResolver)
-        // this command's whole claim is that the argv reached disk, so the ack waits on the write and not on
-        // the assignment: `saveAllOpen` swallows the result, `saveAllOpenChecked` reports it.
-        guard library.saveAllOpenChecked() else {
-            return ControlResponse(ok: false, error: "captured \(captured) pane\(captured == 1 ? "" : "s") "
-                + "but at least one window's save failed; failed windows keep their argv in memory until they "
-                + "save successfully")
-        }
-        var result = ControlResult(count: captured)
-        result.text = "captured \(captured) pane\(captured == 1 ? "" : "s")"
-        return ControlResponse(ok: true, result: result)
-    }
-
-    /// Open or close the target window's dashboard overlay — the app side of the host-free `dashboard`
-    /// command (the dispatcher validated the args and built `fontMode`, but does not cap the ids). Resolves
-    /// `window ?? frontmost` to an OPEN window's store. `mru` takes up to `DashboardLayout.maxCells` of that
-    /// store's most-recently-used sessions (fewer if it has fewer, nothing unresolved); otherwise each id
-    /// parses as a `DashboardTarget` and its head resolves within THAT store, misses reported in
-    /// `result.text`. A bare id EXPANDS in order into pane cells — always `.primary`, plus `.split` when it
-    /// `hasSplit` (both shells alive), so a split shows as TWO cells — while a `:left`/`:right` suffix (#331)
-    /// takes that cell alone; a `:right` naming no live pane is a miss, not an error. Cells dedup by
-    /// session+pane, NOT by session, so `A:left A:right` is two cells and `A A:left` is still two. The
-    /// `maxCells` (9) cap counts PANES, applied here after expansion, its drops reported alongside
-    /// `unresolved` (joined with "; "). Emptiness is judged on the expanded CELLS, since a resolved id can
-    /// now contribute none.
-    /// Each cell reparents its OWN pane surface (`\.surface` / `\.splitSurface`) app-side in
-    /// `WindowContentView`. Opening closes the window's terminal zoom (mutually exclusive); `--close` calls
-    /// `close()`. The registry returns nil until `WindowContentView` registers the controller (or while the
-    /// window tears down), reported as the window not being open.
-    func setDashboard(targets: [String], window: String?, close: Bool,
-                      fontMode: DashboardFontMode, mru: Bool) -> ControlResponse {
-        resolver.resolvePlacementStore(window) { store in
-            guard let windowID = library.windowID(for: store),
-                  let controller = DashboardControllerRegistry.shared.controller(for: windowID) else {
-                return ControlResponse(ok: false, error: "window not open — window.select it first")
-            }
-            if close {
-                controller.close()
-                return ControlResponse(ok: true)
-            }
-            if let error = PickRegistry.shared.controller(for: windowID)?.pendingModalError {
-                return ControlResponse(ok: false, error: error)
-            }
-            var resolvedTargets: [ResolvedDashboardTarget] = []
-            var unresolved: [String] = []
-            if mru {
-                let recent = store.recentSessions(limit: DashboardLayout.maxCells)
-                guard !recent.isEmpty else {
-                    return ControlResponse(ok: false, error: "no recent sessions")
-                }
-                resolvedTargets = recent.map { ResolvedDashboardTarget(session: $0, pane: nil) }
-            } else {
-                let candidates = store.workspaces.flatMap { $0.sessions.map(\.id) }
-                for target in targets {
-                    guard let parsed = DashboardTarget(rawValue: target),
-                          case .resolved(let id) = ControlResolve.resolve(parsed.head, candidates: candidates,
-                                                                          active: store.selectedSessionID),
-                          let session = store.session(withID: id) else {
-                        unresolved.append(target)
-                        continue
-                    }
-                    // a `:right` ref to a session with no split is a MISS, not a malformed command: the
-                    // dispatcher already passed the grammar. `hasSplit` is the same test
-                    // `dashboardValidMembers` reconciles against, so this never admits a cell reconcile
-                    // would immediately prune.
-                    guard parsed.pane != .split || session.hasSplit else {
-                        unresolved.append(target)
-                        continue
-                    }
-                    resolvedTargets.append(ResolvedDashboardTarget(session: id, pane: parsed.pane))
-                }
-            }
-            // the shared host-free helper: ONE expansion+cap implementation with AppActions.toggleDashboard.
-            // it also dedups, so a bare id beside a pane ref for the same session cannot double-host a surface.
-            let (members, droppedPanes) = store.dashboardMembers(for: resolvedTargets,
-                                                                 limit: DashboardLayout.maxCells)
-            // guard the EXPANSION, not the resolved targets: with pane refs they are no longer equivalent.
-            // `dashboard <id>:right` on a session with no split resolves the id but expands to nothing, and
-            // opening with an empty member set would clear the window's zoom and silently close a live
-            // dashboard while reporting ok (`DashboardController.isOpen` is `!members.isEmpty`).
-            guard !members.isEmpty else {
-                return ControlResponse(ok: false, error: "no dashboard sessions resolved")
-            }
-            TerminalZoomRegistry.shared.controller(for: windowID)?.clear()
-            controller.open(members: members, fontMode: fontMode)
-            // set the applied size SYNCHRONOUSLY so the `dashboardFontSize` read-back is authoritative at
-            // command return: the SwiftUI onChange applying the surface overrides runs a runloop turn later,
-            // and open() never resets appliedFontSize, so an untouched re-open would leak the prior
-            // fixed/auto size. idempotent with the wiring — both go through DashboardFontMode.appliedFontSize.
-            let base = settingsModel.settings.fontSize ?? DashboardLayout.ghosttyDefaultFontSize
-            controller.setAppliedFontSize(fontMode.appliedFontSize(memberCount: members.count, base: base))
-            var notes: [String] = []
-            if !unresolved.isEmpty { notes.append("unresolved: \(unresolved.joined(separator: ", "))") }
-            if droppedPanes > 0 {
-                notes.append("dropped \(droppedPanes) pane(s) beyond the \(DashboardLayout.maxCells)-cell limit")
-            }
-            guard !notes.isEmpty else { return ControlResponse(ok: true) }
-            return ControlResponse(ok: true, result: ControlResult(text: notes.joined(separator: "; ")))
-        }
-    }
-
     /// Project a window's workspace tree into the wire `ControlTree`, marking the active session and the
     /// active workspace (`currentWorkspaceID`, what `--target active` resolves to — not necessarily the
     /// selected session's owner, since an empty or foreground-created workspace becomes current on its own).
@@ -884,7 +842,7 @@ final class ControlServer {
         // the window's dashboard controller (nil until WindowContentView registers it), read LIVE for the four
         // dashboard read-backs: the keyboard-driven dashboard bypasses the command path, so a cache goes stale.
         let dashboard = DashboardControllerRegistry.shared.controller(for: windowID)
-        return store.controlTree(
+        var tree = store.controlTree(
             paneForeground: { session in
                 (session.surface as? GhosttySurfaceView).flatMap {
                     ForegroundProcess.running(for: $0, shellBasename: shellBasename,
@@ -897,7 +855,8 @@ final class ControlServer {
                                               zmxResolver: zmxForegroundResolver)
                 }
             },
-            liveAttribution: { attributions[$0] },
+            liveAttribution: { attributions[$0]?.attribution },
+            liveHostStale: { attributions[$0]?.staleHost == true },
             fontSize: { ($0.addressableSurface as? GhosttySurfaceView)?.currentFontSize() },
             splitFontSize: { ($0.splitSurface as? GhosttySurfaceView)?.currentFontSize() },
             scratchFontSize: { ($0.scratchSurface as? GhosttySurfaceView)?.currentFontSize() },
@@ -940,6 +899,9 @@ final class ControlServer {
             linkOpenMode: settingsModel.settings.effectiveLinkOpenMode,
             sidebarDensity: GhosttyApp.shared.sidebarDensity
         )
+        tree.remote = windowID.flatMap(library.remoteNode(for:))
+        tree.catalogViewers = windowID.flatMap(originViewers)
+        return tree
     }
 
     /// Creates a session in `workspaceID` of `store` with the `session.new` args (cwd default $HOME, optional

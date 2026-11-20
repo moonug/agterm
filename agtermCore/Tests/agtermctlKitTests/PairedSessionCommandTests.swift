@@ -18,6 +18,13 @@ struct PairedSessionCommandTests {
         }
     }
 
+    @Test func pairedCommandsRejectRemoteAndCompanionCreation() {
+        for destination in ["--remote", "--parent"] {
+            #expect(validationMessage(["session", "new", "--command", "left", "--split-command", "right", destination, "target"])
+                    == "--split-command is only supported when creating a local, non-companion session")
+        }
+    }
+
     private func validationMessage(_ arguments: [String]) -> String? {
         do {
             _ = try Agtermctl.parseAsRoot(arguments)

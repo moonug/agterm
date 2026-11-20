@@ -3,36 +3,25 @@ import agtermCore
 import Foundation
 import AgtermResponsibility
 import Darwin
+import os
 
 /// The `zmx` command group: the daemon inventory and, later, the actions over it. Every command needs a
 /// running instance by design — only one can join the live stores, the pending-close records, the checked
 /// closed-window snapshots and the observed daemons into a single answer.
 extension ControlServer {
-    func liveAttributions(in sessions: [Session], leaders: [String: pid_t]?) -> [UUID: SessionHost.Attribution] {
+    func liveAttributions(in sessions: [Session], leaders: [String: pid_t]?) -> [UUID: SessionHost.Placement] {
         let identities = Set(sessions.filter { $0.remoteHost == nil }.flatMap { session -> [UUID] in
             var ids = session.surface?.backedByZmx == true ? [session.paneIdentity] : []
             if session.hasSplit, session.splitSurface?.backedByZmx == true, let split = session.splitPaneIdentity { ids.append(split) }
             return ids
         })
         guard !identities.isEmpty, let leaders else { return [:] }
-        var probes: [pid_t: SessionHost.ResponsibleProcess] = [:]
-        func responsible(_ pid: pid_t) -> SessionHost.ResponsibleProcess {
-            if let cached = probes[pid] { return cached }
-            let result = liveAttributionProbe.responsible(pid)
-            probes[pid] = result
-            return result
-        }
-        let host = liveHostPID(responsible: responsible)
+        let place = liveAttributionProbe.placer(endpoint: zmxClient?.endpoint)
+        let unread = SessionHost.Placement(attribution: .unknown, staleHost: false)
         return Dictionary(uniqueKeysWithValues: identities.map { identity in
-            let leader = leaders[ZmxSupport.daemonName(for: identity)]
-            return (identity, SessionHost.classify(leader: leader, responsible: leader.map(responsible), hostPid: host, appPid: liveAttributionProbe.appPID))
+            let name = ZmxSupport.daemonName(for: identity)
+            return (identity, leaders[name].map { place(name, $0) } ?? unread)
         })
-    }
-
-    /// The session host's pid when its pidfile names a live host, else nil.
-    private func liveHostPID(responsible: (pid_t) -> SessionHost.ResponsibleProcess) -> pid_t? {
-        guard let candidate = zmxClient.flatMap({ liveAttributionProbe.hostPID($0.endpoint) }) else { return nil }
-        return responsible(candidate) == .live(candidate) ? candidate : nil
     }
 
     /// The reset's read-back for the tree top level and the `zmx list` header: nil when nothing is pending
@@ -57,9 +46,11 @@ extension ControlServer {
             return ControlResponse(ok: false, error: "zmx.reset was cancelled")
         case .confirmed(let selection):
             let outdated = selection.outdatedSessionCount
+            let stale = selection.staleHostSessionCount
             let status = ControlLiveResetStatus(sessions: selection.sessionCount, panes: selection.targets.count, pending: true,
-                                                outdated: outdated > 0 ? outdated : nil)
-            let text = LiveReset.dialogText(sessionCount: selection.sessionCount, outdatedSessions: outdated).body
+                                                outdated: outdated > 0 ? outdated : nil, staleHost: stale > 0 ? stale : nil)
+            let text = LiveReset.dialogText(sessionCount: selection.sessionCount, outdatedSessions: outdated,
+                                            staleHostSessions: stale).body
             return ControlResponse(ok: true, result: ControlResult(text: text, liveReset: status))
         }
     }
@@ -68,7 +59,7 @@ extension ControlServer {
     func liveResetSelection() -> LiveReset.Selection? {
         guard let zmxClient, let records = zmxClient.sessionRecords() else { return nil }
         return LiveReset.select(claims: library.paneClaims(), records: records, outdatedBefore: zmxOutdatedBefore,
-                                classify: liveAttributionProbe.classifier(endpoint: zmxClient.endpoint))
+                                place: liveAttributionProbe.placer(endpoint: zmxClient.endpoint))
     }
 
     /// Observed daemons joined against the panes that claim them, with the restore status as a header.
@@ -188,6 +179,11 @@ extension ControlServer {
     /// attach, handing back a fresh shell wearing the session's name. Everything that can fail is checked
     /// before the model is touched, so a refusal leaves no half-built row behind.
     func attachRemoteSession(host: String, session: String, window: String?) async -> ControlResponse {
+        await attachRemoteSession(host: host, session: session, window: window, workspace: nil)
+    }
+
+    func attachRemoteSession(host: String, session: String, window: String?,
+                             workspace target: ControlAttachWorkspace?) async -> ControlResponse {
         let discovery = await remoteTree(host: host)
         guard discovery.ok, let tree = discovery.result?.remote else { return discovery }
         // by id only: remote session names are mutable and deliberately non-unique across workspaces, and
@@ -200,17 +196,61 @@ extension ControlServer {
         case .failure(let response): return response
         case .success(let (_, resolved)): store = resolved
         }
-        if remote.content == "page" { return await attachRemotePageRow(remote, tree: tree, host: host, in: store) }
+        if remote.content == "page" { return await attachRemotePageRow(remote, tree: tree, host: host, in: store, workspace: target) }
         // a companion joins its parent's group when exactly one row here shows that parent, else it stands alone
         let parents = remote.parent == nil ? [] : attachedParentRows(of: remote, tree: tree, host: host, in: store)
         if parents.count == 1, let parent = parents.first, let workspace = store.workspace(forSession: parent.id)?.id {
             return attach(remote, from: tree, host: host,
                           placement: RemotePlacement(store: store, workspace: workspace, parent: parent.id))
         }
-        guard let workspace = store.currentWorkspaceID else {
-            return ControlResponse(ok: false, error: "no window to attach into")
+        switch attachWorkspace(target, in: store) {
+        case .failure(let response): return response
+        case .success(let destination):
+            // created only now: discovery and lookup can no longer refuse, only a payload agterm cannot address
+            guard let workspace = destination.workspace(in: store) else { return Self.workspaceNotCreated }
+            return attach(remote, from: tree, host: host, placement: RemotePlacement(store: store, workspace: workspace))
         }
-        return attach(remote, from: tree, host: host, placement: RemotePlacement(store: store, workspace: workspace))
+    }
+
+    static let workspaceNotCreated = ControlResponse(ok: false, error: "the workspace to attach into could not be created")
+
+    /// AttachDestination is the workspace an attach resolved: one that exists, or a name `--create-workspace` adds
+    /// when the row is placed, so a refusal before that adds none.
+    enum AttachDestination {
+        case existing(UUID)
+        case create(String)
+
+        /// workspace is the destination's id in `store`, creating a named one now; nil when the name sanitizes to blank.
+        @MainActor func workspace(in store: AppStore) -> UUID? {
+            switch self {
+            case .existing(let id): return id
+            case .create(let name): return store.ensureWorkspace(named: name)?.id
+            }
+        }
+    }
+
+    /// attachWorkspace is where a row that stands alone lands in `store`: `target`, else the current workspace.
+    func attachWorkspace(_ target: ControlAttachWorkspace?, in store: AppStore) -> ControlTargetResolver.Resolution<AttachDestination> {
+        switch target {
+        case nil:
+            guard let id = store.currentWorkspaceID else {
+                return .failure(ControlResponse(ok: false, error: "no window to attach into"))
+            }
+            return .success(.existing(id))
+        case .id(let raw):
+            let resolution = ControlResolve.resolve(raw, candidates: store.workspaces.map(\.id), active: store.currentWorkspaceID)
+            guard case .resolved(let id) = resolution else {
+                let message = ControlResolve.errorMessage(noun: "workspace", target: raw, resolution: resolution)
+                return .failure(ControlResponse(ok: false, error: message))
+            }
+            return .success(.existing(id))
+        case .name(let name, let create):
+            if let found = store.workspace(named: name) { return .success(.existing(found.id)) }
+            guard create else {
+                return .failure(ControlResponse(ok: false, error: "no workspace named \"\(name)\" (pass --create-workspace to add it)"))
+            }
+            return .success(.create(name))
+        }
     }
 
     /// RemotePlacement is where an attached row goes: a workspace, or under `parent`, a remote row of the same host.
@@ -219,6 +259,10 @@ extension ControlServer {
         let workspace: UUID
         var parent: UUID?
         var select = true
+        /// index is the row's place in the workspace; nil appends it.
+        var index: Int?
+        /// claimLead is the user asking for the session here; a row the origin's membership brought in takes no lead.
+        var claimLead = true
     }
 
     /// attach creates the local row for `remote`, one session of `tree`, and binds its panes. Everything that can
@@ -235,8 +279,7 @@ extension ControlServer {
         let right = byRole[.right]
         let primary: String
         let split: String?
-        // attaching is the user asking for the session HERE, so every pane claims the lead at once
-        let leads = (left: ZmxLeadAttachment(claim: true), right: ZmxLeadAttachment(claim: true))
+        let leads = (left: ZmxLeadAttachment(claim: placement.claimLead), right: ZmxLeadAttachment(claim: placement.claimLead))
         do {
             primary = try RemoteSession.attachPaneCommand(host: host, endpoint: tree.endpoint, daemon: left,
                                                           session: remote.name, pane: .left, lead: leads.left)
@@ -252,8 +295,8 @@ extension ControlServer {
         // path that exists on the far side may not exist on this Mac. The attached shell reports its real
         // cwd through the terminal stream anyway.
         guard let created = store.addSession(toWorkspace: placement.workspace, cwd: NSHomeDirectory(),
-                                             command: primary, name: remote.name, wait: true,
-                                             select: placement.select, remoteHost: host,
+                                             command: primary, name: remote.name, wait: true, at: placement.index,
+                                             select: placement.select, remoteHost: host, remoteSessionID: remote.id,
                                              parentID: placement.parent) else {
             return ControlResponse(ok: false, error: "could not create the session")
         }
@@ -262,6 +305,8 @@ extension ControlServer {
             created.splitCommandWait = true
             store.setSplitVisibility(created.id, shown: true,
                                      axis: remote.splitAxis.flatMap(SplitAxis.init(rawValue:)) ?? .leftRight)
+            // a new split focuses its right pane; an attached session opens on its left one
+            created.splitFocused = false
         }
         var daemons = [created.paneIdentity: left]
         ZmxLeadBook.shared.begin(leads.left, pane: created.paneIdentity)
@@ -271,9 +316,12 @@ extension ControlServer {
         }
         let origin = RemoteBinding.Origin(host: host, endpoint: tree.endpoint, sessionName: remote.name)
         store.bindRemote(RemoteBinding(remoteSessionID: remote.id, daemonsByLocalPane: daemons,
-                                       presentationVersion: tree.presentation, origin: origin),
+                                       presentationVersion: tree.presentation, origin: origin,
+                                       originHeadless: tree.headless == true),
                          forSession: created.id)
-        // the row's created event fired inside `addSession`, before the binding existed
+        if let members = remote.companions { store.baselineCompanions(members.map(\.id), forSession: created.id) }
+        if let parent = remote.parent { library.markOriginCompanionsHandled([remote.id], parent: parent, host: host, endpoint: tree.endpoint) }
+        // the row's created event fired inside `addSession`, before the binding existed; seeded first, so no list beats it
         startRemotePresentation(for: created)
         // a FIXED target, never `focusActiveSession`: it follows `splitFocused`, which the new split's deck
         // re-render can clear from under it through `onFocusChange`.
@@ -322,7 +370,7 @@ extension ControlServer {
 
     /// Reports per daemon rather than a bare count: a stale-socket cleanup is not a kill, and a caller that
     /// cannot tell the two apart would believe a live unresponsive daemon had gone.
-    private func pruneReport(_ outcomes: [String: ZmxClient.KillOutcome]) -> String {
+    private func pruneReport(_ outcomes: [String: ZmxKillOutcome]) -> String {
         outcomes.keys.sorted().map { name in
             switch outcomes[name] {
             case .killed: return "killed \(name)"
@@ -341,6 +389,14 @@ extension ControlServer {
     /// Resolution runs against the INVENTORY rather than `ControlTargetResolver`, which searches open
     /// stores only: this command deliberately reaches closed and unindexed claims no window shows.
     func killZmxDaemon(target: String, window: String?, pane: ZmxPaneRole) -> ControlResponse {
+        killZmxDaemon(target: target, window: window, pane: pane, pinned: nil)
+    }
+
+    func killZmxPane(target: String, window: String?, pane: ZmxPaneRole, paneID: String) -> ControlResponse {
+        killZmxDaemon(target: target, window: window, pane: pane, pinned: paneID)
+    }
+
+    private func killZmxDaemon(target: String, window: String?, pane: ZmxPaneRole, pinned: String?) -> ControlResponse {
         guard let client = zmxClient else {
             return ControlResponse(ok: false, error: ControlZmxError.unavailable)
         }
@@ -379,6 +435,9 @@ extension ControlServer {
             return ControlResponse(ok: false, error: "no \(pane.rawValue) pane daemon for session \(target)")
         }
         if let refusal = ControlZmxError.killRefusal(row) {
+            return ControlResponse(ok: false, error: refusal)
+        }
+        if let pinned, let refusal = ZmxPaneRole.pinRefusal(pinned, identity: claim.paneIdentity, pane: pane) {
             return ControlResponse(ok: false, error: refusal)
         }
 
@@ -447,12 +506,20 @@ public enum ControlZmxError {
 }
 
 struct LiveAttributionProbe {
+    /// Hosts is every host endpoint's published pid by endpoint name, and the current key's endpoint name,
+    /// nil when the helper's key could not be read.
+    struct Hosts: Equatable {
+        var pids: [String: pid_t] = [:]
+        var current: String?
+    }
+
     var responsible: (pid_t) -> SessionHost.ResponsibleProcess = LiveAttributionProbe.lookup
-    var hostPID: (ControlZmxEndpoint) -> pid_t? = LiveAttributionProbe.host
+    var hosts: (ControlZmxEndpoint) -> Hosts = LiveAttributionProbe.publishedHosts
     var appPID: pid_t = getpid()
 
-    /// A classifier over daemon leaders that resolves the host once and probes each pid once.
-    func classifier(endpoint: ControlZmxEndpoint) -> (String, Int32) -> SessionHost.Attribution {
+    /// placer places daemon leaders against this endpoint's hosts. A published host counts only while it is its
+    /// own responsible process, which disclaiming it at spawn made it.
+    func placer(endpoint: ControlZmxEndpoint?) -> (String, Int32) -> SessionHost.Placement {
         var probes: [pid_t: SessionHost.ResponsibleProcess] = [:]
         func probed(_ pid: pid_t) -> SessionHost.ResponsibleProcess {
             if let cached = probes[pid] { return cached }
@@ -460,9 +527,12 @@ struct LiveAttributionProbe {
             probes[pid] = result
             return result
         }
-        let host = hostPID(endpoint).flatMap { probed($0) == .live($0) ? $0 : nil }
+        let published = endpoint.map(hosts) ?? Hosts()
+        let live = published.pids.filter { probed($0.value) == .live($0.value) }
+        let current: SessionHost.Roots.Current = published.current.map { live[$0].map { .running($0) } ?? .absent } ?? .unknown
+        let roots = SessionHost.Roots(hosts: Set(live.values), current: current)
         return { _, leader in
-            SessionHost.classify(leader: leader, responsible: probed(leader), hostPid: host, appPid: appPID)
+            SessionHost.place(leader: leader, responsible: probed(leader), roots: roots, appPid: appPID)
         }
     }
 
@@ -472,15 +542,72 @@ struct LiveAttributionProbe {
         return errno == ESRCH ? .dead : .unknown
     }
 
-    private static func host(_ endpoint: ControlZmxEndpoint) -> pid_t? {
-        guard let paths = try? SessionHost.paths(socketDirectory: endpoint.socketDirectory) else { return nil }
-        guard let value = try? String(contentsOfFile: paths.pidfile, encoding: .utf8),
-              let pid = pid_t(value.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0 else { return nil }
-        let expected = URL(fileURLWithPath: endpoint.executable).deletingLastPathComponent().appendingPathComponent("agterm-session-host")
-        guard let path = realpath(expected.path, nil) else { return nil }
-        defer { free(path) }
-        var bytes = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
-        guard proc_pidpath(pid, &bytes, UInt32(bytes.count)) > 0 else { return nil }
-        return String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self) == String(cString: path) ? pid : nil
+    static func publishedHosts(_ endpoint: ControlZmxEndpoint) -> Hosts {
+        var result = Hosts()
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: endpoint.socketDirectory)) ?? []
+        where SessionHost.isEndpointName(name) {
+            guard let paths = try? SessionHost.paths(socketDirectory: endpoint.socketDirectory, endpoint: name),
+                  let pid = publishedHost(pidfile: paths.pidfile) else { continue }
+            result.pids[name] = pid
+        }
+        result.current = HelperEndpointKey.shared.key(helper: ZmxLaunch.sessionHostPath).flatMap { try? SessionHost.endpointName(key: $0) }
+        return result
+    }
+
+    /// publishedHost is the pidfile's pid when that process started no later than the file was last written.
+    /// A host writes the file after it starts and touches it while it runs, so a pid reused after a host crash
+    /// started later. The executable path is no test: an update deletes or moves the old host's image.
+    static func publishedHost(pidfile: String) -> pid_t? {
+        let fd = open(pidfile, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var status = stat()
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let count = read(fd, &bytes, bytes.count)
+        guard fstat(fd, &status) == 0, count > 0,
+              let pid = pid_t(String(decoding: bytes.prefix(count), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 0 else { return nil }
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+        let started = Double(info.pbi_start_tvsec) + Double(info.pbi_start_tvusec) / 1e6
+        let written = Double(status.st_mtimespec.tv_sec) + Double(status.st_mtimespec.tv_nsec) / 1e9
+        return started <= written ? pid : nil
+    }
+}
+
+/// HelperEndpointKey runs the bundled helper's `key` once per helper file, keyed by device, inode and
+/// modification time because an update replaces the file under the running app. A failed run is not cached.
+final class HelperEndpointKey: Sendable {
+    static let shared = HelperEndpointKey()
+
+    private struct FileIdentity: Hashable {
+        let device: dev_t
+        let inode: ino_t
+        let modified: Int
+    }
+
+    private let cache = OSAllocatedUnfairLock<[String: (identity: FileIdentity, key: String)]>(initialState: [:])
+    private let run: @Sendable (String) -> String?
+
+    init(run: @escaping @Sendable (String) -> String? = HelperEndpointKey.runHelper) {
+        self.run = run
+    }
+
+    func key(helper: String) -> String? {
+        var status = stat()
+        guard stat(helper, &status) == 0 else { return nil }
+        let identity = FileIdentity(device: status.st_dev, inode: status.st_ino,
+                                    modified: status.st_mtimespec.tv_sec * 1_000_000_000 + status.st_mtimespec.tv_nsec)
+        if let cached = cache.withLock({ $0[helper] }), cached.identity == identity { return cached.key }
+        guard let key = run(helper), (try? SessionHost.endpointName(key: key)) != nil else { return nil }
+        cache.withLock { $0[helper] = (identity, key) }
+        return key
+    }
+
+    private static func runHelper(_ helper: String) -> String? {
+        let invocation = ZmxClient.Invocation(executablePath: helper, arguments: ["key"], environment: [:],
+                                              timeout: 2, mergesStderr: false)
+        return (try? ZmxClient.run(invocation))?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
