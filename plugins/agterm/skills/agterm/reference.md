@@ -2122,11 +2122,11 @@ mailbox. Hiding a split, a swap and a split promoted after the primary exits kee
 quitting the app. Read back `pendingMessages` on the tree surface node and the `message` event; a hook
 on `message` reacts to new mail without polling.
 
-Mail crosses hosts: address a pane of a remote window (an agterm-server's or another Mac's) exactly like a
-local one and agterm forwards the whole `msg` command to the host that owns it over that window's ssh channel,
+Mail crosses hosts: address a pane of a remote window or an individually attached session exactly like a
+local one and agterm forwards the whole `msg` command to the host that owns it using its own addresses,
 returning its answer; `read` and `ack` with `--as` a remote pane forward the same way. One send cannot mix
-local and remote recipients or recipients of different remote windows; `--all` is local-only. A host with an
-old `agtermctl` answers `update agterm-server`. The same commands run on agterm-server reach the other way: address
+local and remote recipients or recipients of different remote windows or attachment origins; `--all` is local-only.
+A host with an old `agtermctl` answers `update agterm-server`. The same commands run on agterm-server reach the other way: address
 a local pane of a Mac that has that server's window open and the Mac runs the command and answers over the same
 catalog connection. Its `SESSION` and `PANE` are the Mac's own ids (`agtermctl tree` on the Mac). An unlisted pane
 answers `no viewing Mac currently lists pane …`; a Mac whose agterm predates cross-host mail answers `update agterm`.

@@ -24,6 +24,26 @@ public struct AttachedOrigin: Equatable, Sendable {
     @MainActor public static func originPaneID(of row: Session, local identity: UUID) -> String? {
         row.remotePresentation?.binding.remotePane(forLocal: identity)?.uuidString
     }
+
+    /// The mailbox belongs to the origin pane, not the local slot showing it.
+    @MainActor public func messageAddress(of row: Session, pane: MessageAddress.Pane) -> String? {
+        let local: UUID? = switch pane {
+        case .id(let id): id
+        case .role(.left): row.paneIdentity
+        case .role(.right): row.splitPaneIdentity
+        case .role(.scratch): row.scratchClientIdentity ?? row.originScratch
+        }
+        guard let local else { return nil }
+        let token: String?
+        if local == row.scratchClientIdentity || local == row.originScratch {
+            token = row.originScratch?.uuidString
+        } else if local == row.paneIdentity || local == row.splitPaneIdentity {
+            token = Self.originPaneID(of: row, local: local)
+        } else {
+            token = nil
+        }
+        return token.map { "\(session):\($0)" }
+    }
 }
 
 /// AttachedForward is an action on a row attached from another host, as the origin's own `agtermctl` arguments.

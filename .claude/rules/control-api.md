@@ -1585,14 +1585,15 @@ side, and reads `lastAppliedIsDark` when bare. Refuse it outside XCUITest; provi
   the `scratchDaemon`, so an ended row keeps only its scratch, and `markSessionEnded` is one more disposal site.
   The Mac routes to it instead of refusing: `ControlServer+Messages.resolveMessagePane` answers a row with a
   `remoteHost` as `MessagePaneError(kind: .remote)`, `detail` the owning window's id, and the dispatcher
-  forwards the whole `msg.*` command to that window over its catalog's ssh `agtermctl` channel
+  forwards the whole `msg.*` command over the catalog's ssh `agtermctl` channel or, for an individually
+  attached session, to its origin using the origin's session and pane IDs from the attachment binding
   (`messageForward`, `MessageForward.arguments` rebuilding argv; `RemoteSession.controlCommand` appends `--json`).
   A forwarded send carries its resolved sender as `--from` (never `--op-id`: `CatalogOperationBook` refuses one
   for msg, and the pool never retries, so at-most-once holds); the far bus parses `--from` as identity-without-resolving,
-  pane-id only. Mixed local+remote recipients, recipients of different remote windows, and a send whose identity is
+  pane-id only. Mixed local+remote recipients, recipients of different remote windows or attachment origins, and a send whose identity is
   a remote pane but whose recipients are all local are refused; `--all`
   stays local-only. An old server that exits 64 with empty stdout answers "update agterm-server".
-  A server-origin `--as` of a remote pane forwards verbatim.
+  A remote `--as` is forwarded for the same origin only, which checks that the pane is live.
 - A server routes `msg` commands to a viewing Mac's panes, the mirror of that route. `CatalogHello` carries `mail: true`
   from a mail-serving Mac, which pushes its local sessions (`remoteHost == nil`) in `mailSessions` frames
   (`mail.sessions`, reusing the `ids` key) on open and every watchdog tick; `CatalogHub` keeps them as

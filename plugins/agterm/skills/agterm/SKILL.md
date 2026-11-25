@@ -736,7 +736,7 @@ Visibility/mode act on the frontmost window; `sidebar expand`/`collapse`/`width`
 terminal. PANE is a pane id (`surfaces[].paneID` in `tree`) or `left`/`right`/`scratch`; `--all` reaches every live pane
 but the sender. Inside a pane the CLI acts as that pane through `AGTERM_SESSION_ID`/`AGTERM_PANE_ID` (`--as SESSION:PANE-ID`
 overrides). `read` prints `ID from SENDER` then the body, oldest first, and removes nothing until `ack`; `read --ack` takes
-the batch in one step. Mail crosses hosts: address a remote window's pane (an agterm-server's or another Mac's) exactly like a local one and the command forwards over that window's ssh channel; `--all` stays local. Mail is in memory only and is dropped when the pane closes or restarts. Read back
+the batch in one step. Mail crosses hosts: address a pane of a remote window or an individually attached session exactly like a local one; `--all` stays local. Mail is in memory only and is dropped when the pane closes or restarts. Read back
 `pendingMessages` on the tree surface and the `message` event. See [reference.md](reference.md#msg).
 
 **font** — `font inc|dec|reset [--pane left|right|scratch]` — change a session pane's font size (omitted/`left` = main pane, `right` = the split pane, `scratch` = the scratch terminal). Read the resulting size back from `tree` (`fontSize`/`splitFontSize`/`scratchFontSize` per pane). A pane under an HTML overlay zooms the page instead, read back as `htmlOverlays[].zoom`.

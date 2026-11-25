@@ -11,7 +11,11 @@ public enum MessageForward {
             var words = ["msg", "send"]
             words += (args.recipients ?? []).flatMap { ["--to", $0] }
             if let workspace = args.workspace { words += ["--workspace", workspace] }
-            if let from = args.from { words += ["--from", from] }
+            if let identity = args.identity {
+                words += ["--as", identity]
+            } else if let from = args.from {
+                words += ["--from", from]
+            }
             return (words, [body])
         case .msgRead:
             guard let identity = args.identity else { return nil }
