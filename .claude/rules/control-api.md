@@ -1561,8 +1561,8 @@ side, and reads `lastAppliedIsDark` when bare. Refuse it outside XCUITest; provi
 ## Message bus
 
 - `msg.*` is dispatcher-only: `ControlDispatcher+Messages` validates, runs the `MessageBus.shared` operation and
-  shapes the reply; `ControlActions` only resolves an address to a live pane, lists the `--all` panes and
-  reports a queued message. A host without the bus answers `MessagePaneError.unsupported`, which refuses the
+  shapes the reply; `ControlActions` only resolves an address to a live pane, lists the `--all` panes, reports a
+  queued message, and forwards a remote-window command (`messageForward`, unsupported by default). A host without the bus answers `MessagePaneError.unsupported`, which refuses the
   whole command; only `.unresolved` becomes a per-recipient `unknown pane` rejection.
 - A live pane is a realized surface with a parseable token, the one definition recipients, identities and
   `--all` share; a split hidden since launch has none. `ControlServer+Messages` resolves the session across
@@ -1583,9 +1583,30 @@ side, and reads `lastAppliedIsDark` when bare. Refuse it outside XCUITest; provi
   first, since a probe leaves a gap in which another reader drains the mailbox.
 - agterm-server hosts its own bus. A headless store's live pane is a daemon-backed main or split identity or
   the `scratchDaemon`, so an ended row keeps only its scratch, and `markSessionEnded` is one more disposal site.
-  A Mac remote row is refused by name: `MessagePaneError.detail` becomes `MessageRejection.detail`
-  (`remote session`), a field rather than a new `Reason`, since a client decodes the whole reply.
-  Local-to-server messaging is `docs/backlog/local-to-server-messaging.md`.
+  The Mac routes to it instead of refusing: `ControlServer+Messages.resolveMessagePane` answers a row with a
+  `remoteHost` as `MessagePaneError(kind: .remote)`, `detail` the owning window's id, and the dispatcher
+  forwards the whole `msg.*` command to that window over its catalog's ssh `agtermctl` channel
+  (`messageForward`, `MessageForward.arguments` rebuilding argv; `RemoteSession.controlCommand` appends `--json`).
+  A forwarded send carries its resolved sender as `--from` (never `--op-id`: `CatalogOperationBook` refuses one
+  for msg, and the pool never retries, so at-most-once holds); the far bus parses `--from` as identity-without-resolving,
+  pane-id only. Mixed local+remote recipients, recipients of different remote windows, and a send whose identity is
+  a remote pane but whose recipients are all local are refused; `--all`
+  stays local-only. An old server that exits 64 with empty stdout answers "update agterm-server".
+  A server-origin `--as` of a remote pane forwards verbatim.
+- A server routes `msg` commands to a viewing Mac's panes, the mirror of that route. `CatalogHello` carries `mail: true`
+  from a mail-serving Mac, which pushes its local sessions (`remoteHost == nil`) in `mailSessions` frames
+  (`mail.sessions`, reusing the `ids` key) on open and every watchdog tick; `CatalogHub` keeps them as
+  `Subscriber.mailSessions`, nil for a peer without the flag. `ServerActions+Messages.resolveMessagePane` consults
+  `mailServes` when the session is not the server's own and answers `.remote` with `detail` the server's `catalogID`;
+  `messageForward` requires that window, and `ServerStreams.mailForward` carries the request as a `msgForward` frame
+  to the subscriber listing the pane, awaiting the `msgResult` frame (`mail.result`) with a 15 s timeout. An unlisted
+  session answers "no viewing Mac currently lists pane …", a mail-less subscriber "the connected Mac predates
+  cross-host mail, update agterm". `CatalogStream.receive` intercepts `.msgResult` before `hub.receive` and calls
+  `catalogMailResult`, default no-op, so Mac-side `CatalogStreamHost` conformances are untouched. The Mac's
+  `RemoteCatalogClient` intercepts `.msgForward` before `mirror.receive` and answers by dispatching the request
+  through its own `ControlServer`; with no handler it returns an error response. Mac-to-Mac mail is not bridged:
+  the directions meet only at the Mac that owns the sessions. Unknown frame kinds decode as `.unknown` and unknown
+  hello fields are dropped, so a version-skewed peer simply leaves the direction unavailable.
 - Server mail reaches a Mac two ways. Counts ride `CatalogPane.pendingMessages` into `Session.catalogPanes`,
   rebuilt from each catalog entry and never part of the binding, so a count change attaches nothing; a server
   scratch reads back on the session (`scratchPaneID`, `scratchPendingMessages`), since the `surfaces[]` entry

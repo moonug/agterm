@@ -282,6 +282,7 @@ public final class RemoteCatalogMirror {
             }
         case .ping: return .ack
         case .ack: break
+        case .mailSessions, .msgForward, .msgResult: break
         }
         return nil
     }

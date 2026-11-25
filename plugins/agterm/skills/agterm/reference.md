@@ -1701,7 +1701,7 @@ the Mac showing it; `catalog` is served by agterm-server and by that other Mac.
   other Macs show, omitted at none.
 - On agterm-server: one window (the catalog, `--window` takes its id or `active`); `NAME is not available on
   agterm-server` for every command it does not serve (window mutations, sidebar, font, theme, keymap, quick,
-  dashboard, zoom and more; `window list`, `msg send/read/ack` between its own panes and the presenter bridges
+  dashboard, zoom and more; `window list`, `msg send/read/ack` between its own panes, which a presenting Mac reaches through forwarding, and the presenter bridges
   `zmx present`, `run-job`, `page-serve` and `page-attach` are served); `ask open --style gui` needs `--target`; a pick needs a
   session, from `--session` or the calling pane's own. Asks, picks, pages and overlay jobs are held until a Mac
   presents the session, listed in its `interactions` (`{kind, id, state, deadline?}`); only an ask or pick ends
@@ -2087,7 +2087,8 @@ terminal, and the receiver reads it when it chooses. Mailboxes live in the runni
 is drawn on screen.
 
 - `agtermctl msg send TEXT|--stdin (--to SESSION:PANE ... | --all [--workspace W]) [--as SESSION:PANE-ID]`
-  (`msg.send`). PANE is a pane id (`surfaces[].paneID` from `tree --json`) or `left` (alias `primary`, `top`), `right`
+  (`msg.send`). `--from` names the sender without resolving it and is set by agterm itself on a send forwarded
+  across hosts; do not pass it by hand. PANE is a pane id (`surfaces[].paneID` from `tree --json`) or `left` (alias `primary`, `top`), `right`
   (`split`, `bottom`) or `scratch`, resolved once at send time; a bare session is an error. Aliases of one pane are delivered
   once. `--all` reaches every live pane in every open window except the sender and remote rows;
   `--workspace` narrows it. A split hidden since launch has no terminal yet and is not a live pane.
@@ -2121,6 +2122,16 @@ mailbox. Hiding a split, a swap and a split promoted after the primary exits kee
 quitting the app. Read back `pendingMessages` on the tree surface node and the `message` event; a hook
 on `message` reacts to new mail without polling.
 
+Mail crosses hosts: address a pane of a remote window (an agterm-server's or another Mac's) exactly like a
+local one and agterm forwards the whole `msg` command to the host that owns it over that window's ssh channel,
+returning its answer; `read` and `ack` with `--as` a remote pane forward the same way. One send cannot mix
+local and remote recipients or recipients of different remote windows; `--all` is local-only. A host with an
+old `agtermctl` answers `update agterm-server`. The same commands run on agterm-server reach the other way: address
+a local pane of a Mac that has that server's window open and the Mac runs the command and answers over the same
+catalog connection. Its `SESSION` and `PANE` are the Mac's own ids (`agtermctl tree` on the Mac). An unlisted pane
+answers `no viewing Mac currently lists pane …`; a Mac whose agterm predates cross-host mail answers `update agterm`.
+Mail is not bridged Mac-to-Mac through a server.
+
 On agterm-server the same commands work between the panes of that server: main, split and scratch panes,
 hidden ones included, and the main and split panes of an ended row drop their mail while its running scratch
 keeps it. Mail lives for the server's run. The server tree reports `pendingMessages` on main and split surfaces
@@ -2129,9 +2140,7 @@ the server window reports the same counts on the row. Any Mac viewing a session 
 another Mac's, gets the `message` event for mail queued for that session's panes, carrying the host's pane id,
 and reports the host's counts on the row: `pendingMessages` on its surfaces and `scratchPendingMessages` for a
 scratch running on the host, for a row attached alone with `zmx attach` or from another Mac too. A host that
-predates these counts reports none on such a row. A local pane and
-a server pane cannot message each other yet: a Mac send to a server row is rejected `unknown pane` with detail
-`remote session`, a server send to a Mac session `unknown pane`, and a server row as `--as` is refused.
+predates these counts reports none on such a row.
 
 ## font
 

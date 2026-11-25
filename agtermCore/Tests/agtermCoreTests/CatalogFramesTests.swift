@@ -67,6 +67,9 @@ struct CatalogFramesTests {
         .delta(epoch: "e1", rev: 10, change: .paneChanged(CatalogFixture.pane(), session: UUID())),
         .delta(epoch: "e1", rev: 11, change: .paneRemoved(UUID(), session: UUID())),
         .hello(CatalogHello(version: 1, pageRows: true)),
+        .mailSessions([UUID(), UUID()]),
+        .msgForward(index: 3, request: ControlRequest(cmd: .msgSend, args: ControlArgs(body: "hi", recipients: ["s:main"], identity: "t:main"))),
+        .msgResult(index: 3, response: ControlResponse(ok: true)),
         .delta(epoch: "e1", rev: 12, change: .sessionAdded(CatalogFixture.pageRow(), workspace: UUID(), index: 0)),
         .unknown(kind: CatalogFrame.skipKind, epoch: "e1", rev: 13),
         .delta(epoch: "e1", rev: 14, change: .recentChanged([ControlRecentItem(id: "r1", kind: "session", title: "a", subtitle: nil,
@@ -191,6 +194,13 @@ struct CatalogFramesTests {
 
         #expect(try JSONDecoder().decode(CatalogHello.self, from: JSONEncoder().encode(hello)).window == "W1")
         #expect(older.window == nil)
+    }
+
+    @Test func aMailHelloFlagTravelsAndAnOlderHelloCarriesNone() throws {
+        let hello = CatalogHello(version: 1, pageRows: true, window: "W1", mail: true)
+        #expect(try CatalogCodec.decode(try CatalogCodec.encode(.hello(hello)).dropLast()) == .hello(hello))
+        let old = Data(#"{"kind":"hello","hello":{"version":1,"window":"W1"}}"#.utf8)
+        #expect(try CatalogCodec.decode(old) == .hello(CatalogHello(version: 1, window: "W1")))
     }
 
     @Test func aRefusalTravelsWithItsReasonAndFinality() throws {

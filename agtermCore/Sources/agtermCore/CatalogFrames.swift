@@ -248,14 +248,17 @@ public struct CatalogHello: Codable, Equatable, Sendable {
     public var pageRows: Bool?
     /// window names the Mac window a viewer's opening hello subscribes to; a server's catalog takes none.
     public var window: String?
+    /// mail says the viewer carries cross-host mailbox traffic for the sessions it lists; unknown to older hosts.
+    public var mail: Bool?
 
     public init(version: Int, epoch: String? = nil, versions: CatalogVersions? = nil, pageRows: Bool? = nil,
-                window: String? = nil) {
+                window: String? = nil, mail: Bool? = nil) {
         self.version = version
         self.epoch = epoch
         self.versions = versions
         self.pageRows = pageRows
         self.window = window
+        self.mail = mail
     }
 }
 
@@ -270,6 +273,12 @@ public enum CatalogFrame: Equatable, Sendable {
     case delta(epoch: String, rev: Int, change: CatalogChange)
     case ping
     case ack
+    /// mailSessions replaces the sessions a mail viewer currently holds; the host routes mail panes from it.
+    case mailSessions([UUID])
+    /// msgForward is the host's `msg.*` command to the mail viewer listing the addressed pane.
+    case msgForward(index: Int, request: ControlRequest)
+    /// msgResult is the viewer's answer to a msgForward.
+    case msgResult(index: Int, response: ControlResponse)
     /// refused ends a subscription with the reason to show; a final one stops the viewer's retries.
     case refused(reason: String, final: Bool)
     case unknown(kind: String, epoch: String?, rev: Int?)
@@ -283,7 +292,7 @@ extension CatalogFrame {
 extension CatalogFrame: Codable {
     private enum Keys: String, CodingKey {
         case kind, hello, snapshot, index, data, epoch, rev, chunks, reason, final
-        case workspace, session, id, ids, name, pane, identity, tint, tintOn, recent
+        case workspace, session, id, ids, name, pane, identity, tint, tintOn, recent, request, response
     }
 
     public init(from decoder: Decoder) throws {
@@ -299,6 +308,13 @@ extension CatalogFrame: Codable {
                            chunks: try container.decode(Int.self, forKey: .chunks))
         case "ping": self = .ping
         case "ack": self = .ack
+        case "mail.sessions": self = .mailSessions(try container.decode([UUID].self, forKey: .ids))
+        case "mail.forward":
+            self = .msgForward(index: try container.decode(Int.self, forKey: .index),
+                               request: try container.decode(ControlRequest.self, forKey: .request))
+        case "mail.result":
+            self = .msgResult(index: try container.decode(Int.self, forKey: .index),
+                              response: try container.decode(ControlResponse.self, forKey: .response))
         case "refused":
             self = .refused(reason: try container.decode(String.self, forKey: .reason), final: try container.decode(Bool.self, forKey: .final))
         default:
@@ -371,6 +387,17 @@ extension CatalogFrame: Codable {
             try Self.encode(change, into: &container)
         case .ping: try container.encode("ping", forKey: .kind)
         case .ack: try container.encode("ack", forKey: .kind)
+        case .mailSessions(let ids):
+            try container.encode("mail.sessions", forKey: .kind)
+            try container.encode(ids, forKey: .ids)
+        case .msgForward(let index, let request):
+            try container.encode("mail.forward", forKey: .kind)
+            try container.encode(index, forKey: .index)
+            try container.encode(request, forKey: .request)
+        case .msgResult(let index, let response):
+            try container.encode("mail.result", forKey: .kind)
+            try container.encode(index, forKey: .index)
+            try container.encode(response, forKey: .response)
         case .refused(let reason, let final):
             try container.encode("refused", forKey: .kind)
             try container.encode(reason, forKey: .reason)

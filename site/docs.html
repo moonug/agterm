@@ -1995,7 +1995,8 @@ agtermctl msg read --ack --wait --timeout 60                      # wait for mai
 <li>Run inside a pane, <code>agtermctl msg</code> acts as that pane through <code>AGTERM_SESSION_ID</code> and <code>AGTERM_PANE_ID</code>.</li>
 <li>Mail lives in the running app only: closing or restarting the pane, closing its session, workspace or window, or quitting agterm drops it.</li>
 <li>A full mailbox refuses that recipient alone.</li>
-<li>On agterm-server the server's panes message each other the same way, and a Mac showing the server window sees their pending counts and message events. A local pane and a server pane cannot message each other yet.</li>
+<li>On agterm-server the server's panes message each other the same way, and a Mac showing the server window sees their pending counts and message events.</li>
+<li>Mail crosses hosts: address a pane of a remote window (an agterm-server's or another Mac's) exactly like a local one and the message reaches it; <code>read</code> and <code>ack</code> with <code>--as</code> a remote pane reach the host's mailbox the same way. One send cannot mix local and remote recipients, and <code>--all</code> stays local. The same commands run on agterm-server reach a pane of a Mac that has that server's window open, and the Mac answers over the same connection; Mac-to-Mac mail through a server is not bridged.</li>
 </ul>
 <p>Two agents in one split can hold a conversation this way, each reading the other's messages as they arrive: see the <a href="https://github.com/umputun/agterm/tree/master/cookbook/two-agent-mailbox-chat">two-agent mailbox chat</a> recipe.</p>
 <figure>

@@ -209,6 +209,116 @@ struct ControlDispatcherMessagesTests {
         #expect(try JSONDecoder().decode(ControlRequest.self, from: JSONEncoder().encode(go)).args?.to == "next")
     }
 
+    @Test func aSendToARemotePaneForwardsOnceWithTheSenderStamped() async throws {
+        let (actions, bus) = (actions(), MessageBus())
+        let window = UUID()
+        actions.remoteMessageWindows[MessageAddress(session: "r1", pane: .role(.left))] = window
+
+        let response = await dispatch(.msgSend, ControlArgs(body: "hi", recipients: ["r1:left"], identity: addressA),
+                                      actions: actions, bus: bus)
+
+        #expect(response?.ok == true)
+        #expect(response?.result?.messageID == "forwarded")
+        #expect(actions.forwardedMessages.count == 1)
+        let (fwWindow, request) = actions.forwardedMessages[0]
+        #expect(fwWindow == window)
+        #expect(request.cmd == .msgSend)
+        #expect(request.args?.recipients == ["r1:left"])
+        #expect(request.args?.body == "hi")
+        #expect(request.args?.identity == nil)
+        #expect(request.args?.from == addressA)
+        #expect(bus.pending(for: paneA) == 0 && bus.pending(for: paneB) == 0)
+    }
+
+    @Test func aSendAsARemotePaneForwardsTheRequestWhole() async throws {
+        let (actions, bus) = (actions(), MessageBus())
+        let window = UUID()
+        actions.remoteMessageWindows[MessageAddress(session: "r1", pane: .id(paneA))] = window
+
+        let response = await dispatch(.msgSend, ControlArgs(body: "hi", recipients: ["r1:\(paneA.uuidString)"],
+                                                            identity: "r1:\(paneA.uuidString)"),
+                                      actions: actions, bus: bus)
+
+        #expect(response?.ok == true)
+        let (_, request) = try #require(actions.forwardedMessages.first)
+        #expect(request.args?.identity == "r1:\(paneA.uuidString)")
+        #expect(request.args?.from == nil)
+    }
+
+    @Test func mixingLocalAndRemoteRecipientsIsRefused() async {
+        let (actions, bus) = (actions(), MessageBus())
+        actions.remoteMessageWindows[MessageAddress(session: "r1", pane: .role(.left))] = UUID()
+
+        let response = await dispatch(.msgSend, ControlArgs(body: "hi", recipients: ["s1:left", "r1:left"]),
+                                      actions: actions, bus: bus)
+
+        #expect(response == ControlResponse(ok: false, error: "msg.send cannot mix local and remote recipients"))
+        #expect(actions.forwardedMessages.isEmpty)
+    }
+
+    @Test func aSendAsARemotePaneToLocalRecipientsIsRefused() async {
+        let (actions, bus) = (actions(), MessageBus())
+        actions.remoteMessageWindows[MessageAddress(session: "r1", pane: .id(paneA))] = UUID()
+
+        let response = await dispatch(.msgSend, ControlArgs(body: "hi", recipients: ["s1:left"],
+                                                            identity: "r1:\(paneA.uuidString)"),
+                                      actions: actions, bus: bus)
+
+        #expect(response == ControlResponse(ok: false, error: "msg.send cannot act as a remote pane and message local panes"))
+        #expect(actions.forwardedMessages.isEmpty)
+        #expect(bus.pending(for: paneA) == 0)
+    }
+
+    @Test func remoteRecipientsInDifferentWindowsAreRefused() async {
+        let (actions, bus) = (actions(), MessageBus())
+        actions.remoteMessageWindows[MessageAddress(session: "r1", pane: .role(.left))] = UUID()
+        actions.remoteMessageWindows[MessageAddress(session: "r2", pane: .role(.left))] = UUID()
+
+        let response = await dispatch(.msgSend, ControlArgs(body: "hi", recipients: ["r1:left", "r2:left"]),
+                                      actions: actions, bus: bus)
+
+        #expect(response == ControlResponse(ok: false, error: "msg.send recipients live in different remote windows"))
+        #expect(actions.forwardedMessages.isEmpty)
+    }
+
+    @Test func readingAndAckingARemotePaneForwardsTheCommand() async throws {
+        let (actions, bus) = (actions(), MessageBus())
+        let window = UUID()
+        let remote = "r1:\(paneA.uuidString)"
+        actions.remoteMessageWindows[MessageAddress(session: "r1", pane: .id(paneA))] = window
+
+        let read = await dispatch(.msgRead, ControlArgs(identity: remote, ack: true), actions: actions, bus: bus)
+        let ack = await dispatch(.msgAck, ControlArgs(identity: remote, ids: ["m1"]), actions: actions, bus: bus)
+
+        #expect(read?.ok == true && ack?.ok == true)
+        #expect(actions.forwardedMessages.count == 2)
+        #expect(actions.forwardedMessages[0].request.cmd == .msgRead)
+        #expect(actions.forwardedMessages[0].request.args?.ack == true)
+        #expect(actions.forwardedMessages[1].request.cmd == .msgAck)
+        #expect(actions.forwardedMessages[1].request.args?.ids == ["m1"])
+    }
+
+    @Test func aForwardedSendTakesItsSenderFromTheForwardedAddress() async throws {
+        let (actions, bus) = (actions(), MessageBus())
+
+        let response = await dispatch(.msgSend, ControlArgs(body: "hi", recipients: [addressB], from: addressA),
+                                      actions: actions, bus: bus)
+
+        #expect(response?.result?.delivered == [addressB])
+        #expect(bus.read(pane: paneB).messages.first?.from == addressA)
+        #expect(actions.queuedMessages.first?.from == addressA)
+    }
+
+    @Test func aSenderAddressMustNameAPaneID() async {
+        let (actions, bus) = (actions(), MessageBus())
+
+        let response = await dispatch(.msgSend, ControlArgs(body: "hi", recipients: [addressB], from: "s1:left"),
+                                      actions: actions, bus: bus)
+
+        #expect(response?.ok == false)
+        #expect(response?.error == "identity \"s1:left\" must name a pane id, not a role")
+    }
+
     @Test func pendingMessagesIsOmittedWhenThereAreNone() throws {
         let none = ControlSurfaceNode(id: "s", kind: "left", active: true, visible: true, backedByZmx: nil)
         let some = ControlSurfaceNode(id: "s", kind: "left", active: true, visible: true, backedByZmx: nil, pendingMessages: 3)

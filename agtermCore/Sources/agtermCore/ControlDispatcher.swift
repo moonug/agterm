@@ -99,7 +99,7 @@ public struct ControlDispatcher {
         case .askOpen, .askResult, .askCancel:
             return dispatchAskCommand(request)
         case .msgSend, .msgRead, .msgAck:
-            return dispatchMessageCommand(request)
+            return await dispatchMessageCommand(request)
         case .sessionHudOpen, .sessionHudUpdate, .sessionHudClose:
             return dispatchHudCommand(request)
         }

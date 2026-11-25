@@ -32,10 +32,13 @@ public final class CatalogHub {
         let pageRows: Bool
         // the first ping still unanswered; a late heartbeat sends a ping before it can call the subscriber stale
         var pingedAt: Date?
+        /// mailSessions is the set a mail viewer keeps current; nil says the viewer carries no mail.
+        var mailSessions: Set<UUID>?
 
-        init(sink: CatalogSink, pageRows: Bool) {
+        init(sink: CatalogSink, pageRows: Bool, mail: Bool) {
             self.sink = sink
             self.pageRows = pageRows
+            mailSessions = mail ? [] : nil
         }
     }
 
@@ -127,7 +130,7 @@ public final class CatalogHub {
         let state = pageRows ? snapshot() : Self.withoutPageRows(snapshot())
         lastID += 1
         let id = SubscriberID(value: lastID)
-        subscribers[id] = Subscriber(sink: sink, pageRows: pageRows)
+        subscribers[id] = Subscriber(sink: sink, pageRows: pageRows, mail: hello.mail == true)
         let answer = CatalogHello(version: min(hello.version, CatalogCodec.version), epoch: epoch, versions: versions)
         let frames: [CatalogFrame]
         do {
@@ -151,9 +154,23 @@ public final class CatalogHub {
         switch frame {
         case .ack: subscriber.pingedAt = nil
         case .ping: send(.ack, to: id)
+        case .mailSessions(let ids) where subscriber.mailSessions != nil: subscriber.mailSessions = Set(ids)
         default: break
         }
     }
+
+    /// mailServes names the mail subscriber that currently lists `session`, nil when none does.
+    public func mailServes(_ session: UUID) -> SubscriberID? {
+        subscribers.first { $0.value.mailSessions?.contains(session) == true }?.key
+    }
+
+    /// hasMailPeer says some subscriber opened with the mail flag; its absence tells an old viewer apart
+    /// from one that simply does not hold the pane.
+    public var hasMailPeer: Bool { subscribers.values.contains { $0.mailSessions != nil } }
+
+    /// sendMailFrame hands the host one frame for a mail subscriber; false means the subscriber is gone.
+    @discardableResult
+    public func sendMailFrame(_ frame: CatalogFrame, to id: SubscriberID) -> Bool { send(frame, to: id) }
 
     /// heartbeat closes every subscriber that left a ping unanswered past the stale timeout and pings the rest.
     public func heartbeat() {

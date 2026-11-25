@@ -6,6 +6,8 @@ public struct MessagePaneError: Error, Equatable, Sendable {
     public enum Kind: Equatable, Sendable {
         case unresolved
         case unsupported
+        /// remote names an address owned by a remote window's server; `detail` is that window's id.
+        case remote
     }
 
     public static let unsupported = MessagePaneError(ControlActionsUnsupported.message("msg"), kind: .unsupported)
@@ -25,17 +27,17 @@ public struct MessagePaneError: Error, Equatable, Sendable {
 extension ControlDispatcher {
     /// dispatchMessageCommand parses and validates `msg.*`, asks the host only to resolve addresses and
     /// report a queued message, and runs the mailbox operation itself.
-    func dispatchMessageCommand(_ request: ControlRequest) -> ControlResponse {
+    func dispatchMessageCommand(_ request: ControlRequest) async -> ControlResponse {
         let args = request.args ?? ControlArgs()
         switch request.cmd {
-        case .msgSend: return dispatchMessageSend(args)
-        case .msgRead: return dispatchMessageRead(args)
-        case .msgAck: return dispatchMessageAck(args)
+        case .msgSend: return await dispatchMessageSend(args)
+        case .msgRead: return await dispatchMessageRead(request)
+        case .msgAck: return await dispatchMessageAck(request)
         default: preconditionFailure("unexpected msg command: \(request.cmd.rawValue)")
         }
     }
 
-    private func dispatchMessageSend(_ args: ControlArgs) -> ControlResponse {
+    private func dispatchMessageSend(_ args: ControlArgs) async -> ControlResponse {
         guard let body = args.body else { return failure("msg.send requires a body") }
         let addresses = args.recipients ?? []
         let all = args.all == true
@@ -46,16 +48,27 @@ extension ControlDispatcher {
             return failure("message body too large (\(body.utf8.count) bytes, max \(MessageBus.maxBodyBytes))")
         }
         var sender: MessageRecipient?
+        var senderRemote = false
         if let identity = args.identity {
             switch resolveIdentity(identity) {
+            case .failure(let error) where error.kind == .remote: senderRemote = true
             case .failure(let error): return failure(error.message)
             case .success(let resolved): sender = resolved
             }
+        } else if let from = args.from {
+            let address: MessageAddress
+            do { address = try MessageAddress.identity(from) } catch { return failure(error.message) }
+            guard case .id(let pane) = address.pane else { return failure("--from must name a pane id") }
+            sender = MessageRecipient(pane: pane, address: from)
         }
 
         var targets: [MessageRecipient] = []
         var rejected: [MessageRejection] = []
+        var remoteAddresses: [String] = []
+        var remoteWindow: UUID?
+        var remoteWindowsDiffer = false
         if all {
+            if senderRemote { return failure("msg.send --all cannot act as a remote pane") }
             switch actions.messagePanes(workspace: args.workspace, window: args.window) {
             case .failure(let error): return failure(error.message)
             case .success(let panes): targets = panes.filter { $0.pane != sender?.pane }
@@ -67,10 +80,24 @@ extension ControlDispatcher {
                 switch actions.resolveMessagePane(address) {
                 case .success(let recipient): targets.append(recipient)
                 case .failure(let error) where error.kind == .unsupported: return failure(error.message)
+                case .failure(let error) where error.kind == .remote:
+                    remoteAddresses.append(text)
+                    let window = error.detail.flatMap { UUID(uuidString: $0) }
+                    if remoteWindow == nil { remoteWindow = window } else if remoteWindow != window { remoteWindowsDiffer = true }
                 case .failure(let error): rejected.append(MessageRejection(address: text, reason: .unknownPane, detail: error.detail))
                 }
             }
         }
+        if !remoteAddresses.isEmpty {
+            if !targets.isEmpty { return failure("msg.send cannot mix local and remote recipients") }
+            if remoteWindowsDiffer { return failure("msg.send recipients live in different remote windows") }
+            guard let window = remoteWindow else { return failure("remote recipient window is unknown") }
+            var forward = args
+            forward.recipients = remoteAddresses
+            if let sender { forward.identity = nil; forward.from = sender.address }
+            return await actions.messageForward(window: window, request: ControlRequest(cmd: .msgSend, args: forward))
+        }
+        if senderRemote { return failure("msg.send cannot act as a remote pane and message local panes") }
         var seen = Set<UUID>()
         targets = targets.filter { seen.insert($0.pane).inserted }
 
@@ -87,9 +114,13 @@ extension ControlDispatcher {
             messageID: result.messageID.uuidString, delivered: result.delivered, rejected: rejected + result.rejected))
     }
 
-    private func dispatchMessageRead(_ args: ControlArgs) -> ControlResponse {
+    private func dispatchMessageRead(_ request: ControlRequest) async -> ControlResponse {
+        let args = request.args ?? ControlArgs()
         let reader: MessageRecipient
         switch requireIdentity(args.identity, command: .msgRead) {
+        case .failure(let error) where error.kind == .remote:
+            guard let window = error.detail.flatMap({ UUID(uuidString: $0) }) else { return failure("remote pane window is unknown") }
+            return await actions.messageForward(window: window, request: request)
         case .failure(let error): return failure(error.message)
         case .success(let resolved): reader = resolved
         }
@@ -102,9 +133,13 @@ extension ControlDispatcher {
             messages: batch.messages, remaining: batch.remaining, acked: batch.messages.map(\.id.uuidString)))
     }
 
-    private func dispatchMessageAck(_ args: ControlArgs) -> ControlResponse {
+    private func dispatchMessageAck(_ request: ControlRequest) async -> ControlResponse {
+        let args = request.args ?? ControlArgs()
         let reader: MessageRecipient
         switch requireIdentity(args.identity, command: .msgAck) {
+        case .failure(let error) where error.kind == .remote:
+            guard let window = error.detail.flatMap({ UUID(uuidString: $0) }) else { return failure("remote pane window is unknown") }
+            return await actions.messageForward(window: window, request: request)
         case .failure(let error): return failure(error.message)
         case .success(let resolved): reader = resolved
         }

@@ -55,6 +55,33 @@ final class ServerStreams: PresentationStreamHost, OverlayJobStreamHost, PageSer
 
     func catalogSubscription(for hello: CatalogHello) -> CatalogSubscription { .serve(catalogHub, catalogVersions) }
 
+    // MARK: cross-host mail
+
+    /// mailPending waits for each msgForward's answer, numbered within this run.
+    private var mailPending: [Int: CheckedContinuation<ControlResponse, Never>] = [:]
+    private var mailIndex = 0
+
+    /// mailForward runs one `msg.*` command on the Mac that lists the addressed pane and waits for its answer.
+    func mailForward(to subscriber: CatalogHub.SubscriberID, request: ControlRequest) async -> ControlResponse {
+        mailIndex += 1
+        let index = mailIndex
+        guard catalogHub.sendMailFrame(.msgForward(index: index, request: request), to: subscriber) else {
+            return ControlResponse(ok: false, error: "the Mac's catalog stream closed, retry")
+        }
+        return await withCheckedContinuation { continuation in
+            mailPending[index] = continuation
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self, let waiting = self.mailPending.removeValue(forKey: index) else { return }
+                waiting.resume(returning: ControlResponse(ok: false, error: "the Mac did not answer the message command"))
+            }
+        }
+    }
+
+    func catalogMailResult(index: Int, response: ControlResponse) {
+        mailPending.removeValue(forKey: index)?.resume(returning: response)
+    }
+
     init(store: AppStore, catalogID: UUID, overlayJobs: OverlayJobs) {
         self.store = store
         self.catalogID = catalogID

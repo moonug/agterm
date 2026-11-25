@@ -380,4 +380,56 @@ struct ServerActionsMessagesTests {
         #expect(await settledMail(sink) == [next.uuidString: 2])
         MessageBus.shared.dispose(pane: next)
     }
+
+    private final class RecordingSink: CatalogSink {
+        var frames: [CatalogFrame] = []
+        func offer(_ frame: CatalogFrame) -> Bool { frames.append(frame); return true }
+        func close(_ reason: CatalogHub.CloseReason) {}
+    }
+
+    private func mailSubscriber(_ hub: CatalogHub, _ sink: CatalogSink, listing sessions: [UUID]) throws -> CatalogHub.SubscriberID {
+        let id = try hub.subscribe(hello: CatalogHello(version: 1, mail: true), sink: sink,
+                                   versions: CatalogVersions(server: "1.2.3", protocolVersion: 1, catalog: 1))
+        hub.receive(.mailSessions(sessions), from: id)
+        return id
+    }
+
+    @Test func aPaneListedByAViewingMacResolvesRemoteWithTheCatalogWindow() throws {
+        let macSession = UUID()
+        let id = try mailSubscriber(harness.actions.streams.catalogHub, RecordingSink(), listing: [macSession])
+
+        let outcome = harness.actions.resolveMessagePane(try MessageAddress.recipient("\(macSession.uuidString):\(UUID().uuidString)"))
+
+        guard case .failure(let error) = outcome else {
+            Issue.record("expected a remote refusal")
+            return
+        }
+        #expect(error.kind == .remote && error.detail == harness.actions.streams.catalogID.uuidString)
+        _ = id
+    }
+
+    @Test func aMessageToAMacPaneTravelsOverTheCatalogStreamAndBack() async throws {
+        let hub = harness.actions.streams.catalogHub
+        let sink = RecordingSink()
+        let macSession = UUID()
+        _ = try mailSubscriber(hub, sink, listing: [macSession])
+        let target = "\(macSession.uuidString):\(UUID().uuidString)"
+        let request = ControlRequest(cmd: .msgSend, args: ControlArgs(body: "hi", recipients: [target]))
+
+        async let reply = harness.actions.messageForward(window: harness.actions.streams.catalogID, request: request)
+
+        var forwarded: CatalogFrame?
+        for _ in 0..<100 {
+            if let frame = sink.frames.first(where: { if case .msgForward = $0 { return true }; return false }) { forwarded = frame; break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard case .msgForward(let index, let carried)? = forwarded else {
+            Issue.record("no msgForward reached the Mac")
+            return
+        }
+        #expect(carried.args?.body == "hi")
+        harness.actions.streams.catalogMailResult(index: index,
+                                                  response: ControlResponse(ok: true, result: ControlResult(delivered: [target])))
+        #expect((await reply).result?.delivered == [target])
+    }
 }

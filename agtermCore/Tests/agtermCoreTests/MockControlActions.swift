@@ -1025,10 +1025,15 @@ final class MockControlActions: ControlActions {
     var messagesUnsupported = false
 
     var messageFailures: [MessageAddress: MessagePaneError] = [:]
+    var remoteMessageWindows: [MessageAddress: UUID] = [:]
+    var forwardedMessages: [(window: UUID, request: ControlRequest)] = []
 
     func resolveMessagePane(_ address: MessageAddress) -> Result<MessageRecipient, MessagePaneError> {
         if messagesUnsupported { return .failure(.unsupported) }
         if let failure = messageFailures[address] { return .failure(failure) }
+        if let window = remoteMessageWindows[address] {
+            return .failure(MessagePaneError("remote session", kind: .remote, detail: window.uuidString))
+        }
         guard let recipient = messagePanes[address] else {
             let pane = switch address.pane {
             case .id(let id): id.uuidString
@@ -1046,5 +1051,10 @@ final class MockControlActions: ControlActions {
 
     func messageQueued(_ messageID: UUID, from: String?, to recipients: [MessageRecipient]) {
         queuedMessages.append(Queued(id: messageID.uuidString, from: from, recipients: recipients))
+    }
+
+    func messageForward(window: UUID, request: ControlRequest) async -> ControlResponse {
+        forwardedMessages.append((window: window, request: request))
+        return ControlResponse(ok: true, result: ControlResult(messageID: "forwarded"))
     }
 }

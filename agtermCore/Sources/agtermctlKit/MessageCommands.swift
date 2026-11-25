@@ -92,6 +92,8 @@ extension Msg {
         var all = false
         @Option(name: .long, help: "With --all, only the panes of this workspace.")
         var workspace: String?
+        @Option(name: .long, help: "Name this pane address as the sender without resolving it; for a send forwarded across hosts.")
+        var from: String?
         @OptionGroup var identity: MessageIdentityOptions
         @OptionGroup var options: BasicOptions
 
@@ -105,6 +107,7 @@ extension Msg {
             args.recipients = recipients.isEmpty ? nil : recipients
             args.all = all ? true : nil
             args.workspace = workspace
+            args.from = from
             args.identity = try identity.resolve(env: env)
             return ControlRequest(cmd: .msgSend, args: args)
         }

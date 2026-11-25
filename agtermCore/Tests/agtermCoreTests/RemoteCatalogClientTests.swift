@@ -302,6 +302,54 @@ final class RemoteCatalogClientTests {
                                                                     window: window.uuidString))])
     }
 
+    @Test func aMailPeerListsItsSessionsInItsHelloAndAnswersAForward() async throws {
+        answers = [(0, versionReply(Self.versions))]
+        let client = client()
+        let session = UUID()
+        client.mailSessions = { [session] }
+        client.mailHandler = { request in
+            ControlResponse(ok: true, result: ControlResult(text: request.args?.body))
+        }
+        await client.connect()
+        let link = try #require(transport.links.first)
+
+        #expect(link.sent.first == .hello(CatalogHello(version: CatalogCodec.version, pageRows: true, mail: true)))
+        #expect(link.sent.contains(.mailSessions([session])))
+
+        try link.deliver(.msgForward(index: 7, request: ControlRequest(cmd: .msgSend, args: ControlArgs(body: "hi", recipients: ["\(session.uuidString):main"]))))
+        var reply: CatalogFrame?
+        for _ in 0..<100 {
+            if let last = link.sent.last, case .msgResult = last { reply = last; break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard case .msgResult(let index, let response)? = reply else {
+            Issue.record("no msgResult sent")
+            return
+        }
+        #expect(index == 7 && response.ok && response.result?.text == "hi")
+    }
+
+    @Test func aForwardToAMacWithoutAHandlerAnswersWithAnError() async throws {
+        answers = [(0, versionReply(Self.versions))]
+        let client = client()
+        client.mailSessions = { [] }
+        await client.connect()
+        let link = try #require(transport.links.first)
+
+        try link.deliver(.msgForward(index: 1, request: ControlRequest(cmd: .msgRead)))
+
+        var reply: CatalogFrame?
+        for _ in 0..<100 {
+            if let last = link.sent.last, case .msgResult = last { reply = last; break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard case .msgResult(let index, let response)? = reply else {
+            Issue.record("no msgResult sent")
+            return
+        }
+        #expect(index == 1 && !response.ok)
+    }
+
     @Test func aFinalRefusalFromAMacStopsRetrying() async throws {
         answers = [(0, macVersionReply())]
         let (client, mirror) = macClient(window: UUID())
