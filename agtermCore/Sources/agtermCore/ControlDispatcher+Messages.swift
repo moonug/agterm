@@ -33,7 +33,8 @@ extension ControlDispatcher {
         case .msgSend: return await dispatchMessageSend(args)
         case .msgRead: return await dispatchMessageRead(request)
         case .msgAck: return await dispatchMessageAck(request)
-        default: preconditionFailure("unexpected msg command: \(request.cmd.rawValue)")
+        default:
+            preconditionFailure("unexpected msg command: \(request.cmd.rawValue) - ControlDispatcher.messageCommands must match the cases handled here")
         }
     }
 
