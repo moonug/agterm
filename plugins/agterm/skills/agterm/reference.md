@@ -2130,7 +2130,11 @@ A host with an old `agtermctl` answers `update agterm-server`. The same commands
 a local pane of a Mac that has that server's window open and the Mac runs the command and answers over the same
 catalog connection. Its `SESSION` and `PANE` are the Mac's own ids (`agtermctl tree` on the Mac). An unlisted pane
 answers `no viewing Mac currently lists pane …`; a Mac whose agterm predates cross-host mail answers `update agterm`.
-Mail is not bridged Mac-to-Mac through a server.
+Mail crosses between a Mac and agterm-server only: it is not bridged Mac-to-Mac through a server, and a server send whose
+recipients live on two different Macs is refused — send one message per Mac. A forward the far side never answers (it
+quit, or the link dropped mid-command) reports an unknown outcome with a warning: `send` and `read --ack` may already
+have taken effect, so do not resend or re-read them; a plain `read` or `msg ack` failure is safe to retry.
+`msg read --wait` against a remote mailbox polls about every 2 seconds, since each poll crosses the wire.
 
 On agterm-server the same commands work between the panes of that server: main, split and scratch panes,
 hidden ones included, and the main and split panes of an ended row drop their mail while its running scratch

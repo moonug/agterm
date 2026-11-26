@@ -1,5 +1,5 @@
 ---
-worth: maybe
+worth: likely
 where: agtermCore/Sources/agtermCore/RemoteSession.swift:controlCommand
 added: 2026-11-11
 ---
@@ -22,3 +22,7 @@ Surfaced by the dependency screen while reviewing PR #967. Neither obvious fix w
 A fix needs a shell-neutral transport, such as arguments encoded so no login shell sees a newline and
 decoded by `/bin/sh` on the far side. Every caller found passes text the local user typed, so the split
 runs that user's own lines on their own host. Not traced: callers passing text from another source.
+
+Update 2026-11-27: cross-host mail (PR #10) forwards `agtermctl msg` through this same transport, so a message body
+carrying a newline reaches a tcsh login shell too — the defect now shapes a user-visible feature, not only restore.
+Bumped to likely.
