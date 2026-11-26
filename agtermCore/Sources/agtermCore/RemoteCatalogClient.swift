@@ -176,6 +176,10 @@ public final class RemoteCatalogClient {
     }
 
     private func answerMailForward(index: Int, request: ControlRequest) {
+        if let refusal = MailForwardPolicy.refusal(request.cmd) {
+            send(.msgResult(index: index, response: ControlResponse(ok: false, error: refusal)))
+            return
+        }
         guard let handler = mailHandler else {
             send(.msgResult(index: index, response: ControlResponse(ok: false, error: "this agterm cannot receive messages")))
             return

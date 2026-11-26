@@ -350,6 +350,41 @@ final class RemoteCatalogClientTests {
         #expect(index == 1 && !response.ok)
     }
 
+    @Test func aForwardOfANonMailCommandIsRefusedAtTheMailBoundary() async throws {
+        answers = [(0, versionReply(Self.versions))]
+        let client = client()
+        client.mailSessions = { [] }
+        var handlerRan = false
+        client.mailHandler = { _ in handlerRan = true; return ControlResponse(ok: true) }
+        await client.connect()
+        let link = try #require(transport.links.first)
+
+        try link.deliver(.msgForward(index: 4, request: ControlRequest(cmd: .sessionType, args: ControlArgs(text: "echo hi"))))
+
+        var reply: CatalogFrame?
+        for _ in 0..<100 {
+            if let last = link.sent.last, case .msgResult = last { reply = last; break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard case .msgResult(let index, let response)? = reply else {
+            Issue.record("no msgResult sent")
+            return
+        }
+        #expect(index == 4 && !response.ok)
+        #expect(response.error == "session.type cannot be forwarded over mail: only msg.send, msg.read and msg.ack reach a Mac")
+        #expect(!handlerRan)
+    }
+
+    @Test func theMailPolicyPassesOnlyMailCommands() {
+        for command in Command.allCases where MailForwardPolicy.refusal(command) == nil {
+            #expect([.msgSend, .msgRead, .msgAck].contains(command))
+        }
+        #expect(MailForwardPolicy.refusal(.msgSend) == nil)
+        #expect(MailForwardPolicy.refusal(.msgRead) == nil)
+        #expect(MailForwardPolicy.refusal(.msgAck) == nil)
+        #expect(MailForwardPolicy.refusal(.sessionClose) != nil)
+    }
+
     @Test func aFinalRefusalFromAMacStopsRetrying() async throws {
         answers = [(0, macVersionReply())]
         let (client, mirror) = macClient(window: UUID())
