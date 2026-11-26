@@ -30,6 +30,13 @@ public enum MessageForward {
         }
     }
 
+    /// hasNewlineOperand reports text whose newline the far login shell splits into separate commands
+    /// under tcsh (docs/backlog/mail-forward-body-newline-executes-on-recipient-host.md).
+    /// shortcut: refuses newline operands cross-host until the transport is shell-neutral; drop it when it is.
+    public static func hasNewlineOperand(words: [String], operands: [String]) -> Bool {
+        (words + operands).contains { $0.rangeOfCharacter(from: .newlines) != nil }
+    }
+
     /// noAnswerNote is what a lost answer may have left behind, nil for commands that are safe to retry:
     /// a send may have delivered and a read --ack may have consumed the batch, while a plain read removes
     /// nothing and an explicit ack by id is idempotent.

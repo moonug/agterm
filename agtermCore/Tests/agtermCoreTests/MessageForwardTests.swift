@@ -32,6 +32,12 @@ struct MessageForwardTests {
         #expect(MessageForward.arguments(for: ControlRequest(cmd: .sessionGo)) == nil)
     }
 
+    @Test func aNewlineOperandIsRefusedCrossHost() {
+        #expect(MessageForward.hasNewlineOperand(words: ["msg", "send", "--to", "S:P"], operands: ["hello\necho INJECTED"]))
+        #expect(MessageForward.hasNewlineOperand(words: ["msg", "send"], operands: ["first\rsecond"]))
+        #expect(!MessageForward.hasNewlineOperand(words: ["msg", "read", "--as", "S:P"], operands: []))
+    }
+
     @Test func onlyCommandsThatMayHaveTakenEffectCarryANoAnswerNote() {
         #expect(MessageForward.noAnswerNote(for: ControlRequest(cmd: .msgSend, args: ControlArgs(body: "x"))) != nil)
         #expect(MessageForward.noAnswerNote(for: ControlRequest(cmd: .msgRead, args: ControlArgs(identity: "S:P", ack: true))) != nil)

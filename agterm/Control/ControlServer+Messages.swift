@@ -103,6 +103,9 @@ extension ControlServer {
             return ControlResponse(ok: false, error: "cannot forward \(request.cmd.rawValue)")
         }
         let host = route.host
+        if MessageForward.hasNewlineOperand(words: words, operands: operands) {
+            return ControlResponse(ok: false, error: "message text must be one line: a newline cannot cross a host yet")
+        }
         let slot = pool?.leaseOnce()
         defer { if let slot { pool?.release(slot.user) } }
         if let pool, let slot, !(await pool.ready(slot.path)) {
