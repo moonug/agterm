@@ -34,7 +34,9 @@ extension ServerActions {
                 ? "no viewing Mac currently lists pane \(session.uuidString)"
                 : "the connected Mac predates cross-host mail, update agterm")
         }
-        // One forward goes to one Mac; a send split across two of them cannot ride as one batch.
+        // One forward goes to one Mac; a send split across two of them cannot ride as one batch. An
+        // unparsable recipient is skipped because the dispatcher forwards only remote addresses and has
+        // already refused a local/remote mix: this guard is a belt, not a reachable path.
         if request.cmd == .msgSend, let recipients = request.args?.recipients {
             for text in recipients.dropFirst() {
                 guard let address = try? MessageAddress.recipient(text), let id = UUID(uuidString: address.session) else { continue }

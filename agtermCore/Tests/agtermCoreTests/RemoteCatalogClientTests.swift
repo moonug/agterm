@@ -383,6 +383,7 @@ final class RemoteCatalogClientTests {
         #expect(MailForwardPolicy.refusal(.msgRead) == nil)
         #expect(MailForwardPolicy.refusal(.msgAck) == nil)
         #expect(MailForwardPolicy.refusal(.sessionClose) != nil)
+        #expect(MailForwardPolicy.forwardableCommands == ControlDispatcher.messageCommands)
     }
 
     @Test func aFinalRefusalFromAMacStopsRetrying() async throws {

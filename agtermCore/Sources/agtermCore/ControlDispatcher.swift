@@ -4,6 +4,10 @@ import Foundation
 /// response shape; host actions keep target resolution, AppKit state, and terminal-surface side effects.
 @MainActor
 public struct ControlDispatcher {
+    /// messageCommands is what dispatchMessageCommand has a case for. Routing by it instead of listing the
+    /// commands would trap there rather than refuse, so the mail forward policy is pinned to it by a test.
+    public nonisolated static let messageCommands: Set<Command> = [.msgSend, .msgRead, .msgAck]
+
     let actions: any ControlActions
     let bus: MessageBus
 
