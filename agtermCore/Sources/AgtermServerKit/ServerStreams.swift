@@ -61,6 +61,9 @@ final class ServerStreams: PresentationStreamHost, OverlayJobStreamHost, PageSer
     private var mailPending: [Int: CheckedContinuation<ControlResponse, Never>] = [:]
     private var mailIndex = 0
 
+    /// mailAnswerTimeout is how long the server waits for the Mac's msgResult before the outcome is unknown.
+    private static let mailAnswerTimeout: TimeInterval = 15
+
     /// mailForward runs one `msg.*` command on the Mac that lists the addressed pane and waits for its answer.
     func mailForward(to subscriber: CatalogHub.SubscriberID, request: ControlRequest) async -> ControlResponse {
         mailIndex += 1
@@ -71,9 +74,13 @@ final class ServerStreams: PresentationStreamHost, OverlayJobStreamHost, PageSer
         return await withCheckedContinuation { continuation in
             mailPending[index] = continuation
             Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(Self.mailAnswerTimeout * 1_000_000_000))
                 guard let self, let waiting = self.mailPending.removeValue(forKey: index) else { return }
-                waiting.resume(returning: ControlResponse(ok: false, error: "the Mac did not answer the message command"))
+                if let note = MessageForward.noAnswerNote(for: request) {
+                    waiting.resume(returning: .unknownOutcome("the Mac gave no answer; \(note)"))
+                } else {
+                    waiting.resume(returning: ControlResponse(ok: false, error: "the Mac did not answer the message command"))
+                }
             }
         }
     }

@@ -29,4 +29,15 @@ public enum MessageForward {
             return nil
         }
     }
+
+    /// noAnswerNote is what a lost answer may have left behind, nil for commands that are safe to retry:
+    /// a send may have delivered and a read --ack may have consumed the batch, while a plain read removes
+    /// nothing and an explicit ack by id is idempotent.
+    public static func noAnswerNote(for request: ControlRequest) -> String? {
+        switch request.cmd {
+        case .msgSend: return "the message may have arrived, do not resend it"
+        case .msgRead where request.args?.ack == true: return "the batch may have been consumed, do not read again"
+        default: return nil
+        }
+    }
 }

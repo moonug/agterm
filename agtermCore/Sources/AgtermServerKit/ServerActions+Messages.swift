@@ -34,6 +34,16 @@ extension ServerActions {
                 ? "no viewing Mac currently lists pane \(session.uuidString)"
                 : "the connected Mac predates cross-host mail, update agterm")
         }
+        // One forward goes to one Mac; a send split across two of them cannot ride as one batch.
+        if request.cmd == .msgSend, let recipients = request.args?.recipients {
+            for text in recipients.dropFirst() {
+                guard let address = try? MessageAddress.recipient(text), let id = UUID(uuidString: address.session) else { continue }
+                if let other = streams.catalogHub.mailServes(id), other != subscriber {
+                    return ControlResponse(ok: false,
+                                           error: "msg.send recipients live on different Macs, send one message per Mac")
+                }
+            }
+        }
         return await streams.mailForward(to: subscriber, request: request)
     }
 

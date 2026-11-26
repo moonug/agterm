@@ -31,4 +31,19 @@ struct MessageForwardTests {
         #expect(MessageForward.arguments(for: ControlRequest(cmd: .msgAck, args: ControlArgs(identity: "S:P"))) == nil)
         #expect(MessageForward.arguments(for: ControlRequest(cmd: .sessionGo)) == nil)
     }
+
+    @Test func onlyCommandsThatMayHaveTakenEffectCarryANoAnswerNote() {
+        #expect(MessageForward.noAnswerNote(for: ControlRequest(cmd: .msgSend, args: ControlArgs(body: "x"))) != nil)
+        #expect(MessageForward.noAnswerNote(for: ControlRequest(cmd: .msgRead, args: ControlArgs(identity: "S:P", ack: true))) != nil)
+        #expect(MessageForward.noAnswerNote(for: ControlRequest(cmd: .msgRead, args: ControlArgs(identity: "S:P"))) == nil)
+        #expect(MessageForward.noAnswerNote(for: ControlRequest(cmd: .msgAck, args: ControlArgs(identity: "S:P", ids: ["m1"]))) == nil)
+    }
+
+    @Test func anUnknownOutcomeReplyCarriesTheStablePrefix() {
+        let reply = ControlResponse.unknownOutcome("the Mac gave no answer; the message may have arrived, do not resend it")
+        #expect(!reply.ok)
+        #expect(reply.isUnknownOutcome())
+        #expect(!ControlResponse(ok: false, error: "the Mac did not answer the message command").isUnknownOutcome())
+        #expect(!ControlResponse(ok: true).isUnknownOutcome())
+    }
 }

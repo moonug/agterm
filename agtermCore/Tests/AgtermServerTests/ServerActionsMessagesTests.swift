@@ -432,4 +432,17 @@ struct ServerActionsMessagesTests {
                                                   response: ControlResponse(ok: true, result: ControlResult(delivered: [target])))
         #expect((await reply).result?.delivered == [target])
     }
+
+    @Test func aSendWhoseRecipientsLiveOnTwoMacsIsRefused() async throws {
+        let hub = harness.actions.streams.catalogHub
+        let macASession = UUID(), macBSession = UUID()
+        _ = try mailSubscriber(hub, RecordingSink(), listing: [macASession])
+        _ = try mailSubscriber(hub, RecordingSink(), listing: [macBSession])
+
+        let sent = await send("hi", to: ["\(macASession.uuidString):\(UUID().uuidString)",
+                                                "\(macBSession.uuidString):\(UUID().uuidString)"])
+
+        #expect(!sent.ok)
+        #expect(sent.error == "msg.send recipients live on different Macs, send one message per Mac")
+    }
 }

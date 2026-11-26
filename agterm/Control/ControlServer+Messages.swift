@@ -112,15 +112,21 @@ extension ControlServer {
                                                            controlPath: slot?.path) else {
             return ControlResponse(ok: false, error: "cannot reach \(host)")
         }
-        let result = await remoteRunner.run(argv, deadline: 15)
+        let result = await remoteRunner.run(argv, deadline: Self.messageForwardTimeout)
         if result.status == 64, result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return ControlResponse(ok: false, error: "\(host) refused the message command; its agtermctl is too old, update agterm-server")
         }
         guard let reply = try? JSONDecoder().decode(ControlResponse.self, from: Data(result.stdout.utf8)) else {
+            if let note = MessageForward.noAnswerNote(for: request) {
+                return .unknownOutcome("\(host) did not answer the message command; \(note)")
+            }
             return ControlResponse(ok: false, error: "\(host) did not answer the message command")
         }
         return reply
     }
+
+    /// messageForwardTimeout is how long the Mac waits for the far agtermctl's reply before the outcome is unknown.
+    private static let messageForwardTimeout: TimeInterval = 15
 
     private func messageOrigin(_ session: Session, pane: MessageAddress.Pane, window: UUID) -> (MessageRoute, String)? {
         if let origin = AttachedOrigin(session) {
