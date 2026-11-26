@@ -40,4 +40,12 @@ public enum MessageForward {
         default: return nil
         }
     }
+
+    /// markRemote stamps a forwarded reply so a `--wait` reader sees the mailbox lives on another machine.
+    public static func markRemote(_ reply: ControlResponse) -> ControlResponse {
+        guard reply.ok else { return reply }
+        var result = reply.result ?? ControlResult()
+        result.mailRemote = true
+        return ControlResponse(ok: true, result: result)
+    }
 }

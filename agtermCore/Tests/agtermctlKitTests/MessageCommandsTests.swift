@@ -193,6 +193,19 @@ struct MessageCommandsTests {
         #expect(fake.sleeps == [Msg.Read.pollDelay, Msg.Read.pollDelay])
     }
 
+    @Test func waitPollsSlowerWhenTheReplySaysTheMailboxIsRemote() throws {
+        var remote = ControlResult(messages: [], remaining: 0)
+        remote.mailRemote = true
+        let fake = FakeApp([ControlResponse(ok: true, result: remote)])
+        let read = try parse(["read", "--wait", "--timeout", "5"], as: Msg.Read.self)
+
+        guard case .timedOut = try read.read(read.makeRequest(env: env), dependencies: fake.dependencies) else {
+            Issue.record("expected a timeout")
+            return
+        }
+        #expect(fake.sleeps == [Msg.Read.remotePollFloor, Msg.Read.remotePollFloor, 1])
+    }
+
     @Test func waitStopsOnAServerErrorOrAnUnconfirmedAck() throws {
         let refused = FakeApp([ControlResponse(ok: false, error: "pane gone")])
         let read = try parse(["read", "--wait", "--ack"], as: Msg.Read.self)

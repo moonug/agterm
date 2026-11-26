@@ -39,6 +39,14 @@ struct MessageForwardTests {
         #expect(MessageForward.noAnswerNote(for: ControlRequest(cmd: .msgAck, args: ControlArgs(identity: "S:P", ids: ["m1"]))) == nil)
     }
 
+    @Test func markRemoteStampsEverySuccessfulForwardedReply() {
+        let empty = MessageForward.markRemote(ControlResponse(ok: true, result: ControlResult(messages: [], remaining: 0)))
+        #expect(empty.result?.mailRemote == true)
+        #expect(empty.result?.messages?.isEmpty == true)
+        #expect(MessageForward.markRemote(ControlResponse(ok: true)).result?.mailRemote == true)
+        #expect(MessageForward.markRemote(ControlResponse(ok: false, error: "no")).result?.mailRemote == nil)
+    }
+
     @Test func anUnknownOutcomeReplyCarriesTheStablePrefix() {
         let reply = ControlResponse.unknownOutcome("the Mac gave no answer; the message may have arrived, do not resend it")
         #expect(!reply.ok)

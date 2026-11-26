@@ -430,7 +430,9 @@ struct ServerActionsMessagesTests {
         #expect(carried.args?.body == "hi")
         harness.actions.streams.catalogMailResult(index: index,
                                                   response: ControlResponse(ok: true, result: ControlResult(delivered: [target])))
-        #expect((await reply).result?.delivered == [target])
+        let back = await reply
+        #expect(back.result?.delivered == [target])
+        #expect(back.result?.mailRemote == true)
     }
 
     @Test func aSendWhoseRecipientsLiveOnTwoMacsIsRefused() async throws {

@@ -810,6 +810,9 @@ public struct ControlResult: Codable, Sendable, Equatable {
     public var remaining: Int?
     /// acked names the messages removed, present on every `msg.ack` and `msg.read --ack` reply, empty included.
     public var acked: [String]?
+    /// mailRemote is true on every reply a cross-host mail forward brings back, empty reads included: it tells
+    /// a `--wait` reader its polls ride an ssh round-trip, so it spaces them out instead of hammering.
+    public var mailRemote: Bool?
     public var remoteGroup: ControlRemoteGroup?
     /// updates is the Sparkle schedule on `version`, omitted by a build with no update feed.
     public var updates: ControlUpdateStatus?

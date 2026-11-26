@@ -122,7 +122,7 @@ extension ControlServer {
             }
             return ControlResponse(ok: false, error: "\(host) did not answer the message command")
         }
-        return reply
+        return MessageForward.markRemote(reply)
     }
 
     /// messageForwardTimeout is how long the Mac waits for the far agtermctl's reply before the outcome is unknown.

@@ -44,7 +44,7 @@ extension ServerActions {
                 }
             }
         }
-        return await streams.mailForward(to: subscriber, request: request)
+        return MessageForward.markRemote(await streams.mailForward(to: subscriber, request: request))
     }
 
     /// mailForwardTarget is the session a forwarded msg command addresses: a send's first recipient, a read or
