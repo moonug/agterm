@@ -334,6 +334,24 @@ struct CatalogHubTests {
         #expect(snapshot.workspaces == CatalogHub.withoutPageRows(hub.snapshot()).workspaces)
     }
 
+    @Test func aMailSubscriberRegistersItsSessionsAndTheHostFindsThePane() throws {
+        let hub = CatalogHub(epoch: "e1", staleTimeout: 30) { CatalogFixture.snapshot([]) }
+        let mail = Sink()
+        let id = try hub.subscribe(hello: CatalogHello(version: 1, mail: true), sink: mail, versions: CatalogFixture.versions)
+        let plain = Sink()
+        let plainID = try hub.subscribe(hello: CatalogHello(version: 1), sink: plain, versions: CatalogFixture.versions)
+        let session = UUID()
+
+        #expect(hub.mailServes(session) == nil)
+        hub.receive(.mailSessions([session]), from: id)
+        #expect(hub.mailServes(session) == id)
+        hub.receive(.mailSessions([session]), from: plainID)
+        #expect(hub.mailServes(session) == id)
+        hub.receive(.mailSessions([]), from: id)
+        #expect(hub.mailServes(session) == nil)
+        #expect(hub.hasMailPeer)
+    }
+
     @Test func aPingIsAnsweredWithAnAck() throws {
         let hub = CatalogHub(epoch: "e1", staleTimeout: 30) { CatalogFixture.snapshot([]) }
         let sink = Sink()

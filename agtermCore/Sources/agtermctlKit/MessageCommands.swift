@@ -92,6 +92,8 @@ extension Msg {
         var all = false
         @Option(name: .long, help: "With --all, only the panes of this workspace.")
         var workspace: String?
+        @Option(name: .long, help: "Name this pane address as the sender without resolving it; for a send forwarded across hosts.")
+        var from: String?
         @OptionGroup var identity: MessageIdentityOptions
         @OptionGroup var options: BasicOptions
 
@@ -105,6 +107,7 @@ extension Msg {
             args.recipients = recipients.isEmpty ? nil : recipients
             args.all = all ? true : nil
             args.workspace = workspace
+            args.from = from
             args.identity = try identity.resolve(env: env)
             return ControlRequest(cmd: .msgSend, args: args)
         }
@@ -138,6 +141,9 @@ extension Msg {
 
         static let timeoutExitCode: Int32 = 124
         static let pollDelay: TimeInterval = 0.25
+        /// remotePollFloor is the wait delay once a reply says the mailbox is on another machine: each poll
+        /// there costs a full ssh round-trip, and 4 Hz of those is hammering.
+        static let remotePollFloor: TimeInterval = 2
 
         @Flag(name: .long, help: "Remove the messages this read returns.")
         var ack = false
@@ -188,13 +194,14 @@ extension Msg {
                 guard wait, reply.response.ok, result?.messages?.isEmpty ?? true, !ack || Self.ackConfirmed(result) else {
                     return .reply(reply)
                 }
+                let delay = result?.mailRemote == true ? max(Self.pollDelay, Self.remotePollFloor) : Self.pollDelay
                 guard let deadline else {
-                    dependencies.sleep(Self.pollDelay)
+                    dependencies.sleep(delay)
                     continue
                 }
                 let left = deadline - dependencies.now()
                 if left <= 0 { return .timedOut }
-                dependencies.sleep(min(Self.pollDelay, left))
+                dependencies.sleep(min(delay, left))
             }
         }
 

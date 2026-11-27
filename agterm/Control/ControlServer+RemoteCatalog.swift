@@ -37,6 +37,12 @@ extension ControlServer {
             return (result.status, result.stdout)
         }
         let client = RemoteCatalogClient(mirror: mirror, transport: remoteTransport, runner: run, pool: pool)
+        // this Mac answers mail forwarded over the stream with its own dispatcher, and keeps the server's
+        // registry of its own sessions current; mirror rows of other hosts are not this Mac's panes.
+        client.mailSessions = { [weak self] in self?.macMailSessions() ?? [] }
+        client.mailHandler = { [weak self] request in
+            await self?.dispatch(request) ?? ControlResponse(ok: false, error: "this agterm is stopping")
+        }
         let actions = RemoteCatalogActions(mirror: mirror, runner: run, pool: pool)
         actions.onChange = { [weak self] in self?.refreshWindowCache() }
         store.remoteActions = actions
@@ -77,6 +83,15 @@ extension ControlServer {
 
     func stopRemoteCatalogs() {
         for id in Array(remoteCatalogs.keys) { stopRemoteCatalog(window: id) }
+    }
+
+    /// macMailSessions lists this Mac's own sessions across every open window, for the mail registries.
+    func macMailSessions() -> [UUID] {
+        library.openIDs().flatMap { id in
+            (library.store(for: id)?.workspaces.flatMap(\.sessions) ?? [])
+                .filter { $0.remoteHost == nil }
+                .map(\.id)
+        }
     }
 
     func windowRemoteOpen(host: String) async -> ControlResponse {

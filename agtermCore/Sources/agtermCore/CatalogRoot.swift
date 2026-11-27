@@ -79,3 +79,15 @@ public enum HeadlessCommandPolicy {
         return "\(command.rawValue) is not available on agterm-server: it drives a window on the Mac showing it"
     }
 }
+
+/// MailForwardPolicy names the commands the host may forward into a Mac's mail channel: the channel reaches
+/// the Mac's full dispatcher, so default-deny here mirrors the server command policy at the server boundary.
+public enum MailForwardPolicy {
+    static let forwardableCommands: Set<Command> = [.msgSend, .msgRead, .msgAck]
+
+    /// refusal is the error for a command that may not ride the mail channel, nil for the mail commands.
+    public static func refusal(_ command: Command) -> String? {
+        guard !forwardableCommands.contains(command) else { return nil }
+        return "\(command.rawValue) cannot be forwarded over mail: only msg.send, msg.read and msg.ack reach a Mac"
+    }
+}

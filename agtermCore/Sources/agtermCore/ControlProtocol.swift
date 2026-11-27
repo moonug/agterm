@@ -182,6 +182,9 @@ public enum Command: String, Codable, Sendable, CaseIterable {
 /// A bag of optional command parameters. Each command reads only the fields it needs; the rest stay nil and
 /// are omitted from the JSON.
 public struct ControlArgs: Codable, Sendable, Equatable {
+    /// from is `msg.send`'s sender address handed over already resolved: a cross-host forward resolved it on the
+    /// sender's own instance, and the far server takes it without resolving it there.
+    public var from: String?
     /// opID names a structural command for agterm-server's receipts; only agterm-server takes one.
     public var opID: String?
     /// epoch is the catalog epoch the caller last saw, sent with `opID`; another epoch refuses the command.
@@ -561,7 +564,7 @@ public struct ControlArgs: Codable, Sendable, Equatable {
                 placeholder: String? = nil, choices: [ControlAskChoice]? = nil, multiple: Bool? = nil,
                 checked: [String]? = nil, other: String? = nil, undoable: Bool? = nil,
                 tint: String? = nil, tintOn: [String]? = nil, recipients: [String]? = nil,
-                identity: String? = nil, ack: Bool? = nil, ids: [String]? = nil) {
+                identity: String? = nil, ack: Bool? = nil, ids: [String]? = nil, from: String? = nil) {
         self.name = name
         self.cwd = cwd
         self.targets = targets
@@ -671,6 +674,7 @@ public struct ControlArgs: Codable, Sendable, Equatable {
         self.identity = identity
         self.ack = ack
         self.ids = ids
+        self.from = from
     }
 }
 
@@ -806,6 +810,9 @@ public struct ControlResult: Codable, Sendable, Equatable {
     public var remaining: Int?
     /// acked names the messages removed, present on every `msg.ack` and `msg.read --ack` reply, empty included.
     public var acked: [String]?
+    /// mailRemote is true on every reply a cross-host mail forward brings back, empty reads included: it tells
+    /// a `--wait` reader its polls ride an ssh round-trip, so it spaces them out instead of hammering.
+    public var mailRemote: Bool?
     public var remoteGroup: ControlRemoteGroup?
     /// updates is the Sparkle schedule on `version`, omitted by a build with no update feed.
     public var updates: ControlUpdateStatus?

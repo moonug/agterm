@@ -32,6 +32,7 @@ final class ControlServerMessagesTests: XCTestCase {
     private var stateDir: URL!
     private var library: WindowLibrary!
     private var server: ControlServer!
+    private var runner: ScriptedRunner!
     private var touched: [UUID] = []
 
     override func setUp() async throws {
@@ -39,10 +40,12 @@ final class ControlServerMessagesTests: XCTestCase {
         stateDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("agterm-messages-tests-\(UUID().uuidString)", isDirectory: true)
         library = WindowLibrary(directory: stateDir)
+        runner = ScriptedRunner(Array(repeating: RemoteCommandResult(status: 0, stdout: "{\"ok\":true}", stderr: ""), count: 3))
         server = ControlServer(
             library: library, actions: AppActions(library: library),
             settingsModel: SettingsModel(library: library, settingsStore: SettingsStore(directory: stateDir)),
             identity: AppIdentity(version: "9.9.9", commit: "testsha"),
+            remoteRunner: runner,
             socketPath: stateDir.appendingPathComponent("control.sock").path)
     }
 
@@ -75,6 +78,67 @@ final class ControlServerMessagesTests: XCTestCase {
         try XCTUnwrap(library.store(for: library.newWindow(name: "other").id))
     }
 
+    private func attached(host: String = "buildbox") throws -> (Session, String) {
+        let store = try XCTUnwrap(library.activeStore)
+        let session = try liveSession(in: store, remote: host)
+        let originSession = UUID(), originPane = UUID()
+        let endpoint = ControlZmxEndpoint(executable: "/bin/zmx", socketDirectory: "/tmp/zmx")
+        store.bindRemote(RemoteBinding(remoteSessionID: originSession.uuidString,
+                                       daemonsByLocalPane: [session.paneIdentity: ZmxSupport.daemonName(for: originPane)],
+                                       presentationVersion: 1,
+                                       origin: .init(host: host, endpoint: endpoint, sessionName: "origin")), forSession: session.id)
+        return (session, MessageAddress.canonical(session: originSession, pane: originPane))
+    }
+
+    func testAttachedMailUsesOriginAddressesForSendReadAndAck() async throws {
+        let (session, origin) = try attached()
+        let sender = try liveSession(in: XCTUnwrap(library.activeStore))
+        let dispatcher = ControlDispatcher(actions: server)
+        let id = UUID().uuidString
+
+        let sent = await send(ControlArgs(body: "hi", recipients: ["\(session.id.uuidString):left"], identity: address(sender)))
+        let read = await dispatcher.dispatch(ControlRequest(cmd: .msgRead, args: ControlArgs(identity: address(session))))
+        let ack = await dispatcher.dispatch(ControlRequest(cmd: .msgAck, args: ControlArgs(identity: address(session), ids: [id])))
+
+        XCTAssertEqual([sent?.ok, read?.ok, ack?.ok], [true, true, true])
+        XCTAssertEqual(runner.invocations, try [
+            RemoteSession.controlCommand(host: "buildbox", arguments: ["msg", "send", "--to", origin, "--from", address(sender)], operands: ["hi"]),
+            RemoteSession.controlCommand(host: "buildbox", arguments: ["msg", "read", "--as", origin]),
+            RemoteSession.controlCommand(host: "buildbox", arguments: ["msg", "ack", "--as", origin], operands: [id]),
+        ])
+    }
+
+    func testAttachedSendDoesNotTurnItsIdentityIntoAnAnonymousSend() async throws {
+        let (session, origin) = try attached()
+        let (other, target) = try attached()
+        let response = await send(ControlArgs(body: "hi", recipients: [address(other)], identity: address(session)))
+
+        XCTAssertEqual(response?.ok, true)
+        XCTAssertEqual(runner.invocations, try [
+            RemoteSession.controlCommand(host: "buildbox", arguments: ["msg", "send", "--to", target, "--as", origin], operands: ["hi"]),
+        ])
+    }
+
+    func testAttachedMailCannotCrossOriginsOrUseAnUnmappedPane() async throws {
+        let (first, _) = try attached()
+        let (second, _) = try attached(host: "elsewhere")
+        let unknown = address(first, UUID())
+
+        let different = await send(ControlArgs(body: "hi", recipients: [address(first), address(second)]))
+        let unmapped = await send(ControlArgs(body: "hi", recipients: [unknown]))
+
+        XCTAssertEqual(different?.error, "a message command cannot address panes on different origins")
+        XCTAssertEqual(unmapped?.error, "no remote pane for \(unknown)")
+        XCTAssertTrue(runner.invocations.isEmpty)
+    }
+
+    func testACrossHostSendRefusesANewlineBody() async throws {
+        let (session, _) = try attached()
+        let response = await send(ControlArgs(body: "hello\necho INJECTED", recipients: [address(session)]))
+        XCTAssertEqual(response?.error, "a forwarded message argument must be one line: a newline cannot cross a host yet, send one line per message")
+        XCTAssertTrue(runner.invocations.isEmpty)
+    }
+
     func testBroadcastReachesEveryOpenWindowAndSkipsTheSenderAndRemoteRows() async throws {
         let first = try XCTUnwrap(library.activeStore)
         let sender = try liveSession(in: first)
@@ -88,19 +152,17 @@ final class ControlServerMessagesTests: XCTestCase {
         XCTAssertEqual(MessageBus.shared.pending(for: sender.paneIdentity), 0)
     }
 
-    func testARemoteRowIsRejectedByNameAndRefusedAsAnIdentity() async throws {
+    func testARemoteRowRefusesMixedRecipientsAndARemoteSender() async throws {
         let store = try XCTUnwrap(library.activeStore)
         let local = try liveSession(in: store)
         let remote = try liveSession(in: store, remote: "buildbox")
-        let remoteLeft = "\(remote.id.uuidString):left"
 
-        let sent = await send(ControlArgs(body: "hi", recipients: [remoteLeft, address(local)]))
+        let mixed = await send(ControlArgs(body: "hi", recipients: ["\(remote.id.uuidString):left", address(local)]))
         let asRemote = await send(ControlArgs(body: "hi", recipients: [address(local)], identity: address(remote)))
 
-        XCTAssertEqual(sent?.result?.delivered, [address(local)])
-        XCTAssertEqual(sent?.result?.rejected, [MessageRejection(address: remoteLeft, reason: .unknownPane, detail: "remote session")])
-        XCTAssertEqual(asRemote?.error, "session \(remote.id.uuidString) is a remote session: a local pane cannot message it")
-        XCTAssertEqual(MessageBus.shared.pending(for: local.paneIdentity), 1)
+        XCTAssertEqual(mixed?.error, "msg.send cannot mix local and remote recipients")
+        XCTAssertEqual(asRemote?.error, "msg.send cannot act as a remote pane and message local panes")
+        XCTAssertEqual(MessageBus.shared.pending(for: local.paneIdentity), 0)
     }
 
     func testAnAnonymousBroadcastReachesEveryPane() async throws {

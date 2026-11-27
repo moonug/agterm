@@ -332,4 +332,13 @@ public protocol ControlActions {
     func messagePanes(workspace: String?, window: String?) -> Result<[MessageRecipient], MessagePaneError>
     /// messageQueued reports a queued message so each recipient's store emits its `message` event.
     func messageQueued(_ messageID: UUID, from: String?, to recipients: [MessageRecipient])
+    /// messageForward runs a `msg.*` command whose addresses all belong to remote window `window`, on that
+    /// window's host; hosts without a remote window refuse it.
+    func messageForward(window: UUID, request: ControlRequest) async -> ControlResponse
+}
+
+public extension ControlActions {
+    func messageForward(window: UUID, request: ControlRequest) async -> ControlResponse {
+        ControlResponse(ok: false, error: ControlActionsUnsupported.message("msg"))
+    }
 }

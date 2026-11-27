@@ -21,6 +21,8 @@ public protocol CatalogStreamHost: AnyObject {
     func catalogSubscription(for hello: CatalogHello) -> CatalogSubscription
     /// catalogViewersChanged follows every subscribe and unsubscribe.
     func catalogViewersChanged()
+    /// catalogMailResult carries a mail viewer's answer to the host's msgForward; a host without mail ignores it.
+    func catalogMailResult(index: Int, response: ControlResponse)
 }
 
 /// CatalogStream is one viewer's catalog stream: a hub's sink on one side, a `ControlStreamOwner` on the other.
@@ -81,6 +83,10 @@ public final class CatalogStream: CatalogSink {
             return
         }
         if let hub, let subscriber {
+            if case .msgResult(let index, let response) = frame {
+                host.catalogMailResult(index: index, response: response)
+                return
+            }
             hub.receive(frame, from: subscriber)
             return
         }
@@ -117,6 +123,8 @@ public final class CatalogStream: CatalogSink {
 
 extension CatalogStreamHost {
     public func catalogViewersChanged() {}
+
+    public func catalogMailResult(index: Int, response: ControlResponse) {}
 
     /// adoptCatalogStream takes over a connection whose `catalog.subscribe` was just answered ok.
     public func adoptCatalogStream(descriptor: Int32) {

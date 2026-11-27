@@ -15,6 +15,10 @@ public final class RemoteCatalogClient {
     static let silenceLimit: TimeInterval = 35
 
     public let mirror: RemoteCatalogMirror
+    /// mailSessions, when set, makes this client a mail peer: its hello carries the flag, the provider's session
+    /// ids keep the host's registry current, and the host's msgForward answers through mailHandler.
+    public var mailSessions: (@MainActor () -> [UUID])?
+    public var mailHandler: ((ControlRequest) async -> ControlResponse)?
     private let host: String
     private let transport: any RemotePresentationTransport
     private let runner: Runner
@@ -100,7 +104,9 @@ public final class RemoteCatalogClient {
         lastFrame = now()
         link = transport.open(argv, onLine: { [weak self] line in self?.receive(line, generation: current) },
                               onClose: { [weak self] reason in self?.closed(reason, generation: current) })
-        send(.hello(CatalogHello(version: CatalogCodec.version, pageRows: true, window: mirror.originWindow?.uuidString)))
+        send(.hello(CatalogHello(version: CatalogCodec.version, pageRows: true, window: mirror.originWindow?.uuidString,
+                                mail: mailSessions == nil ? nil : true)))
+        pushMailSessions()
         startWatchdog()
     }
 
@@ -115,6 +121,10 @@ public final class RemoteCatalogClient {
         if case .refused(let reason, false) = frame {
             drop()
             lost(reason)
+            return
+        }
+        if case .msgForward(let index, let request) = frame {
+            answerMailForward(index: index, request: request)
             return
         }
         if let reply = mirror.receive(frame) { send(reply) }
@@ -159,6 +169,27 @@ public final class RemoteCatalogClient {
         old?.stop()
     }
 
+    /// pushMailSessions re-lists this Mac's sessions for the host's mail registry.
+    public func pushMailSessions() {
+        guard let provider = mailSessions, link != nil else { return }
+        send(.mailSessions(provider()))
+    }
+
+    private func answerMailForward(index: Int, request: ControlRequest) {
+        if let refusal = MailForwardPolicy.refusal(request.cmd) {
+            send(.msgResult(index: index, response: ControlResponse(ok: false, error: refusal)))
+            return
+        }
+        guard let handler = mailHandler else {
+            send(.msgResult(index: index, response: ControlResponse(ok: false, error: "this agterm cannot receive messages")))
+            return
+        }
+        Task { @MainActor [weak self] in
+            let response = await handler(request)
+            self?.send(.msgResult(index: index, response: response))
+        }
+    }
+
     private func send(_ frame: CatalogFrame) {
         guard let line = try? CatalogCodec.encode(frame) else { return }
         link?.send(line)
@@ -170,7 +201,9 @@ public final class RemoteCatalogClient {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(Self.silenceLimit / 3 * 1_000_000_000))
                 guard let self, !Task.isCancelled, !self.stopped else { return }
-                guard self.link != nil, self.now().timeIntervalSince(self.lastFrame) > Self.silenceLimit else { continue }
+                guard self.link != nil else { continue }
+                self.pushMailSessions()
+                guard self.now().timeIntervalSince(self.lastFrame) > Self.silenceLimit else { continue }
                 self.drop()
                 self.lost("no word from \(self.host) for \(Int(Self.silenceLimit)) seconds")
             }
