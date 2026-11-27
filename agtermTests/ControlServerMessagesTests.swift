@@ -132,6 +132,13 @@ final class ControlServerMessagesTests: XCTestCase {
         XCTAssertTrue(runner.invocations.isEmpty)
     }
 
+    func testACrossHostSendRefusesANewlineBody() async throws {
+        let (session, _) = try attached()
+        let response = await send(ControlArgs(body: "hello\necho INJECTED", recipients: [address(session)]))
+        XCTAssertEqual(response?.error, "a forwarded message argument must be one line: a newline cannot cross a host yet, send one line per message")
+        XCTAssertTrue(runner.invocations.isEmpty)
+    }
+
     func testBroadcastReachesEveryOpenWindowAndSkipsTheSenderAndRemoteRows() async throws {
         let first = try XCTUnwrap(library.activeStore)
         let sender = try liveSession(in: first)

@@ -2134,7 +2134,7 @@ Mail crosses between a Mac and agterm-server only: it is not bridged Mac-to-Mac 
 recipients live on two different Macs is refused — send one message per Mac. A forward the far side never answers (it
 quit, or the link dropped mid-command) reports an unknown outcome with a warning: `send` and `read --ack` may already
 have taken effect, so do not resend or re-read them; a plain `read` or `msg ack` failure is safe to retry.
-A cross-host `msg send` refuses a body containing a newline (the far login shell would split it); send one line per message.
+A cross-host `msg send` over ssh refuses a body containing a newline (the ssh target's login shell would split it); mail reaching a Mac through the server catalog stream is unaffected. One line per message over ssh.
 `msg read --wait` against a remote mailbox polls about every 2 seconds, since each poll crosses the wire.
 
 On agterm-server the same commands work between the panes of that server: main, split and scratch panes,
