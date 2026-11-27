@@ -435,6 +435,32 @@ struct ServerActionsMessagesTests {
         #expect(back.result?.mailRemote == true)
     }
 
+    @Test func aMultiLineBodyTravelsToAMacOverTheCatalogStream() async throws {
+        let hub = harness.actions.streams.catalogHub
+        let sink = RecordingSink()
+        let macSession = UUID()
+        _ = try mailSubscriber(hub, sink, listing: [macSession])
+        let target = "\(macSession.uuidString):\(UUID().uuidString)"
+        let request = ControlRequest(cmd: .msgSend, args: ControlArgs(body: "one\ntwo", recipients: [target]))
+
+        async let reply = harness.actions.messageForward(window: harness.actions.streams.catalogID, request: request)
+
+        var forwarded: CatalogFrame?
+        for _ in 0..<100 {
+            if let frame = sink.frames.first(where: { if case .msgForward = $0 { return true }; return false }) { forwarded = frame; break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard case .msgForward(let index, let carried)? = forwarded else {
+            Issue.record("no msgForward reached the Mac")
+            return
+        }
+        #expect(carried.args?.body == "one\ntwo")
+        harness.actions.streams.catalogMailResult(index: index,
+                                                  response: ControlResponse(ok: true, result: ControlResult(delivered: [target])))
+        let back = await reply
+        #expect(back.ok)
+    }
+
     @Test func aSendWhoseRecipientsLiveOnTwoMacsIsRefused() async throws {
         let hub = harness.actions.streams.catalogHub
         let macASession = UUID(), macBSession = UUID()
