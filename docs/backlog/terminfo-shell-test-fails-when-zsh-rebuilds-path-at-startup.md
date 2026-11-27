@@ -15,6 +15,6 @@ with the Nix-style path.
 
 A fix needs a per-shell argument map instead of one shared argv: `zsh -f -c` is enough. zsh still reads
 the system startup file, but that file rebuilds the search path only while its rcs check passes, and `-f`
-turns that option off; `-d` alone leaves the rcs option on and the test red. The other shells need none. CI is unaffected, where zsh reads no such file.
-Surfaced as the single full-run `swift test` red on a maintainer Mac at 4873adcc; the branch under review
-was not implicated.
+turns that option off; `-d` alone leaves the rcs option on and the test red. The other shells need none.
+CI is unaffected, where zsh reads no such file. Surfaced as the single full-run `swift test` red on a
+maintainer Mac at 4873adcc; the branch under review was not implicated.
